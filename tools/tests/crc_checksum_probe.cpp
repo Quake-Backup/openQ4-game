@@ -6,6 +6,14 @@ typedef unsigned char byte;
 
 #define __PRECOMPILED_H__
 
+namespace crc8_impl {
+#include "../../src/idlib/hashing/CRC8.cpp"
+}
+
+namespace crc16_impl {
+#include "../../src/idlib/hashing/CRC16.cpp"
+}
+
 namespace crc32_impl {
 #include "../../src/idlib/hashing/CRC32.cpp"
 }
@@ -16,8 +24,8 @@ namespace honeyman_impl {
 
 struct checksumVector_t {
 	const char *text;
-	unsigned long crc32;
-	unsigned long honeyman;
+	uint32_t crc32;
+	uint32_t honeyman;
 };
 
 int main() {
@@ -26,6 +34,8 @@ int main() {
 #endif
 
 	static_assert( sizeof( unsigned long ) == 8, "Linux x64/arm64 must use LP64 for this probe" );
+	static_assert( sizeof( decltype( crc8_impl::CRC8_BlockChecksum( nullptr, 0 ) ) ) == 1, "CRC-8 state must stay 8-bit" );
+	static_assert( sizeof( decltype( crc16_impl::CRC16_BlockChecksum( nullptr, 0 ) ) ) == 2, "CRC-16 state must stay 16-bit" );
 	static_assert( sizeof( crc32_impl::crc32Word_t ) == 4, "CRC-32 state must stay 32-bit" );
 	static_assert( sizeof( honeyman_impl::honeymanWord_t ) == 4, "Honeyman state must stay 32-bit" );
 
@@ -47,7 +57,7 @@ int main() {
 			return 2;
 		}
 
-		unsigned long crc32 = 0;
+		uint32_t crc32 = 0;
 		crc32_impl::CRC32_InitChecksum( crc32 );
 		for ( int i = 0; i < length; ++i ) {
 			crc32_impl::CRC32_Update( crc32, static_cast<byte>( vector.text[i] ) );
@@ -57,7 +67,7 @@ int main() {
 			return 3;
 		}
 
-		unsigned long honeyman = 0;
+		uint32_t honeyman = 0;
 		honeyman_impl::Honeyman_InitChecksum( honeyman );
 		for ( int i = 0; i < length; ++i ) {
 			honeyman_impl::Honeyman_Update( honeyman, static_cast<byte>( vector.text[i] ) );
@@ -68,32 +78,12 @@ int main() {
 		}
 	}
 
-	// Public signatures remain unsigned long for source compatibility. These
-	// seeded checks ensure their state still follows Win32's 32-bit truncation.
-	unsigned long crc32 = 0xfeedfaceffffffffUL;
-	crc32_impl::CRC32_UpdateChecksum( crc32, "abc", 3 );
-	crc32_impl::CRC32_FinishChecksum( crc32 );
-	if ( crc32 != 0x352441c2UL ) {
+	static const char canonical[] = "123456789";
+	if ( crc8_impl::CRC8_BlockChecksum( canonical, 9 ) != 0xf4u ) {
 		return 5;
 	}
-
-	unsigned long honeyman = 0xfeedfaceffffffffUL;
-	honeyman_impl::Honeyman_UpdateChecksum( honeyman, "abc", 3 );
-	honeyman_impl::Honeyman_FinishChecksum( honeyman );
-	if ( honeyman != 0x1f2fe9ffUL ) {
+	if ( crc16_impl::CRC16_BlockChecksum( canonical, 9 ) != 0x29b1u ) {
 		return 6;
-	}
-
-	crc32 = 0xfeedface00000000UL;
-	crc32_impl::CRC32_FinishChecksum( crc32 );
-	if ( crc32 != 0xffffffffUL ) {
-		return 7;
-	}
-
-	honeyman = 0xfeedface89abcdefUL;
-	honeyman_impl::Honeyman_FinishChecksum( honeyman );
-	if ( honeyman != 0x89abcdefUL ) {
-		return 8;
 	}
 
 	return 0;

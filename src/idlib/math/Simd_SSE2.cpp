@@ -1836,7 +1836,7 @@ idSIMD_SSE2::ShadowVolume_CreateSilTriangles
 int VPCALL idSIMD_SSE2::ShadowVolume_CreateSilTriangles( int *shadowIndexes, const byte *facing, const silEdge_s *silEdges, const int numSilEdges ) {
 #if 1
 
-	int num;
+	uintptr_t num;
 
 	__asm {
 		push		ebx
@@ -1966,7 +1966,7 @@ int VPCALL idSIMD_SSE2::ShadowVolume_CreateSilTriangles( int *shadowIndexes, con
 		pop			ebx
 	}
 
-	return ( num - (int)shadowIndexes ) >> 2;
+	return static_cast<int>( ( num - reinterpret_cast<uintptr_t>( shadowIndexes ) ) / sizeof( *shadowIndexes ) );
 
 #else
 
@@ -2012,7 +2012,7 @@ idSIMD_SSE2::ShadowVolume_CreateCapTriangles
 int VPCALL idSIMD_SSE2::ShadowVolume_CreateCapTriangles( int *shadowIndexes, const byte *facing, const int *indexes, const int numIndexes ) {
 #if 1
 
-	int num = numIndexes / 3;
+	uintptr_t num = static_cast<uintptr_t>( numIndexes / 3 );
 
 	__asm {
 		push		ebx
@@ -2125,7 +2125,7 @@ int VPCALL idSIMD_SSE2::ShadowVolume_CreateCapTriangles( int *shadowIndexes, con
 		pop			ebx
 	}
 
-	return ( num - (int)shadowIndexes ) >> 2;
+	return static_cast<int>( ( num - reinterpret_cast<uintptr_t>( shadowIndexes ) ) / sizeof( *shadowIndexes ) );
 
 #else
 

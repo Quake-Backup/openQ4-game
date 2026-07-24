@@ -89,33 +89,28 @@ static const honeymanWord_t crctable[256] = {
 
 #endif
 
-void Honeyman_InitChecksum( unsigned long &crcvalue ) {
-	crcvalue = static_cast<unsigned long>( HONEYMAN_INIT_VALUE );
+void Honeyman_InitChecksum( uint32_t &crcvalue ) {
+	crcvalue = HONEYMAN_INIT_VALUE;
 }
 
-void Honeyman_Update( unsigned long &crcvalue, const byte data ) {
-	const honeymanWord_t crc = static_cast<honeymanWord_t>( crcvalue );
-	crcvalue = static_cast<unsigned long>( ( crc >> 7 ) ^ crctable[ ( crc ^ data ) & 0x7fu ] );
+void Honeyman_Update( uint32_t &crcvalue, const byte data ) {
+	crcvalue = ( crcvalue >> 7 ) ^ crctable[ ( crcvalue ^ data ) & 0x7fu ];
 }
 
-void Honeyman_UpdateChecksum( unsigned long &crcvalue, const void *data, int length ) {
-	honeymanWord_t crc;
+void Honeyman_UpdateChecksum( uint32_t &crcvalue, const void *data, int length ) {
 	const unsigned char *buf = (const unsigned char *) data;
 
-	crc = static_cast<honeymanWord_t>( crcvalue );
 	while( length-- ) {
-		crc = ( crc >> 7 ) ^ crctable[ ( crc ^ *buf++ ) & 0x7fu ];
+		crcvalue = ( crcvalue >> 7 ) ^ crctable[ ( crcvalue ^ *buf++ ) & 0x7fu ];
 	}
-	crcvalue = static_cast<unsigned long>( crc );
 }
 
-void Honeyman_FinishChecksum( unsigned long &crcvalue ) {
-	const honeymanWord_t crc = static_cast<honeymanWord_t>( crcvalue ) ^ HONEYMAN_XOR_VALUE;
-	crcvalue = static_cast<unsigned long>( crc );
+void Honeyman_FinishChecksum( uint32_t &crcvalue ) {
+	crcvalue ^= HONEYMAN_XOR_VALUE;
 }
 
-unsigned long Honeyman_BlockChecksum( const void *data, int length ) {
-	unsigned long crc;
+uint32_t Honeyman_BlockChecksum( const void *data, int length ) {
+	uint32_t crc;
 
 	Honeyman_InitChecksum( crc );
 	Honeyman_UpdateChecksum( crc, data, length );

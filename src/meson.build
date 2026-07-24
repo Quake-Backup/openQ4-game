@@ -82,6 +82,9 @@ if is_msvc
   common_cpp_args += [
     '/std:c++17',
     '/W4',
+    '/we4302',
+    '/we4311',
+    '/we4312',
     '/FS',
     '/source-charset:windows-1252',
     '/execution-charset:windows-1252',

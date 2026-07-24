@@ -2544,7 +2544,7 @@ void VPCALL idSIMD_SSE::Dot( float &dot, const float *src1, const float *src2, c
 	float *aligned;																		\
 																						\
 	/* if the float array is not aligned on a 4 byte boundary */						\
-	if ( ((int) SRC0) & 3 ) {															\
+	if ( ( reinterpret_cast<uintptr_t>( SRC0 ) & uintptr_t( 3 ) ) != 0 ) {			\
 		/* unaligned memory access */													\
 		pre = 0;																		\
 		cnt = COUNT >> 2;																\
@@ -2581,8 +2581,10 @@ void VPCALL idSIMD_SSE::Dot( float &dot, const float *src1, const float *src2, c
 	}																					\
 	else {																				\
 		/* aligned memory access */														\
-		aligned = (float *) ((((int) SRC0) + 15) & ~15);								\
-		if ( (int)aligned > ((int)src0) + COUNT ) {										\
+		const uintptr_t sourceAddress = reinterpret_cast<uintptr_t>( SRC0 );			\
+		const uintptr_t alignedAddress = ( sourceAddress + 15u ) & ~uintptr_t( 15u );	\
+		aligned = reinterpret_cast<float *>( alignedAddress );							\
+		if ( alignedAddress - sourceAddress > static_cast<uintptr_t>( COUNT ) * sizeof( *SRC0 ) ) {	\
 			pre = COUNT;																\
 			post = 0;																	\
 		}																				\
@@ -2636,7 +2638,7 @@ void VPCALL idSIMD_SSE::Dot( float &dot, const float *src1, const float *src2, c
 	float *aligned;																		\
 																						\
 	/* if the float array is not aligned on a 4 byte boundary */						\
-	if ( ((int) SRC0) & 3 ) {															\
+	if ( ( reinterpret_cast<uintptr_t>( SRC0 ) & uintptr_t( 3 ) ) != 0 ) {			\
 		/* unaligned memory access */													\
 		pre = 0;																		\
 		cnt = COUNT >> 2;																\
@@ -2675,8 +2677,10 @@ void VPCALL idSIMD_SSE::Dot( float &dot, const float *src1, const float *src2, c
 	}																					\
 	else {																				\
 		/* aligned memory access */														\
-		aligned = (float *) ((((int) SRC0) + 15) & ~15);								\
-		if ( (int)aligned > ((int)src0) + COUNT ) {										\
+		const uintptr_t sourceAddress = reinterpret_cast<uintptr_t>( SRC0 );			\
+		const uintptr_t alignedAddress = ( sourceAddress + 15u ) & ~uintptr_t( 15u );	\
+		aligned = reinterpret_cast<float *>( alignedAddress );							\
+		if ( alignedAddress - sourceAddress > static_cast<uintptr_t>( COUNT ) * sizeof( *SRC0 ) ) {	\
 			pre = COUNT;																\
 			post = 0;																	\
 		}																				\

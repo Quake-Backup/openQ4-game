@@ -881,24 +881,23 @@ idStr::FileNameHash
 */
 int idStr::FileNameHash( void ) const {
 	int		i;
-	long	hash;
-	char	letter;
+	uint32_t	hash;
+	byte	letter;
 
 	hash = 0;
 	i = 0;
 	while( data[i] != '\0' ) {
-		letter = idStr::ToLower( data[i] );
+		letter = static_cast<byte>( idStr::ToLower( data[i] ) );
 		if ( letter == '.' ) {
 			break;				// don't include extension
 		}
 		if ( letter =='\\' ) {
 			letter = '/';
 		}
-		hash += (long)(letter)*(i+119);
+		hash += static_cast<uint32_t>( letter ) * ( static_cast<uint32_t>( i ) + 119u );
 		i++;
 	}
-	hash &= (FILE_HASH_SIZE-1);
-	return hash;
+	return static_cast<int>( hash & ( FILE_HASH_SIZE - 1 ) );
 }
 
 /*

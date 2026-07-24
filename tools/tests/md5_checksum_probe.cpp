@@ -17,7 +17,7 @@ static unsigned int LittleLong( unsigned int value ) {
 
 struct checksumVector_t {
 	const char *text;
-	unsigned long expected;
+	uint32_t expected;
 };
 
 int main() {

@@ -28,27 +28,41 @@ def main() -> None:
     src_meson = read("src/meson.build")
     options = read("meson_options.txt")
     sys_public = read("src/sys/sys_public.h")
+    win_main_cpp = read("src/sys/win32/win_main.cpp")
     lib_cpp = read("src/idlib/Lib.cpp")
     lib_h = read("src/idlib/Lib.h")
+    base64_cpp = read("src/idlib/Base64.cpp")
+    heap_cpp = read("src/idlib/Heap.cpp")
+    heap_h = read("src/idlib/Heap.h")
     str_cpp = read("src/idlib/Str.cpp")
     trace_model_cpp = read("src/idlib/geometry/TraceModel.cpp")
     file_h = read("src/framework/File.h")
+    file_system_h = read("src/framework/FileSystem.h")
     parser_cpp = read("src/idlib/Parser.cpp")
+    parser_h = read("src/idlib/Parser.h")
     dict_cpp = read("src/idlib/Dict.cpp")
     md4_cpp = read("src/idlib/hashing/MD4.cpp")
+    md4_h = read("src/idlib/hashing/MD4.h")
     md5_cpp = read("src/idlib/hashing/MD5.cpp")
+    md5_h = read("src/idlib/hashing/MD5.h")
     crc32_cpp = read("src/idlib/hashing/CRC32.cpp")
+    crc32_h = read("src/idlib/hashing/CRC32.h")
     honeyman_cpp = read("src/idlib/hashing/Honeyman.cpp")
+    honeyman_h = read("src/idlib/hashing/Honeyman.h")
     math_h = read("src/idlib/math/Math.h")
     math_cpp = read("src/idlib/math/Math.cpp")
     random_h = read("src/idlib/math/Random.h")
     simd_generic_cpp = read("src/idlib/math/Simd_generic.cpp")
+    simd_mmx_cpp = read("src/idlib/math/Simd_MMX.cpp")
+    simd_sse2_cpp = read("src/idlib/math/Simd_SSE2.cpp")
     vector_h = read("src/idlib/math/Vector.h")
     token_h = read("src/idlib/Token.h")
     lexer_cpp = read("src/idlib/Lexer.cpp")
     decl_mat_type_h = read("src/framework/declMatType.h")
+    cvar_system_h = read("src/framework/CVarSystem.h")
     mapfile_cpp = read("src/idlib/mapfile.cpp")
     renderer_model_h = read("src/renderer/Model.h")
+    renderer_qgl_h = read("src/renderer/qgl.h")
     mpgame_aas_cpp = read("src/mpgame/ai/AAS.cpp")
     mpgame_game_local_cpp = read("src/mpgame/Game_local.cpp")
     game_local_cpp = read("src/game/Game_local.cpp")
@@ -150,6 +164,9 @@ def main() -> None:
         "build-machine Python discovery",
     )
     reject(src_meson, "import('python').find_installation", "target-machine Python discovery")
+    for warning_error in ("/we4302", "/we4311", "/we4312"):
+        require(src_meson, warning_error, "MSVC pointer-truncation error policy")
+    reject(src_meson, "'/WX'", "blanket MSVC warnings-as-errors policy")
     require(src_meson, "is_linux = host_system == 'linux'", "Linux host predicate")
     require(
         src_meson,
@@ -191,18 +208,39 @@ def main() -> None:
         "#define ALIGN16( x )\t\t\t\t\t__attribute__((aligned(16))) x",
         "Linux 16-byte alignment",
     )
+    require(sys_public, "typedef uintptr_t idSocketHandle_t;", "Win64-width socket handle")
+    require(sys_public, "typedef int idSocketHandle_t;", "POSIX socket descriptor")
+    if sys_public.count("idSocketHandle_t\tnetSocket") != 2:
+        raise AssertionError("UDP socket members must use the platform socket-handle type")
+    require(sys_public, "idSocketHandle_t\tfd;", "TCP socket handle")
+    require(sys_public, "uint32_t\t\tthreadId;", "fixed-width thread identifier")
+    reject(sys_public, "unsigned long\tthreadId;", "LP64-wide thread identifier")
+    require(win_main_cpp, "DWORD threadId = 0;", "native CreateThread identifier output")
+    require(win_main_cpp, "info.threadId = static_cast<uint32_t>( threadId );", "fixed-width stored thread identifier")
 
     require(lib_cpp, "#if defined( MACOS_X ) || defined( __linux__ )", "POSIX signal header")
     require(lib_cpp, "raise( SIGTRAP );", "portable Linux assertion trap")
     reject(lib_cpp, '"int $0x03"', "x86-only Linux assertion trap")
     reject(lib_cpp, "register unsigned char", "C++17-obsolete byte-swap register hint")
     reject(lib_h, '#include "Swap.h"', "standalone GPL-derived endian-swap dependency")
+    if re.search(r"typedef\s+[^;]+\bulong\s*;", lib_h):
+        raise AssertionError("Legacy ulong alias must not vary with or conflict with the host ABI")
+    if base64_cpp.count("uint32_t w;") != 2:
+        raise AssertionError("Base64 encode and decode words must remain exactly 32 bits")
+    require(base64_cpp, "static_cast<uint32_t>( *from )", "fixed-width Base64 input promotion")
+    reject(base64_cpp, "unsigned long w;", "LP64-wide Base64 work word")
     reject(md5_cpp, "register unsigned int", "C++17-obsolete MD5 register hint")
     reject(simd_generic_cpp, "register double", "C++17-obsolete generic SIMD register hint")
     require(file_h, "BigRevBytes(&c, sizeof(c), 1);", "scalar big-endian file read")
     require(file_h, "BigRevBytes(c, sizeof(c[0]), count);", "array big-endian file read")
     require(file_h, "BigRevBytes(&b, sizeof(b), 1);", "scalar big-endian file write")
     reject(file_h, "idSwap::", "unavailable standalone endian helper")
+    require(
+        file_system_h,
+        "FILE_NOT_FOUND_TIMESTAMP\t= static_cast<ID_TIME_T>( -1 );",
+        "width-stable missing-file timestamp sentinel",
+    )
+    reject(file_system_h, "FILE_NOT_FOUND_TIMESTAMP\t= 0xFFFFFFFF;", "32-bit-only missing-file timestamp sentinel")
 
     require(
         md5_cpp,
@@ -233,8 +271,36 @@ def main() -> None:
         require(source, f"typedef uint32_t {word_type};", f"fixed-width {context} word")
         require(source, f'static_assert( sizeof( {word_type} ) == 4, "{assertion}" );', f"fixed-width {context} contract")
         require(source, f"static const {word_type} crctable[256]", f"fixed-width {context} table")
-        require(source, f"static_cast<{word_type}>( crcvalue )", f"32-bit {context} public-state truncation")
         reject(source, "static unsigned long crctable[256]", f"LP64-wide {context} table")
+
+    checksum_apis = (
+        (
+            crc32_h,
+            "CRC-32",
+            (
+                "void CRC32_InitChecksum( uint32_t &crcvalue );",
+                "void CRC32_UpdateChecksum( uint32_t &crcvalue, const void *data, int length );",
+                "void CRC32_FinishChecksum( uint32_t &crcvalue );",
+                "uint32_t CRC32_BlockChecksum( const void *data, int length );",
+            ),
+        ),
+        (
+            honeyman_h,
+            "Honeyman",
+            (
+                "void Honeyman_InitChecksum( uint32_t &crcvalue );",
+                "void Honeyman_UpdateChecksum( uint32_t &crcvalue, const void *data, int length );",
+                "void Honeyman_FinishChecksum( uint32_t &crcvalue );",
+                "uint32_t Honeyman_BlockChecksum( const void *data, int length );",
+            ),
+        ),
+        (md4_h, "MD4", ("uint32_t MD4_BlockChecksum( const void *data, int length );",)),
+        (md5_h, "MD5", ("uint32_t MD5_BlockChecksum( const void *data, int length );",)),
+    )
+    for header, context, signatures in checksum_apis:
+        for signature in signatures:
+            require(header, signature, f"fixed-width {context} public API")
+        reject(header, "unsigned long", f"LP64-wide {context} public API")
 
     for token in (
         "ID_INLINE unsigned int idMath_FloatBits( const float f )",
@@ -281,6 +347,55 @@ def main() -> None:
 
     require(token_h, "unsigned int\tintvalue;", "32-bit binary token integer storage")
     reject(token_h, "unsigned long\tintvalue;", "LP64-wide binary token integer storage")
+    require(token_h, "uint32_t\t\tGetUnsignedLongValue( void );", "fixed-width binary token value API")
+    require(token_h, "ID_INLINE uint32_t idToken::GetUnsignedLongValue( void )", "fixed-width binary token value accessor")
+    reject(token_h, "ID_INLINE unsigned long\tidToken::GetUnsignedLongValue", "LP64-wide binary token value API")
+
+    for parser_source, context in ((parser_h, "parser declarations"), (parser_cpp, "parser implementation")):
+        reject(parser_source, "signed long int", f"LP64-wide {context}")
+    require(parser_h, "EvaluateTokens( idToken *tokens, int32_t *intvalue", "fixed-width parser evaluator API")
+    require(parser_h, "Evaluate( int32_t *intvalue", "fixed-width parser directive API")
+    require(parser_h, "DollarEvaluate( int32_t *intvalue", "fixed-width dollar-evaluator API")
+    require(parser_cpp, "int32_t intvalue;", "fixed-width parser value storage")
+    require(parser_cpp, "const uint32_t magnitude = value < 0", "overflow-safe parser integer magnitude")
+    require(parser_cpp, 'sprintf( buf, "%u", magnitude );', "fixed-width parser output format")
+    reject(parser_cpp, 'sprintf( buf, "%ld", abs( value ) );', "LP64-dependent parser output format")
+    for helper in (
+        "idParser_Int32Negate",
+        "idParser_Int32Add",
+        "idParser_Int32Subtract",
+        "idParser_Int32Multiply",
+        "idParser_Int32LeftShift",
+        "idParser_Int32ArithmeticRightShift",
+        "idParser_Int32Divide",
+        "idParser_Int32Modulo",
+    ):
+        require(parser_cpp, helper, "defined 32-bit parser expression arithmetic")
+    require(
+        parser_cpp,
+        "return idParser_Int32FromBits( 0u - idParser_Int32Bits( value ) );",
+        "modulo-2^32 parser unary negation",
+    )
+    require(
+        parser_cpp,
+        "return shift >= 0 && shift < 32;",
+        "bounded parser shift count",
+    )
+    if parser_cpp.count("if ( !idParser_IsValidShiftCount( v2->intvalue ) ) {") != 2:
+        raise AssertionError("Both parser shift operators must validate counts before shifting")
+    if parser_cpp.count("if ( lhs == INT32_MIN && rhs == -1 ) {") != 2:
+        raise AssertionError("Parser division and modulo must handle INT32_MIN / -1 explicitly")
+    require(parser_cpp, "return INT32_MIN;", "defined parser INT32_MIN / -1 division result")
+    require(parser_cpp, "return 0;", "defined parser INT32_MIN / -1 modulo result")
+    evaluator = parser_cpp.split("int idParser::EvaluateTokens", 1)[1].split("idParser::Evaluate\n", 1)[0]
+    if re.search(r"v1->intvalue\s*(?:\*=|/=|%=|\+=|-=|<<=|>>=|&=|\|=|\^=)", evaluator):
+        raise AssertionError("Parser evaluator contains direct signed compound arithmetic")
+    reject(evaluator, "v->intvalue = - t->GetIntValue()", "direct signed parser unary negation")
+    for shift_call in (
+        "idParser_Int32ArithmeticRightShift( v1->intvalue, static_cast<uint32_t>( v2->intvalue ) )",
+        "idParser_Int32LeftShift( v1->intvalue, static_cast<uint32_t>( v2->intvalue ) )",
+    ):
+        require(evaluator, shift_call, "checked fixed-width parser shift")
     for token in (
         "unsigned int val = static_cast<unsigned int>( tok->GetUnsignedLongValue() );",
         "case BTT_SUBTYPE_INT: {",
@@ -310,6 +425,10 @@ def main() -> None:
     require(decl_mat_type_h, "memset( mTint, 0, sizeof( mTint ) );", "four-byte material tint initialization")
     require(decl_mat_type_h, "memcpy( mTint, tint, sizeof( mTint ) );", "four-byte material tint copy")
     reject(decl_mat_type_h, "*( ulong *)mTint", "LP64-wide material tint access")
+    cvar_sentinel = "reinterpret_cast< idCVar * >( static_cast<uintptr_t>( -1 ) )"
+    if cvar_system_h.count(cvar_sentinel) != 3:
+        raise AssertionError("CVar registration sentinel must be formed through pointer-width uintptr_t")
+    reject(cvar_system_h, "(idCVar *)-1", "narrow integer-to-pointer CVar sentinel")
     require(mapfile_cpp, "return idMath_FloatBits( f );", "alias-safe map float checksum")
     require(renderer_model_h, "virtual\t\t\t\t\t\t~idRenderModel( void );", "render-model ABI virtual destructor")
     reject(renderer_model_h, "//virtual\t\t\t\t\t\t~idRenderModel", "disabled render-model ABI destructor")
@@ -320,8 +439,69 @@ def main() -> None:
         "typedef enum {\n\tINVALID_JOINT",
         "non-fixed enum used for integer joint handles",
     )
+    if renderer_qgl_h.count("uint32_t texNameCRC32") != 2:
+        raise AssertionError("texture-cache CRC parameters must remain exactly 32 bits")
+    reject(renderer_qgl_h, "unsigned long texNameCRC32", "LP64-wide texture-cache CRC parameter")
     require(lib_cpp, "memcpy( &swapvalue, swaptest, sizeof( swapvalue ) );", "alignment-safe endian probe")
     reject(lib_cpp, "*(short *)swaptest", "unaligned endian probe")
+
+    for signature in (
+        "Mem_Alloc( const size_t size",
+        "Mem_ClearedAlloc( const size_t size",
+        "Mem_Alloc16( const size_t size",
+    ):
+        require(heap_h, signature, "size_t-safe heap public allocation boundary")
+        require(heap_cpp, signature, "size_t-safe heap allocation implementation")
+    for token in (
+        "static bool Mem_ValidateAllocSize( const size_t size, const size_t overhead",
+        "size > maxHeapSize - overhead",
+        "static_cast<int>( size )",
+        "GetAlignedBlockSize( const int num, int &alignedBytes )",
+        "elementCount > maxPayload / sizeof( type )",
+        "const int64_t combinedSize",
+        "combinedSize <= static_cast<int64_t>( ID_HEAP_MAX_SIZE )",
+        "static_cast<int64_t>( sizeof( idDynamicBlock<type> ) )",
+    ):
+        require(heap_h if "GetAlignedBlockSize" in token or "maxPayload" in token or "combinedSize" in token or "idDynamicBlock" in token else heap_cpp,
+                token, "overflow-safe legacy heap sizing")
+    if heap_h.count("Alloc( const int num )") < 2 or heap_h.count("Resize( type *ptr, const int num )") < 2:
+        raise AssertionError("dynamic allocator element-count APIs must retain signed negative-count semantics")
+    require(heap_h, "elementCount > ID_HEAP_MAX_SIZE / sizeof( type )", "simple dynamic allocator multiplication guard")
+    require(heap_h, "class alignas(16) idDynamicBlock", "dynamic-block payload alignment")
+    require(
+        heap_h,
+        "block = ( idDynamicBlock<type> * ) Mem_Alloc16( allocSize, memoryTag );\n//RAVEN END\n\t\tif ( block == NULL )",
+        "failed dynamic-block base allocation handling",
+    )
+    require(
+        heap_h,
+        "Mem_Alloc16( baseBlockSize, memoryTag );\n//RAVEN END\n\t\tif ( block == NULL )",
+        "failed fixed-block allocation handling",
+    )
+    for counter in ("baseBlockMemory", "usedBlockMemory", "freeBlockMemory"):
+        if re.search(rf"\bsize_t\s+{counter};", heap_h) is None:
+            raise AssertionError(f"Missing native-width {counter} accounting")
+    require(heap_h, "GetUsedBlockMemorySize( void ) const", "native-width dynamic allocation stats getter")
+    reject(heap_h, "Mem_Alloc( const int size", "narrow heap public allocation boundary")
+    reject(heap_h, "Mem_Alloc16( const int size", "narrow aligned-heap public allocation boundary")
+    require(heap_h, "reinterpret_cast<uintptr_t>( block )", "pointer-width dynamic-block range check")
+    require(heap_h, "reinterpret_cast<uintptr_t>( base )", "pointer-width dynamic-block base address")
+    reject(heap_h, "((int)block)", "narrow dynamic-block range pointer")
+    require(heap_cpp, "const dword bytesLeft = pageSize - smallCurPageOffset;", "width-neutral small-page remainder")
+    reject(heap_cpp, "(long)(pageSize)", "host-long small-page remainder")
+
+    for token in (
+        "reinterpret_cast<uintptr_t>( dest0 )",
+        "reinterpret_cast<uintptr_t>( src0 )",
+        "reinterpret_cast<uintptr_t>( dest )",
+    ):
+        require(simd_mmx_cpp, token, "pointer-width MMX alignment check")
+    reject(simd_mmx_cpp, "(int)dest0", "narrow MMX destination pointer")
+    reject(simd_mmx_cpp, "(int)src0", "narrow MMX source pointer")
+    reject(simd_mmx_cpp, "((int)dest)", "narrow MMX alignment pointer")
+    if simd_sse2_cpp.count("reinterpret_cast<uintptr_t>( shadowIndexes )") != 2:
+        raise AssertionError("SSE2 shadow-index results must use pointer-width address arithmetic")
+    reject(simd_sse2_cpp, "(int)shadowIndexes", "narrow SSE2 shadow-index pointer")
 
     require(
         str_cpp,
@@ -362,10 +542,15 @@ def main() -> None:
 \t}''',
         "PK4-root sibling include base",
     )
-    if parser_cpp.count('sprintf( buf, "%ld", abs( value ) );') != 2:
-        raise AssertionError("integer parser evaluation must format both signed-long results portably")
-    reject(parser_cpp, 'sprintf(buf, "%d", abs(value));', "LP64-unsafe parser evaluation")
-    reject(parser_cpp, 'sprintf( buf, "%d", abs( value ) );', "LP64-unsafe dollar parser evaluation")
+    if parser_cpp.count('sprintf( buf, "%u", magnitude );') != 2:
+        raise AssertionError("integer parser evaluation must safely format both fixed-width results")
+    for unsafe_abs in (
+        'sprintf( buf, "%d", abs( value ) );',
+        "token.intvalue = abs( value );",
+        "token.floatvalue = abs( value );",
+    ):
+        reject(parser_cpp, unsafe_abs, "INT32_MIN-safe parser integer evaluation")
+    reject(parser_cpp, 'sprintf( buf, "%ld", abs( value ) );', "LP64-dependent parser evaluation")
 
     reject(mpgame_aas_cpp, "file->GetMemorySize()", "MP AAS file memory accounting")
     require(

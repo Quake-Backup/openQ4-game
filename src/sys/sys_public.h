@@ -275,6 +275,12 @@ typedef struct sysMemoryStats_s {
 
 typedef uintptr_t address_t;
 
+#if defined( WIN32 ) || defined( _WIN32 )
+typedef uintptr_t idSocketHandle_t;
+#else
+typedef int idSocketHandle_t;
+#endif
+
 template<class type> class idList;		// for Sys_ListFiles
 
 
@@ -543,8 +549,8 @@ public:
 
 private:
 	netadr_t	bound_to;		// interface and port
-	int			netSocket;		// OS specific socket
-	int			netSocket6;		// OS specific IPv6 socket
+	idSocketHandle_t	netSocket;		// OS specific socket
+	idSocketHandle_t	netSocket6;		// OS specific IPv6 socket
 };
 
 class idTCP {
@@ -565,7 +571,7 @@ public:
 
 private:
 	netadr_t	address;		// remote address
-	int			fd;				// OS specific socket
+	idSocketHandle_t	fd;				// OS specific socket
 };
 
 				// parses the port number
@@ -600,7 +606,7 @@ typedef enum {
 typedef struct {
 	const char *	name;
 	uintptr_t		threadHandle;
-	unsigned long	threadId;
+	uint32_t		threadId;
 	volatile bool	stopRequested;
 } xthreadInfo;
 

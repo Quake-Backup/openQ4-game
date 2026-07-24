@@ -248,7 +248,7 @@ void MD4_Final( MD4_CTX *context, unsigned char digest[16] ) {
 MD4_BlockChecksum
 ===============
 */
-unsigned long MD4_BlockChecksum( const void *data, int length ) {
+uint32_t MD4_BlockChecksum( const void *data, int length ) {
 	UINT4			digest[4];
 	UINT4			val;
 	MD4_CTX			ctx;

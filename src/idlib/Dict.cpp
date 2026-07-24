@@ -219,7 +219,7 @@ idDict::Checksum
 ================
 */
 int	idDict::Checksum( void ) const {
-	unsigned long ret;
+	uint32_t ret;
 	int i, n;
 
 	idList<idKeyValue> sorted = args;

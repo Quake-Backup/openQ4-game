@@ -2,6 +2,8 @@
 #ifndef __TOKEN_H__
 #define __TOKEN_H__
 
+#include <stdint.h>
+
 /*
 ===============================================================================
 
@@ -150,7 +152,7 @@ public:
 
 	double			GetDoubleValue( void );				// double value of TT_NUMBER
 	float			GetFloatValue( void );				// float value of TT_NUMBER
-	unsigned long	GetUnsignedLongValue( void );		// unsigned long value of TT_NUMBER
+	uint32_t		GetUnsignedLongValue( void );		// 32-bit unsigned value of TT_NUMBER
 	int				GetIntValue( void );				// int value of TT_NUMBER
 	int				WhiteSpaceBeforeToken( void ) const;// returns length of whitespace before token
 	void			ClearTokenWhiteSpace( void );		// forget whitespace before token
@@ -206,7 +208,7 @@ ID_INLINE float idToken::GetFloatValue( void ) {
 	return (float) GetDoubleValue();
 }
 
-ID_INLINE unsigned long	idToken::GetUnsignedLongValue( void ) {
+ID_INLINE uint32_t idToken::GetUnsignedLongValue( void ) {
 	if ( type != TT_NUMBER ) {
 		return 0;
 	}

@@ -50,11 +50,16 @@ def validate_class_allocator_source(relative_path: str) -> None:
         "static const int IDCLASS_ALLOC_HEADER_SIZE = 16;",
         "static byte *idClass_AllocBlock( size_t objectSize )",
         "static byte *idClass_BlockFromObject( void *ptr )",
-        "Mem_Alloc16( static_cast<int>( totalSize ), MA_CLASS )",
+        "Mem_Alloc16( totalSize, MA_CLASS )",
         "*reinterpret_cast<int *>( block ) = static_cast<int>( totalSize );",
         "block + IDCLASS_ALLOC_HEADER_SIZE",
         "return static_cast<byte *>( ptr ) - IDCLASS_ALLOC_HEADER_SIZE;",
-        "const size_t totalSize = s + IDCLASS_ALLOC_HEADER_SIZE;",
+        "objectSize > ID_HEAP_MAX_SIZE - IDCLASS_ALLOC_HEADER_SIZE",
+        'gameLocal.Error( "idClass allocation is too large (%zu bytes)", objectSize );',
+        'throw idAllocError( "idClass allocation exceeds the 32-bit heap limit" );',
+        "if ( block == NULL )",
+        'throw idAllocError( "idClass allocation failed" );',
+        "memused += static_cast<size_t>( *reinterpret_cast<int *>( p ) );",
         "return p + IDCLASS_ALLOC_HEADER_SIZE;",
         "p = idClass_BlockFromObject( ptr );",
         "Mem_Free16( p );",
@@ -115,11 +120,33 @@ def validate_script_pointer_width_fields(tree: str) -> None:
     for token in (
         "static void idEvent_WriteIntPtr( idSaveGame *savefile, const intptr_t value )",
         "static intptr_t idEvent_ReadIntPtr( idRestoreGame *savefile )",
+        "static const size_t EVENT_ARG_ALIGNMENT = alignof( trace_t ) > alignof( intptr_t )",
+        'static_assert( EVENT_ARG_ALIGNMENT <= 16, "event data allocator alignment is insufficient" );',
+        "static const size_t EVENT_TRACE_DATA_OFFSET =",
+        "dataPtr + EVENT_TRACE_DATA_OFFSET",
+        "dataPtr + EVENT_TRACE_MATERIAL_OFFSET",
+        "static size_t idEvent_GetLegacyArgLayout",
+        "static void idEvent_ConvertLegacyRawArgs",
+        "memcpy( destPtr + EVENT_TRACE_DATA_OFFSET, sourcePtr + sizeof( bool ), sizeof( trace_t ) );",
+        "legacyArgSize = idEvent_GetLegacyArgLayout",
+        "if ( static_cast<size_t>( argsize ) != legacyArgSize )",
+        "idEvent_ConvertLegacyRawArgs( event->eventdef, event->data, legacyData, legacyOffsets );",
+        'throw idAllocError( "idEvent data exceeds the 32-bit heap limit" );',
+        'throw idAllocError( "restored idEvent data exceeds the 32-bit heap limit" );',
+        'throw idAllocError( "restored legacy idEvent data exceeds the 32-bit heap limit" );',
+        "if ( ev->data == NULL )",
+        "if ( legacyData == NULL )",
         "case D_EVENT_INTEGER64bit",
         "idEvent_WriteIntPtr( savefile, *reinterpret_cast<intptr_t *>( dataPtr ) );",
         "*reinterpret_cast<intptr_t *>( dataPtr ) = idEvent_ReadIntPtr( savefile );",
     ):
         require(event_source, token, f"{tree} event intptr save/restore")
+
+    require(event_header, "size_t\t\t\t\t\t\targOffset", f"{tree} event argument offsets")
+    if event_source.count("if ( event->data == NULL )") != 2:
+        raise AssertionError(f"{tree} typed and legacy restore allocations must both be checked")
+    reject(event_source, "dataPtr + sizeof( bool )", f"{tree} unaligned trace payload")
+    reject(event_source, "static_cast<size_t>( argsize ) == eventArgSize", f"{tree} ambiguous legacy raw event layout")
 
 
 def validate_savegame_object_serialization(tree: str) -> None:

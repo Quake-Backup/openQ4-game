@@ -391,12 +391,12 @@ void VPCALL idSIMD_MMX::Memcpy( void *dest0, const void *src0, const int count0 
 	memcpy( dest0, src0, count0 );
 #else
 	// if copying more than 16 bytes and we can copy 8 byte aligned
-	if ( count0 > 16 && !( ( (int)dest0 ^ (int)src0 ) & 7 ) ) {
+	if ( count0 > 16 && !( ( reinterpret_cast<uintptr_t>( dest0 ) ^ reinterpret_cast<uintptr_t>( src0 ) ) & 7u ) ) {
 		byte *dest = (byte *)dest0;
 		byte *src = (byte *)src0;
 
 		// copy up to the first 8 byte aligned boundary
-		int count = ((int)dest) & 7;
+		int count = static_cast<int>( ( -reinterpret_cast<uintptr_t>( dest ) ) & 7u );
 		memcpy( dest, src, count );
 		dest += count;
 		src += count;
@@ -452,7 +452,7 @@ void VPCALL idSIMD_MMX::Memset( void* dest0, const int val, const int count0 ) {
 	byte *dest = (byte *)dest0;
 	int count = count0;
 
-	while( count > 0 && (((int)dest) & 7) ) {
+	while( count > 0 && ( reinterpret_cast<uintptr_t>( dest ) & 7u ) ) {
 		*dest = val;
 		dest++;
 		count--;

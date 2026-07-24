@@ -434,7 +434,7 @@ private:
 	static idList<idTypeInfo *>	types;
 	static idList<idTypeInfo *>	typenums;
 	static int					typeNumBits;
-	static int					memused;
+	static size_t				memused;
 	static int					numobjects;
 	
 // RAVEN BEGIN

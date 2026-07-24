@@ -7,6 +7,8 @@
 #ifndef __QGL_H__
 #define __QGL_H__
 
+#include <stdint.h>
+
 #if defined( _WINDOWS )
 
 #include <gl/gl.h>
@@ -615,8 +617,8 @@ extern GLXContext (*qglXGetCurrentContext)( void );
 #if defined( _XENON )
 extern void ( APIENTRY * qglSetTexCacheDefault2DImageId ) (int id);
 extern void ( APIENTRY * qglSetTexCacheDefaultCubeImageId ) (int id);
-extern  GLboolean ( APIENTRY * qglTexImageExistsInBundles ) ( unsigned long texNameCRC32 );
-extern  void ( APIENTRY * qglTexImageFromCache )(int id, unsigned long texNameCRC32 );
+extern  GLboolean ( APIENTRY * qglTexImageExistsInBundles ) ( uint32_t texNameCRC32 );
+extern  void ( APIENTRY * qglTexImageFromCache )(int id, uint32_t texNameCRC32 );
 
 // nrausch: capture backbuffer to memory
 extern void xglCapture( int width, int height, void * RESTRICT pixels );

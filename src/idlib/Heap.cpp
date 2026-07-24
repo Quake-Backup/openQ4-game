@@ -109,6 +109,7 @@ void local_free(void *ptr)
 #define SMALL_HEADER_SIZE		( (int) ( sizeof( byte ) + sizeof( byte ) ) )
 #define MEDIUM_HEADER_SIZE		( (int) ( sizeof( mediumHeapEntry_s ) + sizeof( byte ) ) )
 #define LARGE_HEADER_SIZE		( (int) ( sizeof( uintptr_t ) + sizeof( byte ) ) )
+#define MALLOC_HEADER_SIZE		0
 #endif
 // RAVEN END
 
@@ -185,7 +186,7 @@ void PrintOutstandingMemAlloc()
 {
 	
 	int i;
-	unsigned long totalOutstanding = 0;
+	long long totalOutstanding = 0;
 	for (i=0;i<MA_MAX;i++)
 	{
 		if (OutstandingXMallocTagSize[i] || PeakXMallocTagSize[i])
@@ -194,7 +195,7 @@ void PrintOutstandingMemAlloc()
 			totalOutstanding += OutstandingXMallocTagSize[i];
 		}
 	}
-	idLib::common->Printf("Mem_Alloc Outstanding: %d\n",totalOutstanding);
+	idLib::common->Printf("Mem_Alloc Outstanding: %lld\n",totalOutstanding);
 	
 }
 
@@ -903,7 +904,7 @@ void *idHeap::SmallAllocate( dword bytes, byte tag ) {
 		return (void *)(link);
 	}
 
-	dword bytesLeft = (long)(pageSize) - smallCurPageOffset;
+	const dword bytesLeft = pageSize - smallCurPageOffset;
 	// if we need to allocate a new page
 	if ( bytes >= bytesLeft ) {
 
@@ -1496,6 +1497,26 @@ void Mem_UpdateFreeStats( int size ) {
 	mem_total_allocs.totalSize -= size;
 }
 
+/*
+==================
+Mem_ValidateAllocSize
+
+The legacy heap stores allocation sizes and statistics in signed 32-bit
+fields. Accept native size_t at public boundaries, but reject values that
+cannot be represented before converting them for the internal heap.
+==================
+*/
+static bool Mem_ValidateAllocSize( const size_t size, const size_t overhead, const char *functionName ) {
+	const size_t maxHeapSize = ID_HEAP_MAX_SIZE;
+	if ( overhead > maxHeapSize || size > maxHeapSize - overhead ) {
+		if ( idLib::common ) {
+			idLib::common->FatalError( "%s: allocation of %zu bytes exceeds the 32-bit heap limit", functionName, size );
+		}
+		return false;
+	}
+	return true;
+}
+
 
 #ifndef ID_DEBUG_MEMORY
 
@@ -1506,10 +1527,14 @@ Mem_Alloc
 */
 // RAVEN BEGIN
 // amccarthy: Added allocation tag
-void *Mem_Alloc( const int size, byte tag ) {
+void *Mem_Alloc( const size_t size, byte tag ) {
 	if ( !size ) {
 		return NULL;
 	}
+	if ( !Mem_ValidateAllocSize( size, MALLOC_HEADER_SIZE, "Mem_Alloc" ) ) {
+		return NULL;
+	}
+	const int heapSize = static_cast<int>( size );
 	if ( !mem_heap ) {
 #ifdef CRASH_ON_STATIC_ALLOCATION
 		*((int*)0x0) = 1;
@@ -1518,7 +1543,7 @@ void *Mem_Alloc( const int size, byte tag ) {
 		return local_malloc( size );
 	}
 // amccarthy: Added allocation tag
-	void *mem = mem_heap->Allocate( size, tag );
+	void *mem = mem_heap->Allocate( static_cast<dword>( heapSize ), tag );
 	Mem_UpdateAllocStats( mem_heap->Msize( mem ) );
 	return mem;
 }
@@ -1554,10 +1579,14 @@ Mem_Alloc16
 */
 // RAVEN BEGIN
 // amccarthy: Added allocation tag
-void *Mem_Alloc16( const int size, byte tag ) {
+void *Mem_Alloc16( const size_t size, byte tag ) {
 	if ( !size ) {
 		return NULL;
 	}
+	if ( !Mem_ValidateAllocSize( size, MALLOC_HEADER_SIZE + 16 + sizeof( uintptr_t ), "Mem_Alloc16" ) ) {
+		return NULL;
+	}
+	const int heapSize = static_cast<int>( size );
 	if ( !mem_heap ) {
 #ifdef CRASH_ON_STATIC_ALLOCATION
 		*((int*)0x0) = 1;
@@ -1567,7 +1596,7 @@ void *Mem_Alloc16( const int size, byte tag ) {
 	}
 
 // amccarthy: Added allocation tag
-	void *mem = mem_heap->Allocate16( size, tag );
+	void *mem = mem_heap->Allocate16( static_cast<dword>( heapSize ), tag );
 	// make sure the memory is 16 byte aligned
 	assert( ( ((uintptr_t)mem) & 15 ) == 0 );
 	return mem;
@@ -1605,10 +1634,12 @@ Mem_ClearedAlloc
 */
 // RAVEN BEGIN
 // amccarthy: Added allocation tag
-void *Mem_ClearedAlloc( const int size, byte tag ) {
+void *Mem_ClearedAlloc( const size_t size, byte tag ) {
 	void *mem = Mem_Alloc( size, tag );
 // RAVEN END
-	SIMDProcessor->Memset( mem, 0, size );
+	if ( mem ) {
+		SIMDProcessor->Memset( mem, 0, static_cast<int>( size ) );
+	}
 	return mem;
 }
 
@@ -2074,7 +2105,7 @@ Mem_AllocDebugMemory
 ==================
 */
 // RAVEN BEGIN
-void *Mem_AllocDebugMemory( const int size, const char *fileName, const int lineNumber, const bool align16, byte tag ) {
+void *Mem_AllocDebugMemory( const size_t size, const char *fileName, const int lineNumber, const bool align16, byte tag ) {
 // RAVEN END
 	void *p;
 	debugMemory_t *m;
@@ -2082,6 +2113,11 @@ void *Mem_AllocDebugMemory( const int size, const char *fileName, const int line
 	if ( !size ) {
 		return NULL;
 	}
+	const size_t alignmentOverhead = align16 ? 16 + sizeof( uintptr_t ) : 0;
+	if ( !Mem_ValidateAllocSize( size, sizeof( debugMemory_t ) + alignmentOverhead + MALLOC_HEADER_SIZE, "Mem_AllocDebugMemory" ) ) {
+		return NULL;
+	}
+	const int heapSize = static_cast<int>( size );
 
 	if ( !mem_heap ) {
 #ifdef CRASH_ON_STATIC_ALLOCATION
@@ -2096,14 +2132,14 @@ void *Mem_AllocDebugMemory( const int size, const char *fileName, const int line
 
 	if ( align16 ) {
 // RAVEN BEGIN
-		p = mem_heap->Allocate16( size + sizeof( debugMemory_t ), tag );
+		p = mem_heap->Allocate16( static_cast<dword>( heapSize + sizeof( debugMemory_t ) ), tag );
 	}
 	else {
-		p = mem_heap->Allocate( size + sizeof( debugMemory_t ), tag );
+		p = mem_heap->Allocate( static_cast<dword>( heapSize + sizeof( debugMemory_t ) ), tag );
 // RAVEN END
 	}
 
-	Mem_UpdateAllocStats( size );
+	Mem_UpdateAllocStats( heapSize );
 
 	m = (debugMemory_t *) p;
 // RAVEN BEGIN
@@ -2113,7 +2149,7 @@ void *Mem_AllocDebugMemory( const int size, const char *fileName, const int line
 	m->fileName = fileName;
 	m->lineNumber = lineNumber;
 	m->frameNumber = idLib::frameNumber;
-	m->size = size;
+	m->size = heapSize;
 	m->next = mem_debugMemory;
 	m->prev = NULL;
 	if ( mem_debugMemory ) {
@@ -2187,7 +2223,7 @@ void Mem_FreeDebugMemory( void *p, const char *fileName, const int lineNumber, c
 Mem_Alloc
 ==================
 */
-void *Mem_Alloc( const int size, const char *fileName, const int lineNumber, byte tag ) {
+void *Mem_Alloc( const size_t size, const char *fileName, const int lineNumber, byte tag ) {
 	if ( !size ) {
 		return NULL;
 	}
@@ -2211,7 +2247,7 @@ void Mem_Free( void *ptr, const char *fileName, const int lineNumber ) {
 Mem_Alloc16
 ==================
 */
-void *Mem_Alloc16( const int size, const char *fileName, const int lineNumber, byte tag ) {
+void *Mem_Alloc16( const size_t size, const char *fileName, const int lineNumber, byte tag ) {
 	if ( !size ) {
 		return NULL;
 	}
@@ -2240,9 +2276,11 @@ void Mem_Free16( void *ptr, const char *fileName, const int lineNumber ) {
 Mem_ClearedAlloc
 ==================
 */
-void *Mem_ClearedAlloc( const int size, const char *fileName, const int lineNumber, byte tag ) {
+void *Mem_ClearedAlloc( const size_t size, const char *fileName, const int lineNumber, byte tag ) {
 	void *mem = Mem_Alloc( size, fileName, lineNumber, tag );
-	SIMDProcessor->Memset( mem, 0, size );
+	if ( mem ) {
+		SIMDProcessor->Memset( mem, 0, static_cast<int>( size ) );
+	}
 	return mem;
 }
 

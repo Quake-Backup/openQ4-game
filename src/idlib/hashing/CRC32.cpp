@@ -140,33 +140,28 @@ static const crc32Word_t crctable[256] = {
 
 #endif
 
-void CRC32_InitChecksum( unsigned long &crcvalue ) {
-	crcvalue = static_cast<unsigned long>( CRC32_INIT_VALUE );
+void CRC32_InitChecksum( uint32_t &crcvalue ) {
+	crcvalue = CRC32_INIT_VALUE;
 }
 
-void CRC32_Update( unsigned long &crcvalue, const byte data ) {
-	const crc32Word_t crc = static_cast<crc32Word_t>( crcvalue );
-	crcvalue = static_cast<unsigned long>( crctable[ ( crc ^ data ) & 0xffu ] ^ ( crc >> 8 ) );
+void CRC32_Update( uint32_t &crcvalue, const byte data ) {
+	crcvalue = crctable[ ( crcvalue ^ data ) & 0xffu ] ^ ( crcvalue >> 8 );
 }
 
-void CRC32_UpdateChecksum( unsigned long &crcvalue, const void *data, int length ) {
-	crc32Word_t crc;
+void CRC32_UpdateChecksum( uint32_t &crcvalue, const void *data, int length ) {
 	const unsigned char *buf = (const unsigned char *) data;
 
-	crc = static_cast<crc32Word_t>( crcvalue );
 	while( length-- ) {
-		crc = crctable[ ( crc ^ ( *buf++ ) ) & 0xffu ] ^ ( crc >> 8 );
+		crcvalue = crctable[ ( crcvalue ^ ( *buf++ ) ) & 0xffu ] ^ ( crcvalue >> 8 );
 	}
-	crcvalue = static_cast<unsigned long>( crc );
 }
 
-void CRC32_FinishChecksum( unsigned long &crcvalue ) {
-	const crc32Word_t crc = static_cast<crc32Word_t>( crcvalue ) ^ CRC32_XOR_VALUE;
-	crcvalue = static_cast<unsigned long>( crc );
+void CRC32_FinishChecksum( uint32_t &crcvalue ) {
+	crcvalue ^= CRC32_XOR_VALUE;
 }
 
-unsigned long CRC32_BlockChecksum( const void *data, int length ) {
-	unsigned long crc;
+uint32_t CRC32_BlockChecksum( const void *data, int length ) {
+	uint32_t crc;
 
 	CRC32_InitChecksum( crc );
 	CRC32_UpdateChecksum( crc, data, length );

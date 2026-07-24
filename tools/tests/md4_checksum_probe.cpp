@@ -7,7 +7,7 @@
 
 struct checksumVector_t {
 	const char *text;
-	unsigned long expected;
+	uint32_t expected;
 };
 
 int main() {

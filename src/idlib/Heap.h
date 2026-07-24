@@ -3,6 +3,10 @@
 #define __HEAP_H__
 
 #include <stddef.h>
+#include <stdint.h>
+#include <limits.h>
+
+static const size_t ID_HEAP_MAX_SIZE = 0x7fffffffu;
 
 /*
 ===============================================================================
@@ -219,18 +223,18 @@ public:
 
 // RAVEN BEGIN
 // amccarthy: added tags from memory allocation tracking.
-void *		Mem_Alloc( const int size, byte tag = MA_DEFAULT );
-void *		Mem_ClearedAlloc( const int size, byte tag = MA_DEFAULT );
+void *		Mem_Alloc( const size_t size, byte tag = MA_DEFAULT );
+void *		Mem_ClearedAlloc( const size_t size, byte tag = MA_DEFAULT );
 void		Mem_Free( void *ptr );
 char *		Mem_CopyString( const char *in );
-void *		Mem_Alloc16( const int size, byte tag=MA_DEFAULT );
+void *		Mem_Alloc16( const size_t size, byte tag=MA_DEFAULT );
 void		Mem_Free16( void *ptr );
 
 // jscott: standardised stack allocation
 inline void *Mem_StackAlloc( const int size ) { return( _alloca( size ) ); }
 inline void *Mem_StackAlloc16( const int size ) { 
 	byte *addr = ( byte * )_alloca( size + 15 );
-	addr = ( byte * )( ( intptr_t )( addr + 15 ) & ~(intptr_t)15 );
+	addr = ( byte * )( ( uintptr_t )( addr + 15 ) & ~(uintptr_t)15 );
 	return( ( void * )addr ); 
 }
 
@@ -250,11 +254,11 @@ void operator delete[]( void *p );
 
 // RAVEN BEGIN
 // amccarthy: added tags from memory allocation tracking.
-void *		Mem_Alloc( const int size, const char *fileName, const int lineNumber, byte tag = MA_DEFAULT );
-void *		Mem_ClearedAlloc( const int size, const char *fileName, const int lineNumber, byte tag = MA_DEFAULT );
+void *		Mem_Alloc( const size_t size, const char *fileName, const int lineNumber, byte tag = MA_DEFAULT );
+void *		Mem_ClearedAlloc( const size_t size, const char *fileName, const int lineNumber, byte tag = MA_DEFAULT );
 void		Mem_Free( void *ptr, const char *fileName, const int lineNumber );
 char *		Mem_CopyString( const char *in, const char *fileName, const int lineNumber );
-void *		Mem_Alloc16( const int size, const char *fileName, const int lineNumber, byte tag = MA_DEFAULT);
+void *		Mem_Alloc16( const size_t size, const char *fileName, const int lineNumber, byte tag = MA_DEFAULT);
 void		Mem_Free16( void *ptr, const char *fileName, const int lineNumber );
 
 
@@ -262,7 +266,7 @@ void		Mem_Free16( void *ptr, const char *fileName, const int lineNumber );
 inline void *Mem_StackAlloc( const int size ) { return( _alloca( size ) ); }
 inline void *Mem_StackAlloc16( const int size ) { 
 	byte *addr = ( byte * )_alloca( size + 15 );
-	addr = ( byte * )( ( intptr_t )( addr + 15 ) & ~(intptr_t)15 );
+	addr = ( byte * )( ( uintptr_t )( addr + 15 ) & ~(uintptr_t)15 );
 	return( ( void * )addr ); 
 }
 
@@ -431,14 +435,15 @@ public:
 	int								GetNumBaseBlocks( void ) const { return 0; }
 	int								GetBaseBlockMemory( void ) const { return 0; }
 	int								GetNumUsedBlocks( void ) const { return numUsedBlocks; }
-	int								GetUsedBlockMemory( void ) const { return usedBlockMemory; }
+	int								GetUsedBlockMemory( void ) const { return usedBlockMemory > ID_HEAP_MAX_SIZE ? static_cast<int>( ID_HEAP_MAX_SIZE ) : static_cast<int>( usedBlockMemory ); }
+	size_t							GetUsedBlockMemorySize( void ) const { return usedBlockMemory; }
 	int								GetNumFreeBlocks( void ) const { return 0; }
 	int								GetFreeBlockMemory( void ) const { return 0; }
 	int								GetNumEmptyBaseBlocks( void ) const { return 0; }
 
 private:
 	int								numUsedBlocks;			// number of used blocks
-	int								usedBlockMemory;		// total memory in used blocks
+	size_t							usedBlockMemory;		// total memory in used blocks
 
 	int								numAllocs;
 	int								numResizes;
@@ -472,12 +477,21 @@ type *idDynamicAlloc<type, baseBlockSize, minBlockSize, memoryTag>::Alloc( const
 	if ( num <= 0 ) {
 		return NULL;
 	}
+	const size_t elementCount = static_cast<size_t>( num );
+	if ( elementCount > ID_HEAP_MAX_SIZE / sizeof( type ) ) {
+		return NULL;
+	}
+	const int byteCount = static_cast<int>( elementCount * sizeof( type ) );
+	type *result = (type *) ( (byte *) Mem_Alloc16( static_cast<size_t>( byteCount ), memoryTag ) );
+	if ( result == NULL ) {
+		return NULL;
+	}
 	numUsedBlocks++;
-	usedBlockMemory += num * sizeof( type );
+	usedBlockMemory += byteCount;
 // RAVEN BEGIN
 // jscott: to make it build
 // mwhitlock: to make it build on Xenon
-	return (type *) ( (byte *) Mem_Alloc16( num * sizeof( type ), memoryTag ) );
+	return result;
 // RAVEN BEGIN
 }
 
@@ -496,10 +510,13 @@ type *idDynamicAlloc<type, baseBlockSize, minBlockSize, memoryTag>::Resize( type
 	}
 
 	type *newptr = Alloc( num );
+	if ( newptr == NULL ) {
+		return NULL;
+	}
 
 	if ( ptr != NULL ) {
 		const int oldSize = Mem_Size(ptr);
-		const int newSize = num*sizeof(type);
+		const int newSize = static_cast<int>( static_cast<size_t>( num ) * sizeof( type ) );
 		SIMDProcessor->Memcpy( newptr, ptr, (newSize<oldSize)?newSize:oldSize );
 		Free(ptr);
 	}
@@ -555,7 +572,7 @@ void idDynamicAlloc<type, baseBlockSize, minBlockSize, memoryTag>::Clear( void )
 // RAVEN END
 
 template<class type>
-class idDynamicBlock {
+class alignas(16) idDynamicBlock {
 public:
 	type *							GetMemory( void ) const { return (type *)( ( (byte *) this ) + sizeof( idDynamicBlock<type> ) ); }
 	int								GetSize( void ) const { return abs( size ); }
@@ -594,11 +611,14 @@ public:
 	const char *					CheckMemory( const type *ptr ) const;
 
 	int								GetNumBaseBlocks( void ) const { return numBaseBlocks; }
-	int								GetBaseBlockMemory( void ) const { return baseBlockMemory; }
+	int								GetBaseBlockMemory( void ) const { return baseBlockMemory > ID_HEAP_MAX_SIZE ? static_cast<int>( ID_HEAP_MAX_SIZE ) : static_cast<int>( baseBlockMemory ); }
+	size_t							GetBaseBlockMemorySize( void ) const { return baseBlockMemory; }
 	int								GetNumUsedBlocks( void ) const { return numUsedBlocks; }
-	int								GetUsedBlockMemory( void ) const { return usedBlockMemory; }
+	int								GetUsedBlockMemory( void ) const { return usedBlockMemory > ID_HEAP_MAX_SIZE ? static_cast<int>( ID_HEAP_MAX_SIZE ) : static_cast<int>( usedBlockMemory ); }
+	size_t							GetUsedBlockMemorySize( void ) const { return usedBlockMemory; }
 	int								GetNumFreeBlocks( void ) const { return numFreeBlocks; }
-	int								GetFreeBlockMemory( void ) const { return freeBlockMemory; }
+	int								GetFreeBlockMemory( void ) const { return freeBlockMemory > ID_HEAP_MAX_SIZE ? static_cast<int>( ID_HEAP_MAX_SIZE ) : static_cast<int>( freeBlockMemory ); }
+	size_t							GetFreeBlockMemorySize( void ) const { return freeBlockMemory; }
 	int								GetNumEmptyBaseBlocks( void ) const;
 
 private:
@@ -616,17 +636,18 @@ private:
 #endif
 
 	int								numBaseBlocks;			// number of base blocks
-	int								baseBlockMemory;		// total memory in base blocks
+	size_t							baseBlockMemory;		// total memory in base blocks
 	int								numUsedBlocks;			// number of used blocks
-	int								usedBlockMemory;		// total memory in used blocks
+	size_t							usedBlockMemory;		// total memory in used blocks
 	int								numFreeBlocks;			// number of free blocks
-	int								freeBlockMemory;		// total memory in free blocks
+	size_t							freeBlockMemory;		// total memory in free blocks
 
 	int								numAllocs;
 	int								numResizes;
 	int								numFrees;
 
 	void							Clear( void );
+	static bool						GetAlignedBlockSize( const int num, int &alignedBytes );
 	idDynamicBlock<type> *			AllocInternal( const int num );
 	idDynamicBlock<type> *			ResizeInternal( idDynamicBlock<type> *block, const int num );
 	void							FreeInternal( idDynamicBlock<type> *block );
@@ -692,6 +713,9 @@ void idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, memoryTag>::SetFixed
 //amccarthy: Added allocation tag
 		block = ( idDynamicBlock<type> * ) Mem_Alloc16( baseBlockSize, memoryTag );
 //RAVEN END
+		if ( block == NULL ) {
+			break;
+		}
 		if ( lockMemory ) {
 			idLib::sys->LockMemory( block, baseBlockSize );
 		}
@@ -819,10 +843,12 @@ type *idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, memoryTag>::Resize(
 
 	idDynamicBlock<type> *block = ( idDynamicBlock<type> * ) ( ( (byte *) ptr ) - (int)sizeof( idDynamicBlock<type> ) );
 
-	usedBlockMemory -= block->GetSize();
+	const size_t oldBlockSize = static_cast<size_t>( block->GetSize() );
+	usedBlockMemory -= oldBlockSize;
 
 	block = ResizeInternal( block, num );
 	if ( block == NULL ) {
+		usedBlockMemory += oldBlockSize;
 		return NULL;
 	}
 
@@ -883,7 +909,9 @@ const char *idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, memoryTag>::C
 	idDynamicBlock<type> *base;
 	for ( base = firstBlock; base != NULL; base = base->next ) {
 		if ( base->IsBaseBlock() ) {
-			if ( ((int)block) >= ((int)base) && ((int)block) < ((int)base) + baseBlockSize ) {
+			const uintptr_t blockAddress = reinterpret_cast<uintptr_t>( block );
+			const uintptr_t baseAddress = reinterpret_cast<uintptr_t>( base );
+			if ( blockAddress >= baseAddress && blockAddress < baseAddress + static_cast<uintptr_t>( baseBlockSize ) ) {
 				break;
 			}
 		}
@@ -937,9 +965,35 @@ void idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, memoryTag>::Clear( v
 }
 
 template<class type, int baseBlockSize, int minBlockSize, byte memoryTag>
+bool idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, memoryTag>::GetAlignedBlockSize( const int num, int &alignedBytes ) {
+	const size_t blockHeaderSize = sizeof( idDynamicBlock<type> );
+	const size_t maxPayload = ID_HEAP_MAX_SIZE - blockHeaderSize - 15;
+
+	if ( num <= 0 ) {
+		return false;
+	}
+	const size_t elementCount = static_cast<size_t>( num );
+	if ( elementCount > maxPayload / sizeof( type ) ) {
+		return false;
+	}
+
+	const size_t byteCount = elementCount * sizeof( type );
+	const size_t alignedByteCount = ( byteCount + 15 ) & ~static_cast<size_t>( 15 );
+	if ( alignedByteCount > ID_HEAP_MAX_SIZE - blockHeaderSize ) {
+		return false;
+	}
+
+	alignedBytes = static_cast<int>( alignedByteCount );
+	return true;
+}
+
+template<class type, int baseBlockSize, int minBlockSize, byte memoryTag>
 idDynamicBlock<type> *idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, memoryTag>::AllocInternal( const int num ) {
 	idDynamicBlock<type> *block;
-	int alignedBytes = ( num * sizeof( type ) + 15 ) & ~15;
+	int alignedBytes;
+	if ( !GetAlignedBlockSize( num, alignedBytes ) ) {
+		return NULL;
+	}
 
 	block = freeTree.FindSmallestLargerEqual( alignedBytes );
 	if ( block != NULL ) {
@@ -950,8 +1004,11 @@ idDynamicBlock<type> *idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, mem
 //amccarthy: Added allocation tag
 		block = ( idDynamicBlock<type> * ) Mem_Alloc16( allocSize, memoryTag );
 //RAVEN END
+		if ( block == NULL ) {
+			return NULL;
+		}
 		if ( lockMemory ) {
-			idLib::sys->LockMemory( block, baseBlockSize );
+			idLib::sys->LockMemory( block, allocSize );
 		}
 // RAVEN BEGIN
 // jnewquist: Fast sanity checking of idDynamicBlockAlloc
@@ -980,7 +1037,10 @@ idDynamicBlock<type> *idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, mem
 
 template<class type, int baseBlockSize, int minBlockSize, byte memoryTag>
 idDynamicBlock<type> *idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, memoryTag>::ResizeInternal( idDynamicBlock<type> *block, const int num ) {
-	int alignedBytes = ( num * sizeof( type ) + 15 ) & ~15;
+	int alignedBytes;
+	if ( !GetAlignedBlockSize( num, alignedBytes ) ) {
+		return NULL;
+	}
 
 // RAVEN BEGIN
 // jnewquist: Fast sanity checking of idDynamicBlockAlloc
@@ -1006,11 +1066,14 @@ idDynamicBlock<type> *idDynamicBlockAlloc<type, baseBlockSize, minBlockSize, mem
 		idDynamicBlock<type> *nextBlock = block->next;
 
 		// try to annexate the next block if it's free
+		const int64_t combinedSize = nextBlock
+			? static_cast<int64_t>( block->GetSize() ) + static_cast<int64_t>( sizeof( idDynamicBlock<type> ) ) + nextBlock->GetSize()
+			: 0;
 		if ( nextBlock && !nextBlock->IsBaseBlock() && nextBlock->node != NULL &&
-				block->GetSize() + (int)sizeof( idDynamicBlock<type> ) + nextBlock->GetSize() >= alignedBytes ) {
+				combinedSize >= alignedBytes && combinedSize <= static_cast<int64_t>( ID_HEAP_MAX_SIZE ) ) {
 
 			UnlinkFreeInternal( nextBlock );
-			block->SetSize( block->GetSize() + (int)sizeof( idDynamicBlock<type> ) + nextBlock->GetSize(), block->IsBaseBlock() );
+			block->SetSize( static_cast<int>( combinedSize ), block->IsBaseBlock() );
 			block->next = nextBlock->next;
 			if ( nextBlock->next ) {
 				nextBlock->next->prev = block;

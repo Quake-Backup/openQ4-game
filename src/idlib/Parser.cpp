@@ -10,6 +10,75 @@
 
 define_t * idParser::globaldefines;
 
+// Preprocessor integer expressions have the 32-bit wraparound semantics used
+// by the original engine. Perform the operations through unsigned bit patterns
+// so the result is independent of signed-overflow and signed-shift behavior.
+static ID_INLINE uint32_t idParser_Int32Bits( const int32_t value ) {
+	uint32_t bits;
+	memcpy( &bits, &value, sizeof( bits ) );
+	return bits;
+}
+
+static ID_INLINE int32_t idParser_Int32FromBits( const uint32_t bits ) {
+	int32_t value;
+	memcpy( &value, &bits, sizeof( value ) );
+	return value;
+}
+
+static ID_INLINE int32_t idParser_Int32Negate( const int32_t value ) {
+	return idParser_Int32FromBits( 0u - idParser_Int32Bits( value ) );
+}
+
+static ID_INLINE int32_t idParser_Int32Add( const int32_t lhs, const int32_t rhs ) {
+	return idParser_Int32FromBits( idParser_Int32Bits( lhs ) + idParser_Int32Bits( rhs ) );
+}
+
+static ID_INLINE int32_t idParser_Int32Subtract( const int32_t lhs, const int32_t rhs ) {
+	return idParser_Int32FromBits( idParser_Int32Bits( lhs ) - idParser_Int32Bits( rhs ) );
+}
+
+static ID_INLINE int32_t idParser_Int32Multiply( const int32_t lhs, const int32_t rhs ) {
+	return idParser_Int32FromBits( idParser_Int32Bits( lhs ) * idParser_Int32Bits( rhs ) );
+}
+
+static ID_INLINE bool idParser_IsValidShiftCount( const int32_t shift ) {
+	return shift >= 0 && shift < 32;
+}
+
+static ID_INLINE int32_t idParser_Int32LeftShift( const int32_t value, const uint32_t shift ) {
+	assert( shift < 32 );
+	return idParser_Int32FromBits( idParser_Int32Bits( value ) << shift );
+}
+
+static ID_INLINE int32_t idParser_Int32ArithmeticRightShift( const int32_t value, const uint32_t shift ) {
+	assert( shift < 32 );
+	if ( shift == 0 ) {
+		return value;
+	}
+
+	uint32_t bits = idParser_Int32Bits( value ) >> shift;
+	if ( value < 0 ) {
+		bits |= ~uint32_t( 0 ) << ( 32 - shift );
+	}
+	return idParser_Int32FromBits( bits );
+}
+
+static ID_INLINE int32_t idParser_Int32Divide( const int32_t lhs, const int32_t rhs ) {
+	assert( rhs != 0 );
+	if ( lhs == INT32_MIN && rhs == -1 ) {
+		return INT32_MIN;
+	}
+	return lhs / rhs;
+}
+
+static ID_INLINE int32_t idParser_Int32Modulo( const int32_t lhs, const int32_t rhs ) {
+	assert( rhs != 0 );
+	if ( lhs == INT32_MIN && rhs == -1 ) {
+		return 0;
+	}
+	return lhs % rhs;
+}
+
 /*
 ================
 idParser::SetBaseFolder
@@ -1372,7 +1441,7 @@ typedef struct operator_s
 
 typedef struct value_s
 {
-	signed long int intvalue;
+	int32_t intvalue;
 	double floatvalue;
 	int parentheses;
 	struct value_s *prev, *next;
@@ -1443,7 +1512,7 @@ int PC_OperatorPriority(int op) {
 
 #define FreeOperator(op)
 
-int idParser::EvaluateTokens( idToken *tokens, signed long int *intvalue, double *floatvalue, int integer ) {
+int idParser::EvaluateTokens( idToken *tokens, int32_t *intvalue, double *floatvalue, int integer ) {
 	operator_t *o, *firstoperator, *lastoperator;
 	value_t *v, *firstvalue, *lastvalue, *v1, *v2;
 	idToken *t;
@@ -1529,7 +1598,7 @@ int idParser::EvaluateTokens( idToken *tokens, signed long int *intvalue, double
 				//v = (value_t *) GetClearedMemory(sizeof(value_t));
 				AllocValue(v);
 				if (negativevalue) {
-					v->intvalue = - t->GetIntValue();
+					v->intvalue = idParser_Int32Negate( static_cast<int32_t>( t->GetIntValue() ) );
 					v->floatvalue = - t->GetFloatValue();
 				}
 				else {
@@ -1728,9 +1797,9 @@ int idParser::EvaluateTokens( idToken *tokens, signed long int *intvalue, double
 		switch(o->op) {
 			case P_LOGIC_NOT:		v1->intvalue = !v1->intvalue;
 									v1->floatvalue = !v1->floatvalue; break;
-			case P_BIN_NOT:			v1->intvalue = ~v1->intvalue;
+			case P_BIN_NOT:			v1->intvalue = idParser_Int32FromBits( ~idParser_Int32Bits( v1->intvalue ) );
 									break;
-			case P_MUL:				v1->intvalue *= v2->intvalue;
+			case P_MUL:				v1->intvalue = idParser_Int32Multiply( v1->intvalue, v2->intvalue );
 									v1->floatvalue *= v2->floatvalue; break;
 			case P_DIV:				if (!v2->intvalue || !v2->floatvalue)
 									{
@@ -1738,7 +1807,7 @@ int idParser::EvaluateTokens( idToken *tokens, signed long int *intvalue, double
 										error = 1;
 										break;
 									}
-									v1->intvalue /= v2->intvalue;
+									v1->intvalue = idParser_Int32Divide( v1->intvalue, v2->intvalue );
 									v1->floatvalue /= v2->floatvalue; break;
 			case P_MOD:				if (!v2->intvalue)
 									{
@@ -1746,10 +1815,10 @@ int idParser::EvaluateTokens( idToken *tokens, signed long int *intvalue, double
 										error = 1;
 										break;
 									}
-									v1->intvalue %= v2->intvalue; break;
-			case P_ADD:				v1->intvalue += v2->intvalue;
+									v1->intvalue = idParser_Int32Modulo( v1->intvalue, v2->intvalue ); break;
+			case P_ADD:				v1->intvalue = idParser_Int32Add( v1->intvalue, v2->intvalue );
 									v1->floatvalue += v2->floatvalue; break;
-			case P_SUB:				v1->intvalue -= v2->intvalue;
+			case P_SUB:				v1->intvalue = idParser_Int32Subtract( v1->intvalue, v2->intvalue );
 									v1->floatvalue -= v2->floatvalue; break;
 			case P_LOGIC_AND:		v1->intvalue = v1->intvalue && v2->intvalue;
 									v1->floatvalue = v1->floatvalue && v2->floatvalue; break;
@@ -1767,15 +1836,25 @@ int idParser::EvaluateTokens( idToken *tokens, signed long int *intvalue, double
 									v1->floatvalue = v1->floatvalue > v2->floatvalue; break;
 			case P_LOGIC_LESS:		v1->intvalue = v1->intvalue < v2->intvalue;
 									v1->floatvalue = v1->floatvalue < v2->floatvalue; break;
-			case P_RSHIFT:			v1->intvalue >>= v2->intvalue;
+			case P_RSHIFT:			if ( !idParser_IsValidShiftCount( v2->intvalue ) ) {
+										idParser::Error( "shift count %d out of range in #if/#elif\n", v2->intvalue );
+										error = 1;
+										break;
+									}
+									v1->intvalue = idParser_Int32ArithmeticRightShift( v1->intvalue, static_cast<uint32_t>( v2->intvalue ) );
 									break;
-			case P_LSHIFT:			v1->intvalue <<= v2->intvalue;
+			case P_LSHIFT:			if ( !idParser_IsValidShiftCount( v2->intvalue ) ) {
+										idParser::Error( "shift count %d out of range in #if/#elif\n", v2->intvalue );
+										error = 1;
+										break;
+									}
+									v1->intvalue = idParser_Int32LeftShift( v1->intvalue, static_cast<uint32_t>( v2->intvalue ) );
 									break;
-			case P_BIN_AND:			v1->intvalue &= v2->intvalue;
+			case P_BIN_AND:			v1->intvalue = idParser_Int32FromBits( idParser_Int32Bits( v1->intvalue ) & idParser_Int32Bits( v2->intvalue ) );
 									break;
-			case P_BIN_OR:			v1->intvalue |= v2->intvalue;
+			case P_BIN_OR:			v1->intvalue = idParser_Int32FromBits( idParser_Int32Bits( v1->intvalue ) | idParser_Int32Bits( v2->intvalue ) );
 									break;
-			case P_BIN_XOR:			v1->intvalue ^= v2->intvalue;
+			case P_BIN_XOR:			v1->intvalue = idParser_Int32FromBits( idParser_Int32Bits( v1->intvalue ) ^ idParser_Int32Bits( v2->intvalue ) );
 									break;
 			case P_COLON:
 			{
@@ -1868,7 +1947,7 @@ int idParser::EvaluateTokens( idToken *tokens, signed long int *intvalue, double
 idParser::Evaluate
 ================
 */
-int idParser::Evaluate( signed long int *intvalue, double *floatvalue, int integer ) {
+int idParser::Evaluate( int32_t *intvalue, double *floatvalue, int integer ) {
 	idToken token, *firsttoken, *lasttoken;
 	idToken *t, *nexttoken;
 	define_t *define;
@@ -1959,7 +2038,7 @@ int idParser::Evaluate( signed long int *intvalue, double *floatvalue, int integ
 idParser::DollarEvaluate
 ================
 */
-int idParser::DollarEvaluate( signed long int *intvalue, double *floatvalue, int integer) {
+int idParser::DollarEvaluate( int32_t *intvalue, double *floatvalue, int integer) {
 	int indent, defined = false;
 	idToken token, *firsttoken, *lasttoken;
 	idToken *t, *nexttoken;
@@ -2061,7 +2140,7 @@ idParser::Directive_elif
 ================
 */
 int idParser::Directive_elif( void ) {
-	signed long int value;
+	int32_t value;
 	int type, skip;
 
 	idParser::PopIndent( &type, &skip );
@@ -2083,7 +2162,7 @@ idParser::Directive_if
 ================
 */
 int idParser::Directive_if( void ) {
-	signed long int value;
+	int32_t value;
 	int skip;
 
 	if ( !idParser::Evaluate( &value, NULL, true ) ) {
@@ -2179,7 +2258,7 @@ idParser::Directive_eval
 ================
 */
 int idParser::Directive_eval( void ) {
-	signed long int value;
+	int32_t value;
 	idToken token;
 	char buf[128];
 
@@ -2192,7 +2271,10 @@ int idParser::Directive_eval( void ) {
 	token.whiteSpaceEnd_p = NULL;
 	token.linesCrossed = 0;
 	token.flags = 0;
-	sprintf( buf, "%ld", abs( value ) );
+	const uint32_t magnitude = value < 0
+		? static_cast<uint32_t>( -static_cast<int64_t>( value ) )
+		: static_cast<uint32_t>( value );
+	sprintf( buf, "%u", magnitude );
 	token = buf;
 	token.type = TT_NUMBER;
 	token.subtype = TT_INTEGER|TT_LONG|TT_DECIMAL;
@@ -2318,7 +2400,7 @@ idParser::DollarDirective_evalint
 ================
 */
 int idParser::DollarDirective_evalint( void ) {
-	signed long int value;
+	int32_t value;
 	idToken token;
 	char buf[128];
 
@@ -2331,12 +2413,15 @@ int idParser::DollarDirective_evalint( void ) {
 	token.whiteSpaceEnd_p = NULL;
 	token.linesCrossed = 0;
 	token.flags = 0;
-	sprintf( buf, "%ld", abs( value ) );
+	const uint32_t magnitude = value < 0
+		? static_cast<uint32_t>( -static_cast<int64_t>( value ) )
+		: static_cast<uint32_t>( value );
+	sprintf( buf, "%u", magnitude );
 	token = buf;
 	token.type = TT_NUMBER;
 	token.subtype = TT_INTEGER | TT_LONG | TT_DECIMAL | TT_VALUESVALID;
-	token.intvalue = abs( value );
-	token.floatvalue = abs( value );
+	token.intvalue = magnitude;
+	token.floatvalue = magnitude;
 	idParser::UnreadSourceToken( &token );
 	if ( value < 0 ) {
 		idParser::UnreadSignToken();
@@ -2367,7 +2452,7 @@ int idParser::DollarDirective_evalfloat( void ) {
 	token = buf;
 	token.type = TT_NUMBER;
 	token.subtype = TT_FLOAT | TT_LONG | TT_DECIMAL | TT_VALUESVALID;
-	token.intvalue = (unsigned long) fabs( value );
+	token.intvalue = static_cast<uint32_t>( fabs( value ) );
 	token.floatvalue = fabs( value );
 	idParser::UnreadSourceToken( &token );
 	if ( value < 0 ) {
@@ -2816,7 +2901,7 @@ int idParser::ParseInt( void ) {
 	}
 	if ( token.type == TT_PUNCTUATION && token == "-" ) {
 		idParser::ExpectTokenType( TT_NUMBER, TT_INTEGER, &token );
-		return -((signed int) token.GetIntValue());
+		return idParser_Int32Negate( static_cast<int32_t>( token.GetIntValue() ) );
 	}
 	else if ( token.type != TT_NUMBER || token.subtype == TT_FLOAT ) {
 		idParser::Error( "expected integer value, found '%s'", token.c_str() );

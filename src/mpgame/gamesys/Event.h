@@ -34,7 +34,7 @@ private:
 	int							returnType;
 	int							numargs;
 	size_t						argsize;
-	int							argOffset[ D_EVENT_MAXARGS ];
+	size_t						argOffset[ D_EVENT_MAXARGS ];
 	int							eventnum;
 	const idEventDef *			next;
 
@@ -51,7 +51,7 @@ public:
 	int							GetEventNum( void ) const;
 	int							GetNumArgs( void ) const;
 	size_t						GetArgSize( void ) const;
-	int							GetArgOffset( int arg ) const;
+	size_t						GetArgOffset( int arg ) const;
 
 	static int					NumEventCommands( void );
 	static const idEventDef		*GetEventCommand( int eventnum );
@@ -170,7 +170,7 @@ ID_INLINE size_t idEventDef::GetArgSize( void ) const {
 idEventDef::GetArgOffset
 ================
 */
-ID_INLINE int idEventDef::GetArgOffset( int arg ) const {
+ID_INLINE size_t idEventDef::GetArgOffset( int arg ) const {
 	assert( ( arg >= 0 ) && ( arg < D_EVENT_MAXARGS ) );
 	return argOffset[ arg ];
 }

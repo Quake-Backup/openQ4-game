@@ -33,7 +33,7 @@ instancing of objects.
 // this is the head of a singly linked list of all the idTypes
 static idTypeInfo				*typelist = NULL;
 static idHierarchy<idTypeInfo>	classHierarchy;
-static int						eventCallbackMemory	= 0;
+static size_t					eventCallbackMemory	= 0;
 
 /*
 ================
@@ -242,16 +242,23 @@ idList<idTypeInfo *>	idClass::typenums;
 
 bool	idClass::initialized	= false;
 int		idClass::typeNumBits	= 0;
-int		idClass::memused		= 0;
+size_t	idClass::memused		= 0;
 int		idClass::numobjects		= 0;
 
 static const int IDCLASS_ALLOC_HEADER_SIZE = 16;
 
 static byte *idClass_AllocBlock( size_t objectSize ) {
 	byte *block;
+	if ( objectSize > ID_HEAP_MAX_SIZE - IDCLASS_ALLOC_HEADER_SIZE ) {
+		gameLocal.Error( "idClass allocation is too large (%zu bytes)", objectSize );
+		throw idAllocError( "idClass allocation exceeds the 32-bit heap limit" );
+	}
 	const size_t totalSize = objectSize + IDCLASS_ALLOC_HEADER_SIZE;
 
-	block = static_cast<byte *>( Mem_Alloc16( static_cast<int>( totalSize ), MA_CLASS ) );
+	block = static_cast<byte *>( Mem_Alloc16( totalSize, MA_CLASS ) );
+	if ( block == NULL ) {
+		throw idAllocError( "idClass allocation failed" );
+	}
 	*reinterpret_cast<int *>( block ) = static_cast<int>( totalSize );
 
 #ifdef ID_DEBUG_MEMORY
@@ -351,7 +358,7 @@ idClass::DisplayInfo_f
 ================
 */
 void idClass::DisplayInfo_f( const idCmdArgs &args ) {
-	gameLocal.Printf( "Class memory status: %i bytes allocated in %i objects\n", memused, numobjects );
+	gameLocal.Printf( "Class memory status: %zu bytes allocated in %i objects\n", memused, numobjects );
 }
 
 /*
@@ -453,7 +460,7 @@ void idClass::Init( void ) {
 
 	initialized = true;
 
-	gameLocal.Printf( "...%i classes, %i bytes for event callbacks\n", types.Num(), eventCallbackMemory );
+	gameLocal.Printf( "...%i classes, %zu bytes for event callbacks\n", types.Num(), eventCallbackMemory );
 }
 
 /*
@@ -484,13 +491,12 @@ idClass::new
 
 void * idClass::operator new( size_t s ) {
 	byte *p;
-	const size_t totalSize = s + IDCLASS_ALLOC_HEADER_SIZE;
 
 //RAVEN BEGIN
 //amccarthy: Added memory allocation tag
 	p = idClass_AllocBlock( s );
 //RAVEN END
-	memused += static_cast<int>( totalSize );
+	memused += static_cast<size_t>( *reinterpret_cast<int *>( p ) );
 	numobjects++;
 
 	return p + IDCLASS_ALLOC_HEADER_SIZE;
@@ -498,13 +504,12 @@ void * idClass::operator new( size_t s ) {
 
 void * idClass::operator new( size_t s, int, int, char *, int ) {
 	byte *p;
-	const size_t totalSize = s + IDCLASS_ALLOC_HEADER_SIZE;
 
 //RAVEN BEGIN
 //amccarthy: Added memory allocation tag
 	p = idClass_AllocBlock( s );
 //RAVEN END
-	memused += static_cast<int>( totalSize );
+	memused += static_cast<size_t>( *reinterpret_cast<int *>( p ) );
 	numobjects++;
 
 	return p + IDCLASS_ALLOC_HEADER_SIZE;
@@ -524,7 +529,7 @@ void idClass::operator delete( void *ptr ) {
 
 	if ( ptr ) {
 		p = idClass_BlockFromObject( ptr );
-		memused -= *reinterpret_cast<int *>( p );
+		memused -= static_cast<size_t>( *reinterpret_cast<int *>( p ) );
 		numobjects--;
         Mem_Free16( p );
 	}
@@ -535,7 +540,7 @@ void idClass::operator delete( void *ptr, int, int, char *, int ) {
 
 	if ( ptr ) {
 		p = idClass_BlockFromObject( ptr );
-		memused -= *reinterpret_cast<int *>( p );
+		memused -= static_cast<size_t>( *reinterpret_cast<int *>( p ) );
 		numobjects--;
         Mem_Free16( p );
 	}
