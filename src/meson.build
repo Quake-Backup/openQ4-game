@@ -116,6 +116,11 @@ else
     '-Wno-invalid-source-encoding',
     '-Wno-deprecated-declarations',
     '-Wno-writable-strings',
+    # Match the engine: GCC/Clang default to -ffp-contract=fast and fuse
+    # a*b+c into an FMA wherever the target has one. AArch64 always does,
+    # the validated x86-64 SSE2 baseline does not, so leaving this on makes
+    # identical game-side physics and AI math diverge per architecture.
+    '-ffp-contract=off',
   ]
     if cpp.has_argument(compiler_arg)
       common_cpp_args += compiler_arg

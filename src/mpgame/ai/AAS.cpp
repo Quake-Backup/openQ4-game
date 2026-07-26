@@ -60,7 +60,10 @@ bool idAASLocal::Init( const idStr &mapName, unsigned int mapFileCRC ) {
 
 		file = AASFileManager->LoadAAS( mapName, mapFileCRC );
 		if ( !file ) {
-			common->DWarning( "Couldn't load AAS file: '%s'", mapName.c_str() );
+			// DWarning is silent unless com_developer is set, so a map whose
+			// navigation data failed to load looked completely normal while
+			// every AI that needed it silently stopped pathing
+			common->Warning( "Couldn't load AAS file: '%s' - AI that uses it cannot navigate", mapName.c_str() );
 			return false;
 		}
 // RAVEN BEGIN

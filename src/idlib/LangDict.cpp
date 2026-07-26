@@ -36,6 +36,183 @@ void idLangDict::Clear( void ) {
 
 /*
 ============
+LANGDICT_CP1252_HIGH
+
+Windows-1252 0x80-0x9F block - the only range where Windows-1252 diverges from
+Latin-1. 0 marks the five unassigned CP1252 slots (0x81/0x8D/0x8F/0x90/0x9D).
+============
+*/
+static const unsigned short LANGDICT_CP1252_HIGH[32] = {
+	0x20AC, 0x0000, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+	0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x0000, 0x017D, 0x0000,
+	0x0000, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+	0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x0000, 0x017E, 0x0178
+};
+
+/*
+============
+LANGDICT_GLYPH_FOLD
+
+The stock Quake 4 .fontdat atlases hold 256 byte-indexed glyphs, of which only
+83 of the 128 high slots carry real art, and the missing set is identical in
+every shipped Latin font. These CP1252 codes land on a 2x2 .notdef cell with
+zero horizontal advance, so a non-breaking space would not merely draw nothing,
+it would delete the word gap. Fold them to ASCII equivalents that do have art.
+============
+*/
+typedef struct langDictGlyphFold_s {
+	unsigned char	cp1252;
+	const char *	ascii;
+} langDictGlyphFold_t;
+
+static const langDictGlyphFold_t LANGDICT_GLYPH_FOLD[] = {
+	{ 0x82, "," },  { 0x84, "\"" }, { 0x85, "..." },
+	{ 0x91, "'" },  { 0x92, "'" },  { 0x93, "\"" }, { 0x94, "\"" },
+	{ 0x96, "-" },  { 0x97, "-" },  { 0xA0, " " },
+	{ 0x00, NULL }
+};
+
+static const char *LangDict_FoldForCp1252( unsigned char c ) {
+	for ( int i = 0; LANGDICT_GLYPH_FOLD[i].ascii != NULL; i++ ) {
+		if ( LANGDICT_GLYPH_FOLD[i].cp1252 == c ) {
+			return LANGDICT_GLYPH_FOLD[i].ascii;
+		}
+	}
+	return NULL;
+}
+
+/*
+============
+LangDict_DecodeUtf8
+
+Returns the number of bytes consumed, or 0 if the sequence is not well-formed
+shortest-form UTF-8.
+============
+*/
+static int LangDict_DecodeUtf8( const unsigned char *p, int available, unsigned int &codePoint ) {
+	if ( available <= 0 ) {
+		return 0;
+	}
+
+	const unsigned char c0 = p[0];
+	if ( c0 < 0x80 ) {
+		codePoint = c0;
+		return 1;
+	}
+
+	int extra;
+	unsigned int cp;
+	unsigned int minimum;
+	if ( ( c0 & 0xE0 ) == 0xC0 ) {
+		extra = 1; cp = c0 & 0x1Fu; minimum = 0x80;
+	} else if ( ( c0 & 0xF0 ) == 0xE0 ) {
+		extra = 2; cp = c0 & 0x0Fu; minimum = 0x800;
+	} else if ( ( c0 & 0xF8 ) == 0xF0 ) {
+		extra = 3; cp = c0 & 0x07u; minimum = 0x10000;
+	} else {
+		return 0;
+	}
+
+	if ( available < extra + 1 ) {
+		return 0;
+	}
+	for ( int i = 1; i <= extra; i++ ) {
+		if ( ( p[i] & 0xC0 ) != 0x80 ) {
+			return 0;
+		}
+		cp = ( cp << 6 ) | ( p[i] & 0x3Fu );
+	}
+	if ( cp < minimum || cp > 0x10FFFF || ( cp >= 0xD800 && cp <= 0xDFFF ) ) {
+		return 0;
+	}
+
+	codePoint = cp;
+	return extra + 1;
+}
+
+static bool LangDict_CodePointToCp1252( unsigned int codePoint, unsigned char &out ) {
+	if ( codePoint < 0x80 || ( codePoint >= 0xA0 && codePoint <= 0xFF ) ) {
+		out = (unsigned char)codePoint;
+		return true;
+	}
+	for ( int i = 0; i < 32; i++ ) {
+		if ( LANGDICT_CP1252_HIGH[i] != 0 && LANGDICT_CP1252_HIGH[i] == codePoint ) {
+			out = (unsigned char)( 0x80 + i );
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+============
+LangDict_ConvertUtf8ToCp1252
+
+Stock Quake 4 string tables are Windows-1252 and the fonts are 256 byte-indexed
+glyphs, so a UTF-8 table draws two wrong glyphs per accent - "MENUS" comes out
+as "MENA S". Convert only when the WHOLE buffer is well-formed UTF-8, every
+multi-byte code point round-trips to CP1252, and at least one multi-byte
+sequence is present. A genuine CP1252 table with accents is never valid UTF-8
+end to end (0xE9 followed by an ASCII letter fails the continuation-byte test),
+so CP1252 and pure-ASCII inputs are left byte-identical.
+============
+*/
+static bool LangDict_ConvertUtf8ToCp1252( const char *buffer, int length, idStr &converted ) {
+	const unsigned char *p = (const unsigned char *)buffer;
+	bool sawMultiByte = false;
+
+	for ( int i = 0; i < length; ) {
+		unsigned int cp = 0;
+		const int used = LangDict_DecodeUtf8( p + i, length - i, cp );
+		if ( used == 0 ) {
+			return false;
+		}
+		if ( used > 1 ) {
+			unsigned char mapped;
+			if ( !LangDict_CodePointToCp1252( cp, mapped ) ) {
+				return false;
+			}
+			sawMultiByte = true;
+		}
+		i += used;
+	}
+	if ( !sawMultiByte ) {
+		return false;
+	}
+
+	// The output can never be longer than the input: every multi-byte sequence
+	// collapses to a single byte, and the one expanding fold (U+2026 -> "...")
+	// is three bytes in and three bytes out.
+	converted.Fill( ' ', length );
+
+	int outIndex = 0;
+	for ( int i = 0; i < length; ) {
+		unsigned int cp = 0;
+		const int used = LangDict_DecodeUtf8( p + i, length - i, cp );
+		if ( used == 0 ) {
+			// cannot happen after the validation pass above; fail closed
+			return false;
+		}
+
+		unsigned char mapped = '?';
+		LangDict_CodePointToCp1252( cp, mapped );
+
+		const char *fold = ( used > 1 ) ? LangDict_FoldForCp1252( mapped ) : NULL;
+		if ( fold != NULL ) {
+			for ( int k = 0; fold[k] != '\0'; k++ ) {
+				converted[outIndex++] = fold[k];
+			}
+		} else {
+			converted[outIndex++] = (char)mapped;
+		}
+		i += used;
+	}
+	converted.CapLength( outIndex );
+	return true;
+}
+
+/*
+============
 idLangDict::Load
 ============
 */
@@ -45,6 +222,9 @@ bool idLangDict::Load( const char *fileName, bool clear ) {
 	}
 
 	const char *buffer = NULL;
+	// 'transcoded' must be declared before 'src': idLexer::LoadMemory() stores
+	// the pointer without copying, so the buffer has to outlive the lexer.
+	idStr transcoded;
 	idLexer src( LEXFL_NOFATALERRORS | LEXFL_NOSTRINGCONCAT | LEXFL_ALLOWMULTICHARLITERALS | LEXFL_ALLOWBACKSLASHSTRINGCONCAT );
 
 	int len = idLib::fileSystem->ReadFile( fileName, (void**)&buffer );
@@ -52,7 +232,22 @@ bool idLangDict::Load( const char *fileName, bool clear ) {
 		// let whoever called us deal with the failure (so sys_lang can be reset)
 		return false;
 	}
-	src.LoadMemory( buffer, strlen( buffer ), fileName );
+
+	const char *parseText = buffer;
+	int parseLength = (int)strlen( buffer );
+	if ( parseLength >= 3 && (unsigned char)parseText[0] == 0xEF &&
+		 (unsigned char)parseText[1] == 0xBB && (unsigned char)parseText[2] == 0xBF ) {
+		// a UTF-8 BOM would break ExpectTokenString( "{" )
+		parseText += 3;
+		parseLength -= 3;
+	}
+	if ( LangDict_ConvertUtf8ToCp1252( parseText, parseLength, transcoded ) ) {
+		idLib::common->DPrintf( "%s: converted UTF-8 string table to the 8-bit font codepage\n", fileName );
+		parseText = transcoded.c_str();
+		parseLength = transcoded.Length();
+	}
+
+	src.LoadMemory( parseText, parseLength, fileName );
 	if ( !src.IsLoaded() ) {
 		return false;
 	}
@@ -238,7 +433,10 @@ bool idLangDict::ExcludeString( const char *str ) const {
 
 	int i;
 	for ( i = 0; i < c; i++ ) {
-		if ( isalpha( str[i] ) ) {
+		// isalpha() is only defined for unsigned char values and EOF; passing a
+		// plain signed char is undefined for any byte >= 0x80, which every
+		// accented CP1252 character is
+		if ( isalpha( (unsigned char)str[i] ) ) {
 			break;
 		}
 	}

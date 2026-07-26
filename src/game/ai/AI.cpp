@@ -4706,9 +4706,37 @@ void idAI::ScriptedMove ( idEntity* destEnt, float minDist, bool endWithIdle ) {
 	//disable all temporary blocked reachabilities due to teammate obstacle avoidance
 	aiManager.UnMarkAllReachBlocked();
 	//attempt the move - NOTE: this *can* fail if there's no route or AAS obstacles are in the way!
-	MoveToEntity ( destEnt, minDist );
+	const bool moveStarted = MoveToEntity ( destEnt, minDist );
 	//re-enable all temporary blocked reachabilities due to teammate obstacle avoidance
 	aiManager.ReMarkAllReachBlocked();
+
+	// A scripted move that cannot run is a hard progression blocker: the map
+	// script waits on scriptedDone() forever, or the sequence "completes"
+	// without the AI ever reaching the thing it had to touch. Both used to be
+	// completely silent. Report the two distinct failures separately, because
+	// they need different fixes:
+	//   - no AAS: MoveToEntity() still returns true and the AI wanders on
+	//     StepDirection forever, so the script deadlocks
+	//   - AAS present but no route: MoveToEntity() returns false and the AI
+	//     simply never sets off
+	if ( !aas ) {
+		gameLocal.Warning( "scriptedMove: '%s' has no AAS (use_aas '%s'), so it cannot path to '%s' and will wander instead",
+			name.c_str(),
+			spawnArgs.GetString( "use_aas", "<none>" ),
+			destEnt ? destEnt->GetName() : "<null>" );
+	} else if ( !moveStarted ) {
+		gameLocal.Warning( "scriptedMove: '%s' could not start a move to '%s' (use_aas '%s', myArea %d) - the scripted sequence will not play out",
+			name.c_str(),
+			destEnt ? destEnt->GetName() : "<null>",
+			spawnArgs.GetString( "use_aas", "<none>" ),
+			PointReachableAreaNum( physicsObj.GetOrigin() ) );
+	}
+
+	// arm the no-progress watchdog in State_ScriptedMove; these two fields are
+	// otherwise inert for the duration of a scripted move and are already
+	// covered by Save/Restore
+	move.lastMoveOrigin = physicsObj.GetOrigin();
+	move.lastMoveTime = gameLocal.time;
 
 	// Move the torso to the idle state if its not already there
 	SetAnimState( ANIMCHANNEL_TORSO, "Torso_Idle", 4 ); 

@@ -975,6 +975,31 @@ stateResult_t idAI::State_ScriptedMove ( const stateParms_t& parms ) {
 		return SRESULT_DONE;
 	}
 
+	// Map scripts drive marines with aiScriptedMoveWait(), which spins on
+	// scriptedDone() with no timeout. If the move can never complete - no AAS,
+	// an unreachable goal, or the AI physically pinned - the script thread
+	// waits forever and the level becomes unfinishable. Abandon the move once
+	// the AI has demonstrably stopped making progress so the script can run on.
+	const float timeoutSec = ai_scriptedMoveTimeout.GetFloat();
+	if ( timeoutSec > 0.0f ) {
+		const idVec3 &org = physicsObj.GetOrigin();
+		if ( ( org - move.lastMoveOrigin ).LengthSqr() > Square( 8.0f ) ) {
+			move.lastMoveOrigin = org;
+			move.lastMoveTime = gameLocal.time;
+		} else if ( gameLocal.time - move.lastMoveTime > SEC2MS( timeoutSec ) ) {
+			gameLocal.Warning( "scriptedMove: '%s' made no progress toward '%s' for %g seconds "
+				"(status %s, moving %d, blocked %d, unreachable %d, %.1f units away) - abandoning the move so the map script can continue",
+				name.c_str(),
+				move.goalEntity.GetEntity() ? move.goalEntity.GetEntity()->GetName() : "<none>",
+				timeoutSec,
+				aiMoveStatusString[ move.moveStatus ],
+				move.fl.moving, move.fl.blocked, move.fl.goalUnreachable,
+				DistanceTo( move.moveDest ) );
+			StopMove( MOVE_STATUS_DEST_UNREACHABLE );
+			return SRESULT_DONE;
+		}
+	}
+
 	return SRESULT_WAIT;
 }
 

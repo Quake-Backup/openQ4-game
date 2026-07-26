@@ -563,7 +563,11 @@ void idAI::SetAAS( void ) {
 			aas = NULL;
 		}
 	}
-	gameLocal.Printf( "WARNING: %s has no AAS file\n", name.c_str() );
+	// A Printf here meant an AI that can never path looked like ordinary startup
+	// chatter. Name the AAS it asked for: on stock content most .aas files are
+	// placeholders, so the missing type is the whole answer.
+	gameLocal.Warning( "%s requested use_aas '%s' but no such AAS is loaded; this AI cannot path",
+		name.c_str(), use_aas.c_str() );
 }
 
 /*

@@ -137,6 +137,7 @@ extern idCVar	ai_debugHelpers;
 // cdr: added new master move type
 extern idCVar	ai_useRVMasterMove;
 //jshepard: allow old AAS files
+extern idCVar	ai_scriptedMoveTimeout;
 extern idCVar	ai_allowOldAAS;
 // twhitaker: debugging support for eye focus
 extern idCVar	ai_debugEyeFocus;
