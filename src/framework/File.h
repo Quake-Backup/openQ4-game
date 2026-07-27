@@ -29,6 +29,8 @@ If you have questions concerning this license or the applicable additional terms
 #ifndef __FILE_H__
 #define __FILE_H__
 
+#include <stdint.h>
+
 /*
 ==============================================================
 
@@ -272,7 +274,7 @@ public:
 private:
 	idStr					name;			// name of the file in the pak
 	idStr					fullPath;		// full file path including pak file name
-	int						zipFilePos;		// zip file info position in pak
+	uint32_t				zipFilePos;		// classic-ZIP central-directory position
 	int						fileSize;		// size of the file
 	int						containerChecksum;
 	void *					z;				// unzip info
