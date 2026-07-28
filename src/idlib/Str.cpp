@@ -343,7 +343,7 @@ int idStr::FindText( const char *str, const char *text, bool casesensitive, int 
 			}
 		} else {
 			for ( j = 0; text[j]; j++ ) {
-				if ( ::toupper( str[i+j] ) != ::toupper( text[j] ) ) {
+				if ( ::toupper( (unsigned char)str[i+j] ) != ::toupper( (unsigned char)text[j] ) ) {
 					break;
 				}
 			}
@@ -421,7 +421,7 @@ bool idStr::Filter( const char *filter, const char *name, bool casesensitive ) {
 							}
 						}
 						else {
-							if ( ::toupper(*name) >= ::toupper(*filter) && ::toupper(*name) <= ::toupper(*(filter+2)) ) {
+							if ( ::toupper( (unsigned char)*name ) >= ::toupper( (unsigned char)*filter ) && ::toupper( (unsigned char)*name ) <= ::toupper( (unsigned char)*(filter+2) ) ) {
 								found = true;
 							}
 						}
@@ -434,7 +434,7 @@ bool idStr::Filter( const char *filter, const char *name, bool casesensitive ) {
 							}
 						}
 						else {
-							if ( ::toupper(*filter) == ::toupper(*name) ) {
+							if ( ::toupper( (unsigned char)*filter ) == ::toupper( (unsigned char)*name ) ) {
 								found = true;
 							}
 						}
@@ -461,7 +461,7 @@ bool idStr::Filter( const char *filter, const char *name, bool casesensitive ) {
 				}
 			}
 			else {
-				if ( ::toupper(*filter) != ::toupper(*name) ) {
+				if ( ::toupper( (unsigned char)*filter ) != ::toupper( (unsigned char)*name ) ) {
 					return false;
 				}
 			}
@@ -1391,8 +1391,8 @@ int idStr::Cmp( const char *s1, const char *s2 ) {
 	int c1, c2, d;
 
 	do {
-		c1 = *s1++;
-		c2 = *s2++;
+		c1 = static_cast<byte>( *s1++ );
+		c2 = static_cast<byte>( *s2++ );
 
 		d = c1 - c2;
 		if ( d ) {
@@ -1414,8 +1414,8 @@ int idStr::Cmpn( const char *s1, const char *s2, int n ) {
 	assert( n >= 0 );
 
 	do {
-		c1 = *s1++;
-		c2 = *s2++;
+		c1 = static_cast<byte>( *s1++ );
+		c2 = static_cast<byte>( *s2++ );
 
 		if ( !n-- ) {
 			return 0;		// strings are equal until end point
@@ -1439,8 +1439,8 @@ int idStr::Icmp( const char *s1, const char *s2 ) {
 	int c1, c2, d;
 
 	do {
-		c1 = *s1++;
-		c2 = *s2++;
+		c1 = static_cast<byte>( *s1++ );
+		c2 = static_cast<byte>( *s2++ );
 
 		d = c1 - c2;
 		while( d ) {
@@ -1474,8 +1474,8 @@ int idStr::Icmpn( const char *s1, const char *s2, int n ) {
 	assert( n >= 0 );
 
 	do {
-		c1 = *s1++;
-		c2 = *s2++;
+		c1 = static_cast<byte>( *s1++ );
+		c2 = static_cast<byte>( *s2++ );
 
 		if ( !n-- ) {
 			return 0;		// strings are equal until end point
@@ -1520,8 +1520,8 @@ int idStr::IcmpNoEscape ( const char *s1, const char *s2 ) {
 			s2 += d;
 		}
 // RAVEN END
-		c1 = *s1++;
-		c2 = *s2++;
+		c1 = static_cast<byte>( *s1++ );
+		c2 = static_cast<byte>( *s2++ );
 
 		d = c1 - c2;
 		while( d ) {
@@ -1558,8 +1558,8 @@ int idStr::IcmpPath( const char *s1, const char *s2 ) {
 #endif
 
 	do {
-		c1 = *s1++;
-		c2 = *s2++;
+		c1 = static_cast<byte>( *s1++ );
+		c2 = static_cast<byte>( *s2++ );
 
 		d = c1 - c2;
 		while( d ) {
@@ -1592,13 +1592,13 @@ int idStr::IcmpPath( const char *s1, const char *s2 ) {
 				if ( c1 == '/' || c1 == '\\' ) {
 					break;
 				}
-				c1 = *s1++;
+				c1 = static_cast<byte>( *s1++ );
 			}
 			while( c2 ) {
 				if ( c2 == '/' || c2 == '\\' ) {
 					break;
 				}
-				c2 = *s2++;
+				c2 = static_cast<byte>( *s2++ );
 			}
 			if ( c1 && !c2 ) {
 				return -1;
@@ -1629,8 +1629,8 @@ int idStr::IcmpnPath( const char *s1, const char *s2, int n ) {
 	assert( n >= 0 );
 
 	do {
-		c1 = *s1++;
-		c2 = *s2++;
+		c1 = static_cast<byte>( *s1++ );
+		c2 = static_cast<byte>( *s2++ );
 
 		if ( !n-- ) {
 			return 0;		// strings are equal until end point
@@ -1667,13 +1667,13 @@ int idStr::IcmpnPath( const char *s1, const char *s2, int n ) {
 				if ( c1 == '/' || c1 == '\\' ) {
 					break;
 				}
-				c1 = *s1++;
+				c1 = static_cast<byte>( *s1++ );
 			}
 			while( c2 ) {
 				if ( c2 == '/' || c2 == '\\' ) {
 					break;
 				}
-				c2 = *s2++;
+				c2 = static_cast<byte>( *s2++ );
 			}
 			if ( c1 && !c2 ) {
 				return -1;

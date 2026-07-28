@@ -242,7 +242,7 @@ void FAS_ExtractViseme( rvLipSyncData *lsd, int time )
 			// Extract phoneme data
 			index = 0;
 			phoneme = idStr( token[index] );
-			if( isupper( phoneme[0] ) )
+			if( isupper( (unsigned char)phoneme[0] ) )
 			{
 				index++;
 				phoneme += token[index];
@@ -253,7 +253,7 @@ void FAS_ExtractViseme( rvLipSyncData *lsd, int time )
 
 			duration = idStr( token[index] );
 			index++;
-			if( isdigit( token[index] ) )
+			if( isdigit( (unsigned char)token[index] ) )
 			{
 				duration += token[index];
 				index++;

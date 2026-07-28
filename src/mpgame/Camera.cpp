@@ -1360,7 +1360,7 @@ bool idDeclCameraDef::ParseAnim( idLexer &src, int numDefaultAnims ) {
 	// random anims end with a number.  find the numeric suffix of the animation.
 	len = alias.Length();
 	for( i = len - 1; i > 0; i-- ) {
-		if ( !isdigit( alias[ i ] ) ) {
+		if ( !isdigit( (unsigned char)alias[ i ] ) ) {
 			break;
 		}
 	}

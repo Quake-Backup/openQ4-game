@@ -1007,36 +1007,43 @@ ID_INLINE char *idStr::ToUpper( char *s ) {
 	return s;
 }
 
+// The accumulator must see the raw byte value. Plain char is signed on x86-64
+// and on Apple/Windows arm64 but unsigned on Linux AArch64, so folding the
+// character in through char would place a different value in the sum for every
+// byte >= 0x80 depending on the target, and give the same string different hash
+// buckets on different architectures. Accumulating in uint32_t also removes the
+// signed-overflow undefined behavior the original int accumulator had. This
+// matches how idStr::FileNameHash was already hardened.
 ID_INLINE int idStr::Hash( const char *string ) {
-	int i, hash = 0;
-	for ( i = 0; *string != '\0'; i++ ) {
-		hash += ( *string++ ) * ( i + 119 );
+	uint32_t hash = 0;
+	for ( uint32_t i = 0; *string != '\0'; i++ ) {
+		hash += static_cast<uint32_t>( static_cast<byte>( *string++ ) ) * ( i + 119u );
 	}
-	return hash;
+	return static_cast<int>( hash );
 }
 
 ID_INLINE int idStr::Hash( const char *string, int length ) {
-	int i, hash = 0;
-	for ( i = 0; i < length; i++ ) {
-		hash += ( *string++ ) * ( i + 119 );
+	uint32_t hash = 0;
+	for ( int i = 0; i < length; i++ ) {
+		hash += static_cast<uint32_t>( static_cast<byte>( *string++ ) ) * ( static_cast<uint32_t>( i ) + 119u );
 	}
-	return hash;
+	return static_cast<int>( hash );
 }
 
 ID_INLINE int idStr::IHash( const char *string ) {
-	int i, hash = 0;
-	for( i = 0; *string != '\0'; i++ ) {
-		hash += ToLower( *string++ ) * ( i + 119 );
+	uint32_t hash = 0;
+	for( uint32_t i = 0; *string != '\0'; i++ ) {
+		hash += static_cast<uint32_t>( static_cast<byte>( ToLower( static_cast<byte>( *string++ ) ) ) ) * ( i + 119u );
 	}
-	return hash;
+	return static_cast<int>( hash );
 }
 
 ID_INLINE int idStr::IHash( const char *string, int length ) {
-	int i, hash = 0;
-	for ( i = 0; i < length; i++ ) {
-		hash += ToLower( *string++ ) * ( i + 119 );
+	uint32_t hash = 0;
+	for ( int i = 0; i < length; i++ ) {
+		hash += static_cast<uint32_t>( static_cast<byte>( ToLower( static_cast<byte>( *string++ ) ) ) ) * ( static_cast<uint32_t>( i ) + 119u );
 	}
-	return hash;
+	return static_cast<int>( hash );
 }
 
 ID_INLINE char idStr::ToLower( byte c ) {
