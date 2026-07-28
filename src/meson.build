@@ -31,8 +31,8 @@ if is_linux and not ['gcc', 'clang'].contains(cpp.get_id())
   error('openQ4-GameLibs Linux builds require GCC or Clang.')
 endif
 
-if is_windows and not ['x86', 'x86_64'].contains(host_cpu_family)
-  error('openQ4-GameLibs Windows builds currently support x86 and x64 MSVC toolchains.')
+if is_windows and not ['x86', 'x86_64', 'aarch64'].contains(host_cpu_family)
+  error('openQ4-GameLibs Windows builds currently support x86, x64 and arm64 MSVC toolchains.')
 endif
 
 if is_darwin and not ['x86_64', 'aarch64'].contains(host_cpu_family)
@@ -251,7 +251,10 @@ if is_windows
     '/LARGEADDRESSAWARE',
   ]
 
-  if host_cpu_family == 'x86_64'
+  # Keep this in lockstep with the engine repo's meson.build: every 64-bit
+  # Windows target gets the 64-bit preferred load address, and only 32-bit x86
+  # falls back to the 32-bit base.
+  if ['x86_64', 'aarch64'].contains(host_cpu_family)
     module_link_args += ['/BASE:0x180000000']
   else
     module_link_args += ['/BASE:0x20000000']
