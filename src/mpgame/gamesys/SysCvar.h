@@ -401,6 +401,36 @@ extern idCVar	si_tourneyLimit;
 
 extern const char *si_gameTypeArgs[];
 
+// openQ4 BEGIN
+// match progression carried over from Quake Live
+extern idCVar	si_scoreLimit;
+extern idCVar	si_roundLimit;
+extern idCVar	si_roundTimeLimit;
+extern idCVar	si_roundWarmupDelay;
+extern idCVar	si_roundEndDelay;
+extern idCVar	si_mercyLimit;
+extern idCVar	si_overtime;
+extern idCVar	si_suddenDeathRespawnDelay;
+extern idCVar	si_suddenDeathRespawnIncrease;
+extern idCVar	si_suddenDeathRespawnMax;
+extern idCVar	si_forfeit;
+extern idCVar	si_warmupReadyPercentage;
+extern idCVar	si_teamSizeMin;
+extern idCVar	si_teamForcePresent;
+extern idCVar	si_warmupWeapons;
+extern idCVar	si_warmupScoring;
+extern idCVar	si_autoShuffle;
+extern idCVar	si_shuffleDelay;
+extern idCVar	si_freezeThawTime;
+extern idCVar	si_freezeThawRadius;
+extern idCVar	si_obeliskHealth;
+extern idCVar	si_obeliskRegen;
+extern idCVar	si_obeliskRespawn;
+extern idCVar	si_skullTimeout;
+extern idCVar	si_domCaptureTime;
+extern idCVar	si_domScoreRate;
+// openQ4 END
+
 extern idCVar	g_gamelog;
 extern idCVar	cl_showEntityInfo;
 extern idCVar	g_forceUndying;

@@ -1361,6 +1361,13 @@ void idGameLocal::ServerProcessReliableMessage( int clientNum, const idBitMsg &m
 			break;
 		}
 
+		// openQ4 BEGIN
+		case GAME_RELIABLE_MESSAGE_READY: {
+			mpGame.ServerSetPlayerReady( clientNum, msg.ReadBits( 1 ) != 0 );
+			break;
+		}
+		// openQ4 END
+
 		default: {
 			Warning( "Unknown client->server reliable message: %d", id );
 			break;
@@ -1465,6 +1472,11 @@ void idGameLocal::RepeaterProcessReliableMessage( int clientNum, const idBitMsg 
 // RAVEN END
 
 		case GAME_RELIABLE_MESSAGE_GETVOTEMAPS: {
+			break;
+		}
+
+		// openQ4: viewers have no ready state
+		case GAME_RELIABLE_MESSAGE_READY: {
 			break;
 		}
 
@@ -2115,6 +2127,14 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 				break;
 			}
 
+			// openQ4: a notice aimed at one player is not for the viewers
+			case GAME_RELIABLE_MESSAGE_CENTERPRINT: {
+				if ( toClient != -1 ) {
+					inhibitRepeater = true;
+				}
+				break;
+			}
+
 			default:
 				break;
 		}
@@ -2393,6 +2413,12 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			}
 			break;
 		}
+		// openQ4 BEGIN
+		case GAME_RELIABLE_MESSAGE_CENTERPRINT: {
+			mpGame.ReceiveCenterPrint( msg );
+			break;
+		}
+		// openQ4 END
 		default: {
 			Error( "Unknown server->client reliable message: %d", id );
 			break;

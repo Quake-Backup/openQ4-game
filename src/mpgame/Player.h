@@ -650,6 +650,9 @@ public:
 	
 	bool					IsBeingTalkedTo	( void );
  	bool					IsReady			( void );
+	// openQ4: the reliable ready message sets this straight from the server
+	bool					GetReady		( void ) const { return ready; }
+	void					SetReady		( bool value ) { ready = value; }
  	bool					IsRespawning	( void );
  	bool					IsInTeleport	( void );
 	bool					IsZoomed		( void );
@@ -927,7 +930,12 @@ private:
 	int						predictionErrorTime;
 
 	// mp
- 	bool					ready;					// from userInfo
+ 	bool					ready;					// authoritative ready state
+	// openQ4: ui_ready is throttled to one change every five seconds, so the
+	// console ready commands go over their own reliable message instead.  This
+	// shadow copy lets UserInfoChanged tell a genuine ui_ready edit from a
+	// stale userinfo resend that would otherwise undo the reliable update.
+	bool					readyUserInfo;
  	bool					respawning;				// set to true while in SpawnToPoint for telefrag checks
  	bool					leader;					// for sudden death situations
  	bool					weaponCatchup;			// raise up the weapon silently ( state catchups )

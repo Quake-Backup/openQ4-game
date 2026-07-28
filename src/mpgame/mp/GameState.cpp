@@ -57,6 +57,65 @@ void rvGameState::Clear( void ) {
 	nextState = INACTIVE;
 	nextStateTime = 0;
 	fragLimitTimeout = 0;
+	overtimeCount = 0;
+	overtimeAccumulatedMsec = 0;
+	overtimeStartTime = 0;
+}
+
+/*
+================
+rvGameState::StartOvertime
+
+Grants another overtime period by extending the match clock, the way Quake
+Live does.  Returns false when the server has overtime turned off, which is
+the caller's cue to fall back to Quake 4 sudden death.
+================
+*/
+bool rvGameState::StartOvertime( void ) {
+	int overtimeSeconds;
+
+	if ( gameLocal.isClient ) {
+		return false;
+	}
+
+	// an untimed match has nothing to extend; sudden death is the only way out
+	if ( gameLocal.serverInfo.GetInt( "si_timeLimit" ) <= 0 ) {
+		return false;
+	}
+
+	overtimeSeconds = gameLocal.serverInfo.GetInt( "si_overtime" );
+	if ( overtimeSeconds <= 0 ) {
+		return false;
+	}
+
+	overtimeCount++;
+	overtimeAccumulatedMsec += overtimeSeconds * 1000;
+	overtimeStartTime = gameLocal.time;
+
+	// the frag limit timeout must not carry into the extension, or the match
+	// ends on the stale deadline the instant overtime begins
+	fragLimitTimeout = 0;
+
+	if ( overtimeCount > 1 ) {
+		gameLocal.mpGame.CenterPrint( -1, "#str_41311", idMultiplayerGame::CPARM_INT, overtimeCount );
+	} else {
+		gameLocal.mpGame.CenterPrint( -1, "#str_41310" );
+	}
+
+	gameLocal.mpGame.ScheduleTimeAnnouncements();
+
+	return true;
+}
+
+/*
+================
+rvGameState::StopOvertime
+================
+*/
+void rvGameState::StopOvertime( void ) {
+	overtimeCount = 0;
+	overtimeAccumulatedMsec = 0;
+	overtimeStartTime = 0;
 }
 
 /*
@@ -146,6 +205,11 @@ void rvGameState::PackState( idBitMsg& outMsg ) {
 	outMsg.WriteByte( currentState );
 	outMsg.WriteByte( nextState );
 	outMsg.WriteLong( nextStateTime );
+	// openQ4: overtime rides the base header because it applies to every
+	// gametype, and the HUD clock cannot be right without it
+	outMsg.WriteByte( overtimeCount );
+	outMsg.WriteLong( overtimeAccumulatedMsec );
+	outMsg.WriteLong( overtimeStartTime );
 }
 
 /*
@@ -163,6 +227,9 @@ bool rvGameState::BaseUnpackState( const idBitMsg& inMsg ) {
 	currentState = (mpGameState_t)inMsg.ReadByte();
 	nextState = (mpGameState_t)inMsg.ReadByte();
 	nextStateTime = inMsg.ReadLong();
+	overtimeCount = inMsg.ReadByte();
+	overtimeAccumulatedMsec = inMsg.ReadLong();
+	overtimeStartTime = inMsg.ReadLong();
 	return true;
 }
 
@@ -429,6 +496,9 @@ void rvGameState::NewState( mpGameState_t newState ) {
 			//asalmon: clear out lingering team scores.
 			gameLocal.mpGame.ClearTeamScores();
 
+			// openQ4: warmup is never in overtime
+			StopOvertime();
+
 			if( gameLocal.gameType != GAME_TOURNEY ) {
 				for( i = 0; i < gameLocal.numClients; i++ ) {
 					idEntity *ent = gameLocal.entities[ i ];
@@ -507,6 +577,8 @@ void rvGameState::NewState( mpGameState_t newState ) {
 			gameLocal.mpGame.SetMatchStartedTime( gameLocal.time );
 
 			fragLimitTimeout = 0;
+			// openQ4: a fresh match never inherits the previous one's overtime
+			StopOvertime();
 
 			// write server initial reliable messages to give everyone new base
 			for( i = 0; i < MAX_CLIENTS; i++ ) {
@@ -706,6 +778,42 @@ void rvGameState::Spectate( idPlayer* player ) {
 	return;
 }
 
+// openQ4 BEGIN
+/*
+================
+rvGameState::AllowRespawn
+================
+*/
+bool rvGameState::AllowRespawn( idPlayer* player ) {
+	return true;
+}
+
+/*
+================
+rvGameState::PlayerDeath
+================
+*/
+void rvGameState::PlayerDeath( idPlayer* dead, idPlayer* killer ) {
+}
+
+/*
+================
+rvGameState::PlayerDamage
+================
+*/
+void rvGameState::PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage ) {
+}
+
+/*
+================
+rvGameState::WeaponsLocked
+================
+*/
+bool rvGameState::WeaponsLocked( void ) const {
+	return false;
+}
+// openQ4 END
+
 /*
 ================
 rvGameState::operator==
@@ -715,7 +823,10 @@ bool rvGameState::operator==( const rvGameState& rhs ) const {
 	return	(
 		( currentState == rhs.currentState ) &&
 		( nextState	== rhs.nextState ) &&
-		( nextStateTime == rhs.nextStateTime ) 
+		( nextStateTime == rhs.nextStateTime ) &&
+		( overtimeCount == rhs.overtimeCount ) &&
+		( overtimeAccumulatedMsec == rhs.overtimeAccumulatedMsec ) &&
+		( overtimeStartTime == rhs.overtimeStartTime )
 		);
 }
 
@@ -728,7 +839,10 @@ bool rvGameState::operator!=( const rvGameState& rhs ) const {
 	return	(
 		( currentState != rhs.currentState ) ||
 		( nextState	!= rhs.nextState ) ||
-		( nextStateTime != rhs.nextStateTime ) 
+		( nextStateTime != rhs.nextStateTime ) ||
+		( overtimeCount != rhs.overtimeCount ) ||
+		( overtimeAccumulatedMsec != rhs.overtimeAccumulatedMsec ) ||
+		( overtimeStartTime != rhs.overtimeStartTime )
 		);
 }
 
@@ -741,6 +855,9 @@ rvGameState& rvGameState::operator=( const rvGameState& rhs ) {
 	currentState = rhs.currentState;
 	nextState = rhs.nextState;
 	nextStateTime = rhs.nextStateTime;
+	overtimeCount = rhs.overtimeCount;
+	overtimeAccumulatedMsec = rhs.overtimeAccumulatedMsec;
+	overtimeStartTime = rhs.overtimeStartTime;
 	return (*this);
 }
 
@@ -830,19 +947,24 @@ void rvDMGameState::Run( void ) {
 				if( first && second && (gameLocal.mpGame.GetScore( first ) == gameLocal.mpGame.GetScore( second )) )	{
 					//this is a tie...
 					if( gameLocal.mpGame.GetScore( first ) >= gameLocal.serverInfo.GetInt( "si_fragLimit" ) )	{
-						 //and it must be tied at fraglimit, so sudden death.
-						NewState( SUDDENDEATH ); 
+						// openQ4: tied at the frag limit.  Extend the match the
+						// way Quake Live does; fall back to Quake 4 sudden
+						// death only when the server has overtime turned off.
+						if ( !StartOvertime() ) {
+							NewState( SUDDENDEATH );
+						}
 					}
 				}
 				//otherwise, just keep playing as normal.
 				fragLimitTimeout = 0;
-				
+
 			} else if ( gameLocal.mpGame.TimeLimitHit() ) {
 				gameLocal.mpGame.PrintMessageEvent( -1, MSG_TIMELIMIT );
 				if( tiedForFirst ) {
-					// if tied at timelimit hit, goto sudden death
 					fragLimitTimeout = 0;
-					NewState( SUDDENDEATH );
+					if ( !StartOvertime() ) {
+						NewState( SUDDENDEATH );
+					}
 				} else {
 					// or just end the game
 					NewState( GAMEREVIEW );
@@ -923,17 +1045,28 @@ void rvTeamDMGameState::Run( void ) {
 					//this is a tie
 					if( gameLocal.mpGame.GetScoreForTeam( TEAM_MARINE ) >= gameLocal.serverInfo.GetInt( "si_fragLimit" ) )	{
 						//and it's tied at the fraglimit.
-						NewState( SUDDENDEATH ); 
+						if ( !StartOvertime() ) {
+							NewState( SUDDENDEATH );
+						}
 					}
-					//not a tie, game on.
-					fragLimitTimeout = 0;
 				}
+				// openQ4: this used to be cleared only on the tied branch, so a
+				// leader who suicided during FRAGLIMIT_DELAY left the timeout
+				// armed and the match ended on the next frame anyway.
+				fragLimitTimeout = 0;
+			} else if ( gameLocal.mpGame.MercyLimitHit() >= 0 ) {
+				// openQ4: mercy rule, carried over from Quake Live
+				int mercyTeam = gameLocal.mpGame.MercyLimitHit();
+				gameLocal.mpGame.CenterPrint( -1, "#str_41317", idMultiplayerGame::CPARM_TEAM, mercyTeam );
+				gameLocal.mpGame.PrintMessageEvent( -1, MSG_FRAGLIMIT, mercyTeam );
+				NewState( GAMEREVIEW );
 			} else if ( gameLocal.mpGame.TimeLimitHit() ) {
 				gameLocal.mpGame.PrintMessageEvent( -1, MSG_TIMELIMIT );
 				if( tiedForFirst ) {
-					// if tied at timelimit hit, goto sudden death
 					fragLimitTimeout = 0;
-					NewState( SUDDENDEATH );
+					if ( !StartOvertime() ) {
+						NewState( SUDDENDEATH );
+					}
 				} else {
 					// or just end the game
 					NewState( GAMEREVIEW );
@@ -1326,15 +1459,24 @@ void rvCTFGameState::Run( void ) {
 				// enter sudden death, the next frag leader will win
 				// OR the winner lost a point in the frag delay, and there's no tie, so no one wins, game on.
 				if( tiedForFirst && ( gameLocal.mpGame.GetScoreForTeam( TEAM_MARINE ) >= gameLocal.serverInfo.GetInt( "si_captureLimit" ) ))	{
-					NewState( SUDDENDEATH );
+					if ( !StartOvertime() ) {
+						NewState( SUDDENDEATH );
+					}
 				}
-				fragLimitTimeout = 0; 
+				fragLimitTimeout = 0;
+			} else if ( gameLocal.mpGame.MercyLimitHit() >= 0 ) {
+				// openQ4: mercy rule, carried over from Quake Live
+				int mercyTeam = gameLocal.mpGame.MercyLimitHit();
+				gameLocal.mpGame.CenterPrint( -1, "#str_41317", idMultiplayerGame::CPARM_TEAM, mercyTeam );
+				gameLocal.mpGame.PrintMessageEvent( -1, MSG_CAPTURELIMIT, mercyTeam );
+				NewState( GAMEREVIEW );
 			} else if ( gameLocal.mpGame.TimeLimitHit() ) {
 				gameLocal.mpGame.PrintMessageEvent( -1, MSG_TIMELIMIT );
 				if( tiedForFirst ) {
-					// if tied at timelimit hit, goto sudden death
 					fragLimitTimeout = 0;
-					NewState( SUDDENDEATH );
+					if ( !StartOvertime() ) {
+						NewState( SUDDENDEATH );
+					}
 				} else {
 					// or just end the game
 					NewState( GAMEREVIEW );
@@ -2733,6 +2875,7 @@ gameStateType_t rvDMGameState::type = GS_DM;
 gameStateType_t rvTeamDMGameState::type = GS_TEAMDM;
 gameStateType_t rvCTFGameState::type = GS_CTF;
 gameStateType_t rvTourneyGameState::type = GS_TOURNEY;
+gameStateType_t riDZGameState::type = GS_DZ;
 
 bool rvGameState::IsType( gameStateType_t type ) const {
 	return ( type == rvGameState::type );
@@ -2774,6 +2917,14 @@ gameStateType_t rvTourneyGameState::GetClassType( void ) {
 	return rvTourneyGameState::type;
 }
 
+bool riDZGameState::IsType( gameStateType_t type ) const {
+	return ( type == riDZGameState::type );
+}
+
+gameStateType_t riDZGameState::GetClassType( void ) {
+	return riDZGameState::type;
+}
+
 /*
 ===============================================================================
 
@@ -2799,8 +2950,6 @@ riDZGameState::riDZGameState( bool allocPrevious ) : rvGameState( false ) {
 	}
 
 	trackPrevious = allocPrevious;
-
-	type = GS_DZ;
 }
 
 /*

@@ -333,6 +333,11 @@ enum {
 	GAME_RELIABLE_MESSAGE_UNRELIABLE_MESSAGE,
 	// server acknowledges events from client, in response to specific GAME_RELIABLE_MESSAGE_EVENT situations
 	GAME_RELIABLE_MESSAGE_EVENT_ACK,
+	// openQ4: localized centre-screen notice, server driven.  Append only -
+	// these ordinals are the wire format.
+	GAME_RELIABLE_MESSAGE_CENTERPRINT,
+	// openQ4: authoritative ready state, client to server
+	GAME_RELIABLE_MESSAGE_READY,
 };
 
 enum {
@@ -458,6 +463,8 @@ class rvGravityArea;
 //============================================================================
 // ddynerman: moved MultiplayerGame.h down here, so it can use more stuff in Game_local (idEntityPtr)
 #include "MultiplayerGame.h"
+// openQ4: gametype descriptor table; drives the IsTeamGame/IsFlagGameType family below
+#include "mp/GameTypes.h"
 
 //============================================================================
 
@@ -1002,8 +1009,13 @@ public:
 	virtual const char*		GetLongGametypeName( const char* gametype );
 	virtual void			ReceiveRemoteConsoleOutput( const char* output );
 
-	bool					IsFlagGameType( void ) { return ( gameType == GAME_CTF || gameType == GAME_1F_CTF || gameType == GAME_ARENA_CTF || gameType == GAME_ARENA_1F_CTF ); }
-	bool					IsTeamGameType( void ) { return ( gameType == GAME_TDM || gameType == GAME_CTF || gameType == GAME_ARENA_CTF || gameType == GAME_DEADZONE ); }
+	// openQ4: these were three overlapping hard-coded lists that disagreed with
+	// each other (One Flag CTF counted as a team game in one and not the other).
+	// They now read the single gametype descriptor table.
+	bool					IsFlagGameType( void ) { return MPGameTypeHasAny( gameType, GTF_FLAG ); }
+	bool					IsTeamGameType( void ) { return MPGameTypeHasAny( gameType, GTF_TEAM ); }
+	bool					IsRoundGameType( void ) { return MPGameTypeHasAny( gameType, GTF_ROUND ); }
+	bool					IsGameTypeFlagged( int mask ) { return MPGameTypeHasAny( gameType, mask ); }
 	bool					IsTeamPowerups( void );
 
 	// twhitaker: needed this for difficulty settings
@@ -1461,7 +1473,7 @@ ID_INLINE rvClientEffect* idGameLocal::PlayEffect( const idDict& args, const cha
 }
 
 ID_INLINE bool idGameLocal::IsTeamGame( void ) const {
-	return ( isMultiplayer && ( gameType == GAME_CTF || gameType == GAME_TDM || gameType == GAME_1F_CTF || gameType == GAME_ARENA_CTF || gameType == GAME_DEADZONE ) );
+	return ( isMultiplayer && MPGameTypeHasAny( gameType, GTF_TEAM ) );
 }
 
 ID_INLINE int idGameLocal::GetNumMapEntities( void ) const {

@@ -540,6 +540,10 @@ void idGameLocal::Init( void ) {
 	Printf( "gamename: %s\n", game_name.string );
 	Printf( "gamedate: %s\n", __DATE__ );
 
+	// openQ4: fail loudly if the gametype table, the enum and the si_gameType
+	// completion list have drifted apart
+	MPValidateGameTypeTable();
+
 // RAVEN BEGIN
 // rjohnson: new help system for cvar ui
 	//idCVarHelp::RegisterStatics();
@@ -4698,30 +4702,8 @@ idGameLocal::HandleMainMenuCommands
 */
 void idGameLocal::HandleMainMenuCommands( const char *menuCommand, idUserInterface *gui ) {
 	if ( !idStr::Icmp( menuCommand, "initCreateServerSettings" ) ) {
-		int	guiValue = 0;
-
-		switch ( mpGame.GameTypeToVote( si_gameType.GetString() ) ) {
-			case idMultiplayerGame::VOTE_GAMETYPE_DM:
-				guiValue = 0;
-				break;
-			case idMultiplayerGame::VOTE_GAMETYPE_TOURNEY:
-				guiValue = 1;
-				break;
-			case idMultiplayerGame::VOTE_GAMETYPE_TDM:
-				guiValue = 2;
-				break;
-			case idMultiplayerGame::VOTE_GAMETYPE_CTF:
-				guiValue = 3;
-				break;
-			case idMultiplayerGame::VOTE_GAMETYPE_ARENA_CTF:
-				guiValue = 4;
-				break;
-			case idMultiplayerGame::VOTE_GAMETYPE_DEADZONE:
-				guiValue = 5;
-				break;
-		}
-
-		gui->SetStateInt( "currentGametype", guiValue );
+		// openQ4: the vote gametype index is the menu dropdown index
+		gui->SetStateInt( "currentGametype", mpGame.GameTypeToVote( si_gameType.GetString() ) );
 	} else if ( !idStr::Icmp( menuCommand, "filterByNextMod" ) ) {
 		BuildModList();
 
@@ -7885,20 +7867,26 @@ idEntity* idGameLocal::SelectSpawnPoint( idPlayer* player ) {
 	// Pick which spawns to use based on gametype
 // RITUAL BEGIN
 // squirrel: added DeadZone multiplayer mode
-	if( gameLocal.gameType == GAME_DM || gameLocal.gameType == GAME_TDM || gameLocal.gameType == GAME_TOURNEY ) {
-		spawnArray = &spawnSpots;
-	} 
-	else if( IsFlagGameType() || gameLocal.gameType == GAME_DEADZONE ) {	
+// RITUAL END
+// openQ4: this used to be two hard-coded gametype lists with no fallback, so
+// any gametype not named in either one hit a fatal error the first time a
+// player spawned.  Modes built around team bases prefer their own base
+// spawns; everything else, and any base mode on a map with no team spawns,
+// uses the general list.
+	if( MPGameTypeHasAny( gameType, GTF_ANY_OBJECTIVE ) ) {
 		if( teamForwardSpawnSpots[ player->team ].Num() ) {
 			spawnArray = &teamForwardSpawnSpots[ player->team ];
-		} else {
+		} else if( teamSpawnSpots[ player->team ].Num() ) {
 			spawnArray = &teamSpawnSpots[ player->team ];
 		}
 	}
-// RITUAL END
 
-	if ( spawnArray == NULL ) {
-		Error( "SelectSpawnPoint() - invalid spawn list." );
+	if ( spawnArray == NULL || spawnArray->Num() == 0 ) {
+		spawnArray = &spawnSpots;
+	}
+
+	if ( spawnArray->Num() == 0 ) {
+		Error( "SelectSpawnPoint() - no spawn points on this map." );
 		return NULL;
 	}
 

@@ -20,11 +20,11 @@ All game cvars should be defined here.
 // ddynerman: our gameplay modes
 // RITUAL BEGIN
 // squirrel: added DeadZone multiplayer mode
-const char *si_gameTypeArgs[]		= { "singleplayer", "DM", "Tourney", "Team DM", "CTF", "Arena CTF", "DeadZone", NULL };
-const int si_numGameTypeArgs = sizeof( si_gameTypeArgs ) / sizeof( si_gameTypeArgs[0] );
 // RITUAL END
 // RAVEN END
-const char *si_readyArgs[]			= { "Not Ready", "Ready", NULL }; 
+// openQ4: si_gameTypeArgs now lives beside the gametype descriptor table in
+// mp/GameTypes.cpp so the token list and the table cannot drift apart.
+const char *si_readyArgs[]			= { "Not Ready", "Ready", NULL };
 const char *si_spectateArgs[]		= { "Play", "Spectate", NULL };
 
 // RAVEN BEGIN
@@ -66,7 +66,10 @@ idCVar si_minPlayers(				"si_minPlayers",			"1",			CVAR_GAME | CVAR_SERVERINFO |
 idCVar si_captureLimit(				"si_captureLimit",			"5",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "score limit for CTF", 1, MP_PLAYER_MAXFRAGS );
 // shouchard:  for tourney
 idCVar si_tourneyLimit(				"si_tourneyLimit",			"3",			CVAR_GAME | CVAR_SERVERINFO | CVAR_ARCHIVE | CVAR_INTEGER, "number of times a tourney will be run before cycling maps", 1, MP_PLAYER_MAXFRAGS );
-idCVar si_useReady(					"si_useReady",				"0",			CVAR_GAME | CVAR_SERVERINFO | CVAR_ARCHIVE | CVAR_BOOL, "require players to ready before starting a match" );
+// openQ4: defaults to on.  Quake Live's warmup is a ready-up phase, and with
+// this off idPlayer::IsReady is unconditionally true so warmup ends the moment
+// two players connect - which is not what anyone wants from a match.
+idCVar si_useReady(					"si_useReady",				"1",			CVAR_GAME | CVAR_SERVERINFO | CVAR_ARCHIVE | CVAR_BOOL, "require players to ready before starting a match" );
 idCVar si_allowVoting(				"si_allowVoting",			"0",			CVAR_GAME | CVAR_SERVERINFO | CVAR_ARCHIVE | CVAR_BOOL, "enable or disable server option voting" );
 // ddynerman: disable hitscan tint
 idCVar si_allowHitscanTint(			"si_allowHitscanTint",		"2",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "use hitscan tint (e.g. rail color) 0 - no tinting allowed, 1 - player hitscan tinting allowed in DM and NO hitscan tinting in team games, 2 - player hitscan tinting allowed in DM and use team-color hitscan tints in team games" );
@@ -76,6 +79,46 @@ idCVar privatePassword(				"privatePassword",			"",				CVAR_GAME | CVAR_NOCHEAT,
 idCVar si_numPrivatePlayers(		"si_numPrivatePlayers",		"0",			CVAR_GAME | CVAR_SERVERINFO | CVAR_ROM, "number of private slots currently in use" );
 idCVar si_suddenDeathRestart(		"si_suddenDeathRestart",	"1",			CVAR_GAME | CVAR_SERVERINFO | CVAR_ARCHIVE, "toggles whether or not to respawn players/items when team games enter sudden death" );
 // RAVEN END
+
+// openQ4 BEGIN
+// Match progression carried over from Quake Live.  Units are stated in every
+// description because Quake Live mixed minutes, seconds and milliseconds
+// across this same set of rules.
+idCVar si_scoreLimit(				"si_scoreLimit",			"150",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "score limit for objective modes scored by accumulation (Domination, Attack Defend), 0 for no limit", 0, 9999 );
+idCVar si_roundLimit(				"si_roundLimit",			"8",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "rounds a team must win to take a round based match, 0 for no limit", 0, 99 );
+idCVar si_roundTimeLimit(			"si_roundTimeLimit",		"180",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "length of a single round in seconds, 0 for no limit", 0, 3600 );
+idCVar si_roundWarmupDelay(			"si_roundWarmupDelay",		"10",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "countdown before each round starts, in seconds", 0, 60 );
+idCVar si_roundEndDelay(			"si_roundEndDelay",			"4",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "pause after a round is decided before the next one is set up, in seconds", 1, 30 );
+idCVar si_mercyLimit(				"si_mercyLimit",			"0",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "end a team match early once one team leads by this many points, 0 to disable", 0, 999 );
+idCVar si_overtime(					"si_overtime",				"120",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "length of each overtime period in seconds; 0 falls back to Quake 4 sudden death", 0, 3600 );
+idCVar si_suddenDeathRespawnDelay(	"si_suddenDeathRespawnDelay","3",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "respawn delay in seconds while a match is in overtime, 0 to respawn normally", 0, 60 );
+idCVar si_suddenDeathRespawnIncrease("si_suddenDeathRespawnIncrease","1",		CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds added to the overtime respawn delay for every minute of overtime", 0, 60 );
+idCVar si_suddenDeathRespawnMax(	"si_suddenDeathRespawnMax",	"10",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "upper bound on the overtime respawn delay, in seconds", 0, 60 );
+idCVar si_forfeit(					"si_forfeit",				"1",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_BOOL, "end a team match early when one team is left with no players" );
+
+// Warmup and ready-up
+idCVar si_warmupReadyPercentage(	"si_warmupReadyPercentage",	"0.51",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_FLOAT, "fraction of eligible players that must ready up before the countdown starts", 0.0f, 1.0f );
+idCVar si_teamSizeMin(				"si_teamSizeMin",			"1",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "players required on a team before a team match may leave warmup", 1, 16 );
+idCVar si_teamForcePresent(			"si_teamForcePresent",		"1",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_BOOL, "require both teams to meet si_teamSizeMin, rather than just one" );
+idCVar si_warmupWeapons(			"si_warmupWeapons",			"1",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_BOOL, "hand out every weapon on the map during warmup" );
+idCVar si_warmupScoring(			"si_warmupScoring",			"0",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_BOOL, "count frags scored during warmup" );
+idCVar si_autoShuffle(				"si_autoShuffle",			"0",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_BOOL, "shuffle teams automatically during warmup when they are lopsided" );
+idCVar si_shuffleDelay(				"si_shuffleDelay",			"5",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "countdown before an automatic team shuffle runs, in seconds", 1, 60 );
+
+// Freeze Tag
+idCVar si_freezeThawTime(			"si_freezeThawTime",		"2",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds a team mate must stand by a frozen player to thaw them", 1, 30 );
+idCVar si_freezeThawRadius(			"si_freezeThawRadius",		"96",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "how close a team mate must be to thaw a frozen player, in world units", 16, 512 );
+
+// Overload and Harvester
+idCVar si_obeliskHealth(			"si_obeliskHealth",			"2500",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "hit points of a team obelisk", 100, 10000 );
+idCVar si_obeliskRegen(				"si_obeliskRegen",			"15",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "hit points an obelisk regenerates each second, 0 to disable", 0, 500 );
+idCVar si_obeliskRespawn(			"si_obeliskRespawn",		"10",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds before a destroyed obelisk comes back", 1, 120 );
+idCVar si_skullTimeout(				"si_skullTimeout",			"30",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds a dropped Harvester skull survives before despawning", 5, 300 );
+
+// Domination
+idCVar si_domCaptureTime(			"si_domCaptureTime",		"7",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds of standing on a control point needed to take it", 1, 60 );
+idCVar si_domScoreRate(				"si_domScoreRate",			"5",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds between score ticks for each control point held", 1, 60 );
+// openQ4 END
 idCVar si_fragLimit(				"si_fragLimit",				"10",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "frag limit", 0, MP_PLAYER_MAXFRAGS );
 idCVar si_timeLimit(				"si_timeLimit",				"10",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "time limit in minutes", 0, 60 );
 idCVar si_teamDamage(				"si_teamDamage",			"0",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_BOOL, "enable team damage" );

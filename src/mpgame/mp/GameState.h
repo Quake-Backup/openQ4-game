@@ -21,13 +21,24 @@ Game state info common for all gametypes
 ===============================================================================
 */
 
+// Local RTTI tag for the rvGameState hierarchy.  Not a wire value, so this
+// list may be reordered freely.
 typedef enum {
 	GS_BASE,
 	GS_DM,
 	GS_TEAMDM,
 	GS_CTF,
 	GS_TOURNEY,
-	GS_DZ
+	GS_DZ,
+	// openQ4
+	GS_DUEL,
+	GS_ROUND,
+	GS_CA,
+	GS_FREEZETAG,
+	GS_REDROVER,
+	GS_ATTACKDEFEND,
+	GS_OBELISK,
+	GS_DOMINATION
 } gameStateType_t;
 
 typedef enum {
@@ -67,6 +78,22 @@ public:
 	virtual void	ClientDisconnect( idPlayer* player );
 	virtual void	Spectate( idPlayer* player );
 
+// openQ4 BEGIN
+// Hooks the round based and objective gametypes need.  Quake 4 had no way for
+// a game state class to observe a death or to veto a respawn, so elimination
+// rules had nowhere to live outside the tourney arena special case.
+	// false keeps the player out until the game state says otherwise
+	virtual bool	AllowRespawn( idPlayer* player );
+	// called on the server for every multiplayer death, after scoring
+	virtual void	PlayerDeath( idPlayer* dead, idPlayer* killer );
+	// called on the server whenever one player damages another
+	virtual void	PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage );
+	// true while player input should not be able to fire a weapon
+	virtual bool	WeaponsLocked( void ) const;
+	// what happens to a player AllowRespawn keeps out of the game
+	virtual bool	EliminatedBecomesSpectator( void ) const { return true; }
+// openQ4 END
+
 	virtual void	Clear( void );
 
 	virtual	bool	IsType( gameStateType_t type ) const;
@@ -87,6 +114,26 @@ public:
 	void			ReadNetworkInfo( idFile *file, int clientNum );
 
 	void			SpawnDeadZonePowerup();
+
+// openQ4 BEGIN
+// Overtime, carried over from Quake Live.  Quake Live does not run a separate
+// clock for overtime: it accumulates extra milliseconds and every limit check
+// measures against the extended total.  That model drops straight onto Quake 4
+// because si_timeLimit is only ever compared against matchStartedTime.
+//
+// Quake 4's SUDDENDEATH state is kept as the fallback for servers that turn
+// overtime off (si_overtime 0), so the meaning of that already-shipped state
+// byte is unchanged.
+	int				GetOvertimeCount( void ) const		{ return overtimeCount; }
+	int				GetOvertimeMsec( void ) const		{ return overtimeAccumulatedMsec; }
+	int				GetOvertimeStartTime( void ) const	{ return overtimeStartTime; }
+	bool			IsOvertime( void ) const			{ return ( overtimeCount > 0 ); }
+
+	// grants another overtime period; false when overtime is disabled
+	bool			StartOvertime( void );
+	void			StopOvertime( void );
+// openQ4 END
+
 protected:
 	static gameStateType_t type;
 	rvGameState*	previousGameState;
@@ -97,6 +144,13 @@ protected:
 	int				nextStateTime;
 
 	int				fragLimitTimeout;
+
+// openQ4: replicated with the base header, so they must also appear in
+// operator==, operator!= and operator= or SendState's delta early-out will
+// silently never ship them.
+	int				overtimeCount;
+	int				overtimeAccumulatedMsec;
+	int				overtimeStartTime;
 };
 
 /*
@@ -457,13 +511,21 @@ public:
 	bool			operator==( const riDZGameState& rhs ) const;
 	riDZGameState&	operator=( const riDZGameState& rhs );
 
+	// openQ4: this class used to assign GS_DZ to the INHERITED rvGameState::type,
+	// which corrupted the RTTI tag of every game state class for the rest of the
+	// process.  It now owns its tag like every other subclass.
+	virtual	bool	IsType( gameStateType_t type ) const;
+	static gameStateType_t GetClassType( void );
+
 	int				dzTriggerEnt;
 	int				dzShaderParm;
 
 private:
-	dzStatus_t		dzStatus[ TEAM_MAX ];	
+	dzStatus_t		dzStatus[ TEAM_MAX ];
 
 	void ControlZoneStateChanged( int team );
+
+	static gameStateType_t type;
 };
 
 

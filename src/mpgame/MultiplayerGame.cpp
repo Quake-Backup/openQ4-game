@@ -912,6 +912,8 @@ void idMultiplayerGame::Reset() {
 	UpdatePrivatePlayerCount();
 	
 	lastReadyToggleTime = -1;
+	readyPlayerCount = 0;
+	eligiblePlayerCount = 0;
 
 	cvarSystem->SetCVarBool( "s_voiceChatTest", false );
 }
@@ -2155,29 +2157,40 @@ const char *idMultiplayerGame::GameTime( void ) {
 			idStr::snPrintf( buff, sizeof( buff ), "%s %i", (gameState->GetMPGameState() == COUNTDOWN && gameLocal.gameType == GAME_TOURNEY) ? common->GetLocalizedString( "#str_107721" ) : common->GetLocalizedString( "#str_107706" ), s );
 		}
 	} else {
-		int timeLimit = gameLocal.serverInfo.GetInt( "si_timeLimit" );
+		// openQ4: the clock has to measure against the extended match length or
+		// it reads 0:00 for the whole of overtime
+		int matchLength = GetMatchLengthMsec();
 		int startTime = matchStartedTime;
 		if( gameLocal.gameType == GAME_TOURNEY ) {
 			if( gameLocal.GetLocalPlayer() ) {
 				startTime = ((rvTourneyGameState*)gameState)->GetArena( gameLocal.GetLocalPlayer()->GetArena() ).GetMatchStartTime();
 			}
 		}
-		if ( timeLimit ) {
-			ms = ( timeLimit * 60000 ) - ( gameLocal.time - startTime );
+		if ( matchLength > 0 ) {
+			ms = matchLength - ( gameLocal.time - startTime );
 		} else {
 			ms = gameLocal.time - startTime;
 		}
 		if ( ms < 0 ) {
 			ms = 0;
 		}
-	
+
 		s = ms / 1000;
 		m = s / 60;
 		s -= m * 60;
 		t = s / 10;
 		s -= t * 10;
 
-		sprintf( buff, "%i:%i%i", m, t, s );
+		// openQ4: mark the clock while the match is running on borrowed time
+		if ( gameState->IsOvertime() ) {
+			if ( gameState->GetOvertimeCount() > 1 ) {
+				idStr::snPrintf( buff, sizeof( buff ), "%s%i %i:%i%i", common->GetLocalizedString( "#str_41401" ), gameState->GetOvertimeCount(), m, t, s );
+			} else {
+				idStr::snPrintf( buff, sizeof( buff ), "%s %i:%i%i", common->GetLocalizedString( "#str_41401" ), m, t, s );
+			}
+		} else {
+			sprintf( buff, "%i:%i%i", m, t, s );
+		}
 	}
 	return &buff[0];
 }
@@ -2259,14 +2272,42 @@ bool idMultiplayerGame::AllPlayersReady( idStr* reason ) {
 	}
 
 	if ( gameLocal.IsTeamGame() ) {
-		if ( !team[ 0 ] || !team[ 1 ] ) {
+		// openQ4: Quake Live requires a minimum roster per team, not merely one
+		// body on each side
+		int teamSizeMin = Max( 1, gameLocal.serverInfo.GetInt( "si_teamSizeMin" ) );
+		bool forcePresent = gameLocal.serverInfo.GetBool( "si_teamForcePresent" );
+		int shortTeam = -1;
+
+		if ( !team[ TEAM_MARINE ] || !team[ TEAM_STROGG ] ) {
 			if( reason ) {
 				*reason = common->GetLocalizedString( "#str_107675" );
 			}
-	
+
+			return false;
+		}
+
+		if ( team[ TEAM_MARINE ] < teamSizeMin && ( forcePresent || team[ TEAM_STROGG ] < teamSizeMin ) ) {
+			shortTeam = TEAM_MARINE;
+		} else if ( team[ TEAM_STROGG ] < teamSizeMin && ( forcePresent || team[ TEAM_MARINE ] < teamSizeMin ) ) {
+			shortTeam = TEAM_STROGG;
+		}
+
+		if ( shortTeam >= 0 ) {
+			if ( reason ) {
+				int missing = teamSizeMin - team[ shortTeam ];
+				*reason = va( common->GetLocalizedString( missing == 1 ? "#str_41320" : "#str_41321" ),
+					va( "%d", missing ), MPLocalizedTeamName( shortTeam ) );
+			}
+
 			return false;
 		}
 	}
+
+	// openQ4: Quake 4 required every single player to be ready, so one idle
+	// connection held the whole server hostage.  Quake Live starts once a
+	// share of the eligible players have readied up.
+	int readyCount = 0;
+	int eligibleCount = 0;
 
 	for( i = 0; i < gameLocal.numClients; i++ ) {
 		ent = gameLocal.entities[ i ];
@@ -2277,10 +2318,31 @@ bool idMultiplayerGame::AllPlayersReady( idStr* reason ) {
 
 		p = static_cast< idPlayer * >( ent );
 
-		if ( CanPlay( p ) && !p->IsReady() ) {
-			notReady = true;
+		if ( CanPlay( p ) ) {
+			eligibleCount++;
+			if ( p->IsReady() ) {
+				readyCount++;
+			}
 		}
 		team[ p->team ]++;
+	}
+
+	readyPlayerCount = readyCount;
+	eligiblePlayerCount = eligibleCount;
+
+	if ( eligibleCount > 0 ) {
+		float required = gameLocal.serverInfo.GetFloat( "si_warmupReadyPercentage" );
+
+		// a duel needs both players; there is no majority to fall back on
+		if ( MPGameTypeHasAny( gameLocal.gameType, GTF_DUEL ) || required >= 1.0f ) {
+			notReady = ( readyCount < eligibleCount );
+		} else if ( required <= 0.0f ) {
+			notReady = false;
+		} else {
+			notReady = ( (float)readyCount / (float)eligibleCount < required );
+		}
+	} else {
+		notReady = true;
 	}
 
 	if( notReady ) {
@@ -2338,15 +2400,183 @@ idPlayer *idMultiplayerGame::FragLimitHit() {
 idMultiplayerGame::TimeLimitHit
 ================
 */
-bool idMultiplayerGame::TimeLimitHit( void ) {	
-	int timeLimit = gameLocal.serverInfo.GetInt( "si_timeLimit" );
-	if ( timeLimit ) {
-		if ( gameLocal.time >= matchStartedTime + timeLimit * 60000 ) {
+bool idMultiplayerGame::TimeLimitHit( void ) {
+	int matchLength = GetMatchLengthMsec();
+
+	if ( matchLength > 0 ) {
+		if ( gameLocal.time >= matchStartedTime + matchLength ) {
 			return true;
 		}
 	}
 	return false;
 }
+
+// openQ4 BEGIN
+/*
+================
+idMultiplayerGame::GetMatchLengthMsec
+
+The match clock in milliseconds, including every overtime period granted so
+far.  Quake Live models overtime as an extension of the same clock rather than
+a second one, so every limit check goes through here.  Returns 0 when the
+match is untimed.
+================
+*/
+int idMultiplayerGame::GetMatchLengthMsec( void ) {
+	int timeLimit = gameLocal.serverInfo.GetInt( "si_timeLimit" );
+
+	if ( timeLimit <= 0 ) {
+		return 0;
+	}
+
+	return ( timeLimit * 60000 ) + ( gameState ? gameState->GetOvertimeMsec() : 0 );
+}
+
+/*
+================
+idMultiplayerGame::ScoreIsTied
+
+Was computed inline and slightly differently in each game state subclass.
+================
+*/
+bool idMultiplayerGame::ScoreIsTied( void ) {
+	idPlayer *first, *second;
+
+	if ( gameLocal.IsTeamGame() ) {
+		return ( GetScoreForTeam( TEAM_MARINE ) == GetScoreForTeam( TEAM_STROGG ) );
+	}
+
+	first = GetRankedPlayer( 0 );
+	second = GetRankedPlayer( 1 );
+
+	if ( first == NULL || second == NULL ) {
+		return false;
+	}
+
+	return ( GetScore( first ) == GetScore( second ) );
+}
+
+/*
+================
+idMultiplayerGame::MercyLimitHit
+
+Ends a lopsided team match early.  Returns the winning team, or -1.
+================
+*/
+int idMultiplayerGame::MercyLimitHit( void ) {
+	int mercyLimit, marine, strogg;
+
+	if ( !gameLocal.IsTeamGame() ) {
+		return -1;
+	}
+
+	mercyLimit = gameLocal.serverInfo.GetInt( "si_mercyLimit" );
+	if ( mercyLimit <= 0 ) {
+		return -1;
+	}
+
+	marine = GetScoreForTeam( TEAM_MARINE );
+	strogg = GetScoreForTeam( TEAM_STROGG );
+
+	if ( marine - strogg >= mercyLimit ) {
+		return TEAM_MARINE;
+	}
+	if ( strogg - marine >= mercyLimit ) {
+		return TEAM_STROGG;
+	}
+
+	return -1;
+}
+
+/*
+================
+idMultiplayerGame::ForfeitTeam
+
+Quake 4 could only end a drained match through CheckAbortGame, which also
+required the time limit to have expired - so with si_timeLimit 0 a server that
+emptied out sat in GAMEON forever.  Returns the team left standing, or -1.
+================
+*/
+int idMultiplayerGame::ForfeitTeam( void ) {
+	int i, count[ TEAM_MAX ];
+
+	if ( !gameLocal.IsTeamGame() || !gameLocal.serverInfo.GetBool( "si_forfeit" ) ) {
+		return -1;
+	}
+
+	count[ TEAM_MARINE ] = 0;
+	count[ TEAM_STROGG ] = 0;
+
+	for ( i = 0; i < gameLocal.numClients; i++ ) {
+		idEntity *ent = gameLocal.entities[ i ];
+
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+
+		idPlayer *p = static_cast< idPlayer * >( ent );
+		if ( !CanPlay( p ) || p->wantSpectate ) {
+			continue;
+		}
+		if ( p->team < 0 || p->team >= TEAM_MAX ) {
+			continue;
+		}
+
+		count[ p->team ]++;
+	}
+
+	// nobody is playing at all: that is an abort, not a forfeit
+	if ( !count[ TEAM_MARINE ] && !count[ TEAM_STROGG ] ) {
+		return -1;
+	}
+
+	if ( !count[ TEAM_STROGG ] ) {
+		return TEAM_MARINE;
+	}
+	if ( !count[ TEAM_MARINE ] ) {
+		return TEAM_STROGG;
+	}
+
+	return -1;
+}
+
+/*
+================
+idMultiplayerGame::GetOvertimeRespawnDelay
+
+Quake Live's sudden death is not a phase at all: while a match is in overtime
+the respawn delay grows the longer it runs, so trading deaths stops being a
+way to stall.  Returns milliseconds.
+================
+*/
+int idMultiplayerGame::GetOvertimeRespawnDelay( void ) {
+	int base, increase, cap, elapsedMinutes, delay;
+
+	if ( gameState == NULL || !gameState->IsOvertime() ) {
+		return 0;
+	}
+
+	base = gameLocal.serverInfo.GetInt( "si_suddenDeathRespawnDelay" );
+	if ( base <= 0 ) {
+		return 0;
+	}
+
+	increase = gameLocal.serverInfo.GetInt( "si_suddenDeathRespawnIncrease" );
+	cap = gameLocal.serverInfo.GetInt( "si_suddenDeathRespawnMax" );
+
+	elapsedMinutes = ( gameLocal.time - gameState->GetOvertimeStartTime() ) / 60000;
+	if ( elapsedMinutes < 0 ) {
+		elapsedMinutes = 0;
+	}
+
+	delay = base + ( elapsedMinutes * increase );
+	if ( cap > 0 && delay > cap ) {
+		delay = cap;
+	}
+
+	return delay * 1000;
+}
+// openQ4 END
 
 /*
 ================
@@ -2479,6 +2709,13 @@ void idMultiplayerGame::PlayerDeath( idPlayer *dead, idPlayer *killer, int metho
 	SendDeathMessage( killer, dead, methodOfDeath, killer ? killer->PowerUpActive( POWERUP_QUADDAMAGE ) : false );
 
 	statManager->Kill( dead, killer, methodOfDeath );
+
+	// openQ4: let the game state react to the death.  Round modes use this to
+	// eliminate the victim, Freeze Tag to freeze them, Red Rover to switch
+	// their team.  Quake 4 had no such hook at all.
+	if ( gameState != NULL ) {
+		gameState->PlayerDeath( dead, killer );
+	}
 
 // RAVEN BEGIN
 // shouchard:  hack for CTF drop messages for listen servers
@@ -2796,7 +3033,7 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 
 		if ( voteData.m_fieldFlags & VOTEFLAG_MAP ) {
 			const idDict *mapDict = MultiplayerResolveMapDecl( voteData.m_map.c_str() );
-			if ( !mapDict || !mapDict->GetInt( voteString ) ) {
+			if ( !MPMapSupportsGameTypeName( mapDict, voteString ) ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "gametype incompatible with map" );
 				validVote = false;
 				voteData.m_fieldFlags &= ( ~VOTEFLAG_GAMETYPE );
@@ -2805,7 +3042,7 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 	} else {
 		if ( voteData.m_fieldFlags & VOTEFLAG_MAP ) {
 			const idDict *mapDict = MultiplayerResolveMapDecl( voteData.m_map.c_str() );
-			if ( !mapDict || !mapDict->GetInt( si_gameType.GetString() ) ) {
+			if ( !MPMapSupportsGameTypeName( mapDict, si_gameType.GetString() ) ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "map incompatible with gametype" );
 				validVote = false;
 				voteData.m_fieldFlags &= ( ~VOTEFLAG_MAP );
@@ -3089,28 +3326,7 @@ void idMultiplayerGame::ClientStartPackedVote( int clientNum, const voteStruct_t
 			}
 		}
 		if ( 0 != ( currentVoteData.m_fieldFlags & VOTEFLAG_GAMETYPE ) ) {
-			const char *gameTypeString = common->GetLocalizedString( "#str_110011" );
-			switch( currentVoteData.m_gameType ) {
-				case VOTE_GAMETYPE_TOURNEY:
-					gameTypeString = common->GetLocalizedString( "#str_110012" );
-					break;
-				case VOTE_GAMETYPE_TDM:
-					gameTypeString = common->GetLocalizedString( "#str_110013" );
-					break;
-				case VOTE_GAMETYPE_CTF:
-					gameTypeString = common->GetLocalizedString( "#str_110014" );
-					break;
-				case VOTE_GAMETYPE_ARENA_CTF:
-					gameTypeString = common->GetLocalizedString( "#str_110015" );
-					break;
-				case VOTE_GAMETYPE_DEADZONE:
-					gameTypeString = "DeadZone";
-					break;
-				case VOTE_GAMETYPE_DM:
-				default:
-					gameTypeString = common->GetLocalizedString( "#str_110011" );
-					break;
-			}
+			const char *gameTypeString = MPGameTypeLocalizedName( MPVoteGameTypeToGameType( currentVoteData.m_gameType ) );
 			mpHud->SetStateString( va( "voteInfo_%d", voteLineCount ),
 				va( common->GetLocalizedString( "#str_104430" ), gameTypeString ) );
 
@@ -3326,7 +3542,7 @@ void idMultiplayerGame::ExecutePackedVote( void ) {
 			}
 
 			const idDict *mapDict = MultiplayerResolveMapDecl( si_map.GetString() );
-			if ( !mapDict || !mapDict->GetInt( gameTypeString ) ) {
+			if ( !MPMapSupportsGameTypeName( mapDict, gameTypeString ) ) {
 				gameLocal.Warning( "server voted to gametype with no maps; resetting gametype to DM." );
 				si_gameType.SetString( "DM" );
 				needNextMap = false;
@@ -3541,17 +3757,17 @@ void idMultiplayerGame::SetMapList( const char *listName, const char *mapName, i
 		//if the gametype is DM, check for any of these types...
 		if( !(strcmp( gameType, "DM")) || !(strcmp( gameType, "Team DM")) ) {
 			if ( dict && (
-				dict->GetBool( "DM" ) || 
-				dict->GetBool( "Team DM" ) || 
-				dict->GetBool( "CTF" ) || 
+				dict->GetBool( "DM" ) ||
+				dict->GetBool( "Team DM" ) ||
+				dict->GetBool( "CTF" ) ||
 				dict->GetBool( "Tourney" ) ||
 				dict->GetBool( "Arena CTF" ))
 				) {
 			mapOk = true;
 			}
 		//but if not, match the gametype.
-		} else if ( dict && dict->GetBool( gameType ) ) {
-			mapOk = true;			
+		} else if ( MPMapSupportsGameTypeName( dict, gameType ) ) {
+			mapOk = true;
 		}
 		if( mapOk ) {
 			const char *mapName = dict->GetString( "name" );
@@ -5316,25 +5532,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 				data.mapName = gameLocal.serverInfo.GetString( "si_map" );
 			}
 
-			switch ( mainGui->GetStateInt( "admincurrentGametype" ) ) {
-				case VOTE_GAMETYPE_DM:
-					data.gameType = GAME_DM;
-					break;
-				case VOTE_GAMETYPE_TOURNEY:
-					data.gameType = GAME_TOURNEY;
-					break;
-				case VOTE_GAMETYPE_TDM:
-					data.gameType = GAME_TDM;
-					break;
-				case VOTE_GAMETYPE_CTF:
-					data.gameType = GAME_CTF;
-					break;
-				case VOTE_GAMETYPE_ARENA_CTF:
-					data.gameType = GAME_ARENA_CTF;
-					break;
-				case VOTE_GAMETYPE_DEADZONE:
-					data.gameType = GAME_DEADZONE;
-			}
+			data.gameType = MPVoteGameTypeToGameType( mainGui->GetStateInt( "admincurrentGametype" ) );
 			data.captureLimit = mainGui->GetStateInt( "sa_captureLimit" );
 			data.fragLimit = mainGui->GetStateInt( "sa_fragLimit" );
 			data.tourneyLimit = mainGui->GetStateInt( "sa_tourneylimit" );
@@ -5858,6 +6056,64 @@ void idMultiplayerGame::UpdateHud( idUserInterface* _mphud ) {
 	// Always show GameTime() for WARMUP and COUNTDOWN.
 	mpGameState_t state = gameState->GetMPGameState();
 	_mphud->SetStateString( "timeleft", GameTime() );
+
+// openQ4 BEGIN
+	// Match progression carried over from Quake Live.  These keys are always
+	// written so a .gui can bind to them unconditionally; the "show" flags say
+	// whether they mean anything for the current gametype and moment.
+	{
+		bool inOvertime = gameState->IsOvertime();
+
+		_mphud->SetStateBool( "overtime", inOvertime );
+		_mphud->SetStateInt( "overtimecount", gameState->GetOvertimeCount() );
+		_mphud->SetStateString( "overtimetext", inOvertime
+			? ( gameState->GetOvertimeCount() > 1
+				? va( common->GetLocalizedString( "#str_41311" ), va( "%d", gameState->GetOvertimeCount() ) )
+				: common->GetLocalizedString( "#str_41310" ) )
+			: "" );
+
+		// ready tally, so warmup shows progress instead of a bare "waiting"
+		bool showReady = ( state == WARMUP ) && gameLocal.serverInfo.GetBool( "si_useReady" );
+		_mphud->SetStateBool( "showready", showReady );
+		_mphud->SetStateInt( "readycount", readyPlayerCount );
+		_mphud->SetStateInt( "readytotal", eligiblePlayerCount );
+		_mphud->SetStateString( "readytext", showReady
+			? va( common->GetLocalizedString( "#str_41319" ), va( "%d", readyPlayerCount ), va( "%d", eligiblePlayerCount ) )
+			: "" );
+
+		// round state for the round based gametypes
+		bool isRound = gameState->IsType( rvRoundGameState::GetClassType() ) ||
+					   gameLocal.IsRoundGameType();
+		rvRoundGameState *roundState = ( gameLocal.IsRoundGameType() && gameState != NULL )
+			? static_cast< rvRoundGameState * >( gameState ) : NULL;
+
+		_mphud->SetStateBool( "showround", isRound && roundState != NULL && state == GAMEON );
+
+		if ( roundState != NULL ) {
+			int remaining = roundState->GetRoundTimeRemaining();
+
+			_mphud->SetStateInt( "roundnumber", roundState->GetRoundNumber() );
+			_mphud->SetStateString( "roundtext",
+				va( common->GetLocalizedString( "#str_41330" ), va( "%d", roundState->GetRoundNumber() ) ) );
+
+			if ( remaining >= 0 ) {
+				int rs = remaining / 1000;
+				_mphud->SetStateString( "roundtime", va( "%i:%02i", rs / 60, rs % 60 ) );
+				// Quake Live only shows the round clock over the last stretch,
+				// where it actually changes how people play
+				_mphud->SetStateBool( "showroundtime", remaining <= 30000 );
+			} else {
+				_mphud->SetStateString( "roundtime", "" );
+				_mphud->SetStateBool( "showroundtime", false );
+			}
+		} else {
+			_mphud->SetStateInt( "roundnumber", 0 );
+			_mphud->SetStateString( "roundtext", "" );
+			_mphud->SetStateString( "roundtime", "" );
+			_mphud->SetStateBool( "showroundtime", false );
+		}
+	}
+// openQ4 END
 
 // RITUAL BEGIN
 // squirrel: Mode-agnostic buymenus
@@ -6417,6 +6673,167 @@ void idMultiplayerGame::PlayGlobalItemAcquireSound( int defIndex ) {
 idMultiplayerGame::PrintMessageEvent
 ================
 */
+// openQ4 BEGIN
+/*
+================
+MPLocalizedTeamName
+================
+*/
+const char *MPLocalizedTeamName( int team ) {
+	// #str_108025 is "Strogg", #str_108026 is "Marine"
+	return common->GetLocalizedString( team == TEAM_STROGG ? "#str_108025" : "#str_108026" );
+}
+
+/*
+================
+MPTeamColor
+================
+*/
+const char *MPTeamColor( int team ) {
+	return ( team == TEAM_STROGG ) ? S_COLOR_STROGG : S_COLOR_MARINE;
+}
+
+/*
+================
+idMultiplayerGame::FormatCenterPrintParm
+
+Turns one typed parameter into display text.  Client names and team names are
+resolved on the receiving client so nothing pre-translated goes over the wire.
+================
+*/
+static const char *MPFormatCenterPrintParm( int type, int parm ) {
+	switch ( type ) {
+		case idMultiplayerGame::CPARM_CLIENT: {
+			int team = TEAM_MARINE;
+
+			if ( parm < 0 || parm >= MAX_CLIENTS ) {
+				return "";
+			}
+			if ( gameLocal.entities[ parm ] && gameLocal.entities[ parm ]->IsType( idPlayer::GetClassType() ) ) {
+				team = static_cast< idPlayer * >( gameLocal.entities[ parm ] )->team;
+			}
+			if ( gameLocal.IsTeamGame() ) {
+				return va( "%s%s" S_COLOR_DEFAULT, MPTeamColor( team ), gameLocal.userInfo[ parm ].GetString( "ui_name" ) );
+			}
+			return va( "%s", gameLocal.userInfo[ parm ].GetString( "ui_name" ) );
+		}
+		case idMultiplayerGame::CPARM_TEAM:
+			return va( "%s%s" S_COLOR_DEFAULT, MPTeamColor( parm ), MPLocalizedTeamName( parm ) );
+		case idMultiplayerGame::CPARM_INT:
+			return va( "%d", parm );
+		default:
+			break;
+	}
+
+	return "";
+}
+
+/*
+================
+idMultiplayerGame::CenterPrint
+================
+*/
+void idMultiplayerGame::CenterPrint( int to, const char *strId, bool persist ) {
+	CenterPrint( to, strId, CPARM_NONE, 0, CPARM_NONE, 0, persist );
+}
+
+void idMultiplayerGame::CenterPrint( int to, const char *strId, centerPrintParm_t type1, int parm1, bool persist ) {
+	CenterPrint( to, strId, type1, parm1, CPARM_NONE, 0, persist );
+}
+
+void idMultiplayerGame::CenterPrint( int to, const char *strId, centerPrintParm_t type1, int parm1, centerPrintParm_t type2, int parm2, bool persist ) {
+	idBitMsg	outMsg;
+	byte		msgBuf[ MAX_GAME_MESSAGE_SIZE ];
+
+	if ( strId == NULL || *strId == '\0' ) {
+		return;
+	}
+
+	if ( !gameLocal.isClient ) {
+		outMsg.Init( msgBuf, sizeof( msgBuf ) );
+		outMsg.WriteByte( GAME_RELIABLE_MESSAGE_CENTERPRINT );
+		outMsg.WriteString( strId );
+		outMsg.WriteBits( persist ? 1 : 0, 1 );
+		outMsg.WriteBits( type1, 2 );
+		outMsg.WriteShort( parm1 );
+		outMsg.WriteBits( type2, 2 );
+		outMsg.WriteShort( parm2 );
+
+		if ( to == -1 ) {
+			networkSystem->ServerSendReliableMessage( -1, outMsg );
+		} else {
+			networkSystem->ServerSendReliableMessage( to, outMsg );
+		}
+	}
+
+	// a listen server never receives its own reliable messages, so show it here
+	if ( gameLocal.isClient ) {
+		return;
+	}
+
+	idPlayer *local = gameLocal.GetLocalPlayer();
+	if ( local == NULL || ( to != -1 && to != local->entityNumber ) ) {
+		return;
+	}
+
+	local->GUIMainNotice( va( common->GetLocalizedString( strId ), MPFormatCenterPrintParm( type1, parm1 ), MPFormatCenterPrintParm( type2, parm2 ) ), persist );
+}
+
+/*
+================
+idMultiplayerGame::CenterPrintTeam
+
+Sends a notice to every player on one team.  Spectators following a player on
+that team see it too, which is what Quake Live does.
+================
+*/
+void idMultiplayerGame::CenterPrintTeam( int team, const char *strId, centerPrintParm_t type1, int parm1, bool persist ) {
+	int i;
+
+	if ( gameLocal.isClient ) {
+		return;
+	}
+
+	for ( i = 0; i < gameLocal.numClients; i++ ) {
+		idEntity *ent = gameLocal.entities[ i ];
+
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+		if ( static_cast< idPlayer * >( ent )->team != team ) {
+			continue;
+		}
+
+		CenterPrint( i, strId, type1, parm1, persist );
+	}
+}
+
+/*
+================
+idMultiplayerGame::ReceiveCenterPrint
+================
+*/
+void idMultiplayerGame::ReceiveCenterPrint( const idBitMsg &msg ) {
+	char	strId[ 128 ];
+	bool	persist;
+	int		type1, parm1, type2, parm2;
+
+	msg.ReadString( strId, sizeof( strId ) );
+	persist = ( msg.ReadBits( 1 ) != 0 );
+	type1 = msg.ReadBits( 2 );
+	parm1 = msg.ReadShort();
+	type2 = msg.ReadBits( 2 );
+	parm2 = msg.ReadShort();
+
+	idPlayer *local = gameLocal.GetLocalPlayer();
+	if ( local == NULL ) {
+		return;
+	}
+
+	local->GUIMainNotice( va( common->GetLocalizedString( strId ), MPFormatCenterPrintParm( type1, parm1 ), MPFormatCenterPrintParm( type2, parm2 ) ), persist );
+}
+// openQ4 END
+
 void idMultiplayerGame::PrintMessageEvent( int to, msg_evt_t evt, int parm1, int parm2 ) {
 	idPlayer *p = gameLocal.GetLocalPlayer();
 	if ( to == -1 || ( p && to == p->entityNumber ) ) {
@@ -6557,6 +6974,14 @@ void idMultiplayerGame::CheckRespawns( idPlayer *spectator ) {
 			} else {
 				if ( gameState->GetMPGameState() == WARMUP || gameState->GetMPGameState() == COUNTDOWN || gameState->GetMPGameState() == GAMEON ) {
 					if ( gameLocal.gameType != GAME_TOURNEY ) {
+						// openQ4: round based modes hold eliminated players out
+						// until the next round starts
+						if ( !gameState->AllowRespawn( p ) ) {
+							if ( gameState->EliminatedBecomesSpectator() ) {
+								p->ServerSpectate( true );
+							}
+							continue;
+						}
 						// wait for team to be set before spawning in
 						if( !gameLocal.IsTeamGame() || p->team != -1 ) {
 							p->ServerSpectate( false );
@@ -6709,6 +7134,115 @@ void idMultiplayerGame::ForceReady_f( const idCmdArgs &args ) {
 	}
 	gameLocal.mpGame.ForceReady();
 }
+
+// openQ4 BEGIN
+/*
+================
+idMultiplayerGame::ServerSetPlayerReady
+
+Authoritative ready state.  Quake 4 carried ready in the ui_ready userinfo
+key, which ThrottleUserInfo caps at one change every five seconds; a player
+who mistimed a ready press simply had it swallowed.  The console commands
+below reach the server directly through GAME_RELIABLE_MESSAGE_READY.
+================
+*/
+void idMultiplayerGame::ServerSetPlayerReady( int clientNum, bool isReady ) {
+	idEntity *ent;
+	idPlayer *player;
+
+	if ( gameLocal.isClient ) {
+		return;
+	}
+
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+
+	ent = gameLocal.entities[ clientNum ];
+	if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+		return;
+	}
+
+	player = static_cast< idPlayer * >( ent );
+
+	// readying only means anything while a match is being set up
+	if ( gameState == NULL || gameState->GetMPGameState() != WARMUP ) {
+		return;
+	}
+
+	if ( player->GetReady() == isReady ) {
+		return;
+	}
+
+	player->SetReady( isReady );
+
+	if ( !player->wantSpectate ) {
+		AddChatLine( common->GetLocalizedString( "#str_107180" ), gameLocal.userInfo[ clientNum ].GetString( "ui_name" ),
+			isReady ? common->GetLocalizedString( "#str_104300" ) : common->GetLocalizedString( "#str_104301" ) );
+	}
+}
+
+/*
+================
+idMultiplayerGame::SendReady
+
+Client side half of the ready commands.  Keeps ui_ready in step so the menu
+checkbox and the scoreboard icon still reflect the real state.
+================
+*/
+static void MPSendReady( bool isReady ) {
+	idBitMsg	outMsg;
+	byte		msgBuf[ 32 ];
+
+	if ( !gameLocal.isMultiplayer ) {
+		gameLocal.Printf( "ready: only valid in multiplayer\n" );
+		return;
+	}
+
+	if ( !gameLocal.serverInfo.GetBool( "si_useReady" ) ) {
+		gameLocal.Printf( "ready: this server does not use ready up\n" );
+		return;
+	}
+
+	cvarSystem->SetCVarString( "ui_ready", isReady ? "Ready" : "Not Ready" );
+
+	if ( gameLocal.isClient ) {
+		outMsg.Init( msgBuf, sizeof( msgBuf ) );
+		outMsg.WriteByte( GAME_RELIABLE_MESSAGE_READY );
+		outMsg.WriteBits( isReady ? 1 : 0, 1 );
+		networkSystem->ClientSendReliableMessage( outMsg );
+	} else {
+		gameLocal.mpGame.ServerSetPlayerReady( gameLocal.localClientNum, isReady );
+	}
+}
+
+/*
+================
+idMultiplayerGame::Ready_f
+================
+*/
+void idMultiplayerGame::Ready_f( const idCmdArgs &args ) {
+	MPSendReady( true );
+}
+
+/*
+================
+idMultiplayerGame::NotReady_f
+================
+*/
+void idMultiplayerGame::NotReady_f( const idCmdArgs &args ) {
+	MPSendReady( false );
+}
+
+/*
+================
+idMultiplayerGame::ReadyUp_f
+================
+*/
+void idMultiplayerGame::ReadyUp_f( const idCmdArgs &args ) {
+	MPSendReady( idStr::Icmp( cvarSystem->GetCVarString( "ui_ready" ), "Ready" ) != 0 );
+}
+// openQ4 END
 
 /*
 ================
@@ -7524,14 +8058,32 @@ void idMultiplayerGame::CheckAbortGame( void ) {
 		return;
 	}
 
-	// in tourney, if we don't have enough clients to play we need to cycle back to 
+	// in tourney, if we don't have enough clients to play we need to cycle back to
 	// warmup to re-seed
 	if( gameLocal.gameType == GAME_TOURNEY ) {
 		if ( !EnoughClientsToPlay() ) {
 			gameState->NewState( WARMUP );
 		}
-	} else {
-		if ( !EnoughClientsToPlay() && TimeLimitHit() ) {
+		return;
+	}
+
+	// openQ4: forfeit, carried over from Quake Live.  Checked before the
+	// original abort rule, which required the time limit to have expired as
+	// well - so an untimed server that emptied out never ended at all.
+	if ( gameState->GetMPGameState() == GAMEON || gameState->GetMPGameState() == SUDDENDEATH ) {
+		int forfeitTeam = ForfeitTeam();
+
+		if ( forfeitTeam >= 0 ) {
+			CenterPrint( -1, "#str_41316", CPARM_TEAM, forfeitTeam );
+			AddChatLine( "%s", common->GetLocalizedString( "#str_41315" ) );
+			gameState->NewState( GAMEREVIEW );
+			return;
+		}
+	}
+
+	if ( !EnoughClientsToPlay() ) {
+		// openQ4: an untimed match used to hang here forever
+		if ( TimeLimitHit() || GetMatchLengthMsec() <= 0 ) {
 			gameState->NewState( GAMEREVIEW );
 		}
 	}
@@ -7706,6 +8258,12 @@ void idMultiplayerGame::SwitchToTeam( int clientNum, int oldteam, int newteam ) 
 		p->inventory.carryOverWeapons = 0;
 		p->ResetCash();
 //RITUAL END
+		// openQ4: changing sides during warmup withdraws your ready, so a team
+		// swap cannot silently start the match on the players left behind
+		if ( gameState && gameState->GetMPGameState() == WARMUP ) {
+			p->SetReady( false );
+			p->forcedReady = false;
+		}
 		p->Kill( true, true );
 		CheckAbortGame();
 	}
@@ -8850,6 +9408,9 @@ void idMultiplayerGame::ScheduleTimeAnnouncements( void ) {
 
 	if( gameState->GetMPGameState() != COUNTDOWN && gameState->GetMPGameState() != WARMUP ) {
 		int timeLimit = gameLocal.serverInfo.GetInt( "si_timeLimit" );
+		// openQ4: announce against the extended clock so the one minute warning
+		// lands at the end of overtime, not at the end of regulation
+		int matchLength = GetMatchLengthMsec();
 		int endGameTime = 0;
 
 		if( gameLocal.gameType == GAME_TOURNEY ) {
@@ -8860,7 +9421,7 @@ void idMultiplayerGame::ScheduleTimeAnnouncements( void ) {
 			// per-arena timelimits
 			endGameTime = ((rvTourneyGameState*)gameState)->GetArena( arena ).GetMatchStartTime() + ( timeLimit * 60000 );
 		} else {
-			endGameTime = matchStartedTime + ( timeLimit * 60000 );
+			endGameTime = matchStartedTime + matchLength;
 		}
 
 		if( timeLimit > 5 ) {
@@ -8962,12 +9523,40 @@ void idMultiplayerGame::ClearTeamScores ( void ) {
 	}
 }
 
+// openQ4 BEGIN
+/*
+================
+idMultiplayerGame::ScoringSuppressed
+
+Quake 4 let frags accumulate through warmup and then zeroed everyone on
+GAMEON, which meant the warmup scoreboard showed a meaningless race.  Quake
+Live simply does not score warmup at all.
+================
+*/
+bool idMultiplayerGame::ScoringSuppressed( void ) const {
+	if ( gameState == NULL ) {
+		return false;
+	}
+
+	if ( gameLocal.serverInfo.GetBool( "si_warmupScoring" ) ) {
+		return false;
+	}
+
+	return ( gameState->GetMPGameState() == WARMUP || gameState->GetMPGameState() == COUNTDOWN );
+}
+// openQ4 END
+
 void idMultiplayerGame::AddTeamScore ( int team, int amount ) {
 	if ( team < 0 || team >= TEAM_MAX ) {
 		return;
 	}
 
-	teamScore[ team ] += amount;
+	if ( ScoringSuppressed() ) {
+		return;
+	}
+
+	// openQ4: teamScore ships as a short in the snapshot, so keep it in range
+	teamScore[ team ] = idMath::ClampInt( -MP_TEAM_MAXSCORE, MP_TEAM_MAXSCORE, teamScore[ team ] + amount );
 }
 
 void idMultiplayerGame::AddPlayerScore( idPlayer* player, int amount ) {
@@ -8978,6 +9567,10 @@ void idMultiplayerGame::AddPlayerScore( idPlayer* player, int amount ) {
 
 	if( player->entityNumber < 0 || player->entityNumber >= MAX_CLIENTS ) {
 		gameLocal.Warning( "idMultiplayerGame::AddPlayerScore() - Bad player entityNumber '%d'\n", player->entityNumber );
+		return;
+	}
+
+	if ( ScoringSuppressed() ) {
 		return;
 	}
 
@@ -8993,6 +9586,10 @@ void idMultiplayerGame::AddPlayerTeamScore( idPlayer* player, int amount ) {
 
 	if( player->entityNumber < 0 || player->entityNumber >= MAX_CLIENTS ) {
 		gameLocal.Warning( "idMultiplayerGame::AddPlayerTeamScore() - Bad player entityNumber '%d'\n", player->entityNumber );
+		return;
+	}
+
+	if ( ScoringSuppressed() ) {
 		return;
 	}
 
@@ -9133,28 +9730,16 @@ void idMultiplayerGame::ServerSetInstance( int instance ) {
 }
 
 const char* idMultiplayerGame::GetLongGametypeName( const char* gametype ) {
-	if( !idStr::Icmp( gametype, "Tourney" ) ) {
-		return common->GetLocalizedString( "#str_107676" );
-	} else if( !idStr::Icmp( gametype, "Team DM" ) ) {
-		return common->GetLocalizedString( "#str_107677" );
-	} else if( !idStr::Icmp( gametype, "CTF" ) ) {
-		return common->GetLocalizedString( "#str_107678" );
-	} else if( !idStr::Icmp( gametype, "DM" ) ) {
-		return common->GetLocalizedString( "#str_107679" );
-	} else if( !idStr::Icmp( gametype, "One Flag CTF" ) ) {
-		return common->GetLocalizedString( "#str_107680" );
-	} else if( !idStr::Icmp( gametype, "Arena CTF" ) ) {
-		return common->GetLocalizedString( "#str_107681" );
-	} else if( !idStr::Icmp( gametype, "Arena One Flag CTF" ) ) {
-		return common->GetLocalizedString( "#str_107682" );
-	// RITUAL BEGIN
-    // squirrel: added DeadZone multiplayer mode
-	} else if( !idStr::Icmp( gametype, "DeadZone" ) ) {
-		return common->GetLocalizedString( "#str_122001" ); // Squirrel@Ritual - Localized for 1.2 Patch
-    // RITUAL END
+	// openQ4: was a hand-written chain that had to be kept in step with five
+	// other switches; the descriptor table is now the only place a gametype
+	// declares its display name.
+	const mpGameTypeInfo_t *info = MPGameTypeByName( gametype );
+
+	if ( info == NULL ) {
+		return "";
 	}
 
-	return "";
+	return common->GetLocalizedString( info->localizedName );
 }
 
 /*
@@ -9163,47 +9748,17 @@ idMultiplayerGame::VoteGameTypeToString
 ================
 */
 const char *idMultiplayerGame::VoteGameTypeToString( int gameTypeInt ) {
-	const char *gameType = NULL;
-	switch ( gameTypeInt ) {
-		default:
-		case VOTE_GAMETYPE_DM:
-			gameType = "DM";
-			break;
-		case VOTE_GAMETYPE_TOURNEY:
-			gameType = "Tourney";
-			break;
-		case VOTE_GAMETYPE_TDM:
-			gameType = "Team DM";
-			break;
-		case VOTE_GAMETYPE_CTF:
-			gameType = "CTF";
-			break;
-		case VOTE_GAMETYPE_ARENA_CTF:
-			gameType = "Arena CTF";
-			break;
-		case VOTE_GAMETYPE_DEADZONE:
-			gameType = "DeadZone";
-			break;
-	}
-	return gameType;
+	return MPGameTypeName( MPVoteGameTypeToGameType( gameTypeInt ) );
 }
 
 int	idMultiplayerGame::GameTypeToVote( const char *gameType ) {
-	if ( 0 == idStr::Icmp( gameType, "DM" ) ) { 
+	const mpGameTypeInfo_t *info = MPGameTypeByName( gameType );
+
+	if ( info == NULL ) {
 		return VOTE_GAMETYPE_DM;
-	} else if ( 0 == idStr::Icmp( gameType, "Tourney" ) ) {
-		return VOTE_GAMETYPE_TOURNEY;
-	} else if ( 0 == idStr::Icmp( gameType, "Team DM" ) ) {
-		return VOTE_GAMETYPE_TDM;
-	} else if ( 0 == idStr::Icmp( gameType, "CTF" ) ) {
-		return VOTE_GAMETYPE_CTF;
-	} else if ( 0 == idStr::Icmp( gameType, "Arena CTF" ) ) {
-		return VOTE_GAMETYPE_ARENA_CTF;
-	} else if ( 0 == idStr::Icmp( gameType, "DeadZone" ) ) {
-		return VOTE_GAMETYPE_DEADZONE;
 	}
 
-	return VOTE_GAMETYPE_DM;
+	return MPGameTypeToVoteGameType( info->type );
 }
 
 float idMultiplayerGame::GetPlayerDeadZoneScore( idPlayer* player ) {
@@ -9324,39 +9879,61 @@ void idMultiplayerGame::SetGameType( void ) {
 		gameState = NULL;
 	}
 
-	if ( ( idStr::Icmp( gameLocal.serverInfo.GetString( "si_gameType" ), "DM" ) == 0 ) ) {
-		gameLocal.gameType = GAME_DM;
-		gameState = new rvDMGameState();
-	} else if ( ( idStr::Icmp( gameLocal.serverInfo.GetString( "si_gameType" ), "Tourney" ) == 0 ) ) {
-		gameLocal.gameType = GAME_TOURNEY;
-		gameState = new rvTourneyGameState();
-	} else if ( ( idStr::Icmp( gameLocal.serverInfo.GetString( "si_gameType" ), "Team DM" ) == 0 ) ) {
-		gameLocal.gameType = GAME_TDM;
-		gameState = new rvTeamDMGameState();
-	} else if ( ( idStr::Icmp( gameLocal.serverInfo.GetString( "si_gameType" ), "CTF" ) == 0 ) ) {
-		gameLocal.gameType = GAME_CTF;
-		gameState = new rvCTFGameState();
-	} else if ( ( idStr::Icmp( gameLocal.serverInfo.GetString( "si_gameType" ), "One Flag CTF" ) == 0 ) ) {
-		gameLocal.gameType = GAME_1F_CTF;
-		gameState = new rvCTFGameState();
-	} else if ( ( idStr::Icmp( gameLocal.serverInfo.GetString( "si_gameType" ), "Arena CTF" ) == 0 ) ) {
-		gameLocal.gameType = GAME_ARENA_CTF;
-		gameState = new rvCTFGameState();
-	} else if ( ( idStr::Icmp( gameLocal.serverInfo.GetString( "si_gameType" ), "Arena One Flag CTF" ) == 0 ) ) {
-		gameLocal.gameType = GAME_ARENA_1F_CTF;
-		gameState = new rvCTFGameState();
-	} else if ( ( idStr::Icmp( gameLocal.serverInfo.GetString( "si_gameType" ), "DeadZone" ) == 0 ) ) {
-		gameLocal.gameType = GAME_DEADZONE;
-		gameState = new riDZGameState;
-	} else {
+	// openQ4: the descriptor table resolves the name; only the state class
+	// allocation stays as a switch, because that is the one thing a table of
+	// plain data cannot express.
+	const mpGameTypeInfo_t *info = MPGameTypeByName( gameLocal.serverInfo.GetString( "si_gameType" ) );
+
+	if ( info == NULL ) {
 		gameLocal.Error( "idMultiplayerGame::SetGameType() - Unknown gametype '%s'\n", gameLocal.serverInfo.GetString( "si_gameType" ) );
+		return;
 	}
 
-	// force entity filter to gametype name in multiplayer
+	gameLocal.gameType = info->type;
+
+	switch ( info->type ) {
+		case GAME_DM:
+			gameState = new rvDMGameState();
+			break;
+		case GAME_DUEL:
+			gameState = new rvDuelGameState();
+			break;
+		case GAME_TOURNEY:
+			gameState = new rvTourneyGameState();
+			break;
+		case GAME_TDM:
+			gameState = new rvTeamDMGameState();
+			break;
+		case GAME_CTF:
+		case GAME_1F_CTF:
+		case GAME_ARENA_CTF:
+		case GAME_ARENA_1F_CTF:
+			gameState = new rvCTFGameState();
+			break;
+		case GAME_DEADZONE:
+			gameState = new riDZGameState();
+			break;
+		case GAME_CA:
+			gameState = new rvClanArenaGameState();
+			break;
+		case GAME_FREEZETAG:
+			gameState = new rvFreezeTagGameState();
+			break;
+		case GAME_REDROVER:
+			gameState = new rvRedRoverGameState();
+			break;
+		default:
+			gameLocal.Error( "idMultiplayerGame::SetGameType() - gametype '%s' has no game state class\n", info->name );
+			return;
+	}
+
+	// Entity filtering selects which map entities spawn.  Modes carried over
+	// from Quake Live borrow the entity layout of the Quake 4 mode they are
+	// shaped like, so they are playable on stock maps without new map content.
 	if ( gameLocal.gameType != GAME_SP ) {
-		gameLocal.serverInfo.Set( "si_entityFilter", gameLocal.serverInfo.GetString( "si_gameType" ) );
+		gameLocal.serverInfo.Set( "si_entityFilter", info->entityFilter );
 		// also set as a CVar for when serverinfo is rescanned
-		cvarSystem->SetCVarString( "si_entityFilter", gameLocal.serverInfo.GetString( "si_gameType" ) );
+		cvarSystem->SetCVarString( "si_entityFilter", info->entityFilter );
 	}
 }
 
@@ -9408,7 +9985,6 @@ bool idMultiplayerGame::PickMap( idStr gameType, bool checkOnly ) {
 	int miss = 0;
 	const idDict *mapDict;
 	int index = 0;
-	int btype;
 	const char* mapName;
 
 	mapName = si_map.GetString();
@@ -9420,14 +9996,11 @@ bool idMultiplayerGame::PickMap( idStr gameType, bool checkOnly ) {
 
 	// if we're playing a map of this gametype, don't change.
 	mapDict = MultiplayerResolveMapDecl( mapName );
-	if ( mapDict ) {
-		btype = mapDict->GetInt( gameType );
-		if ( btype ) {
-			// ( not sure what the gloubi boulga is about re-setting si_map two ways after reading it at the start of the function already )
-			cvarSystem->SetCVarString( "si_map", mapName );
-			si_map.SetString( mapName );
-			return false;			
-		}
+	if ( MPMapSupportsGameTypeName( mapDict, gameType ) ) {
+		// ( not sure what the gloubi boulga is about re-setting si_map two ways after reading it at the start of the function already )
+		cvarSystem->SetCVarString( "si_map", mapName );
+		si_map.SetString( mapName );
+		return false;
 	}
 
 	if ( checkOnly ) {
@@ -9481,15 +10054,10 @@ bool idMultiplayerGame::PickMap( idStr gameType, bool checkOnly ) {
 			mapName = maps[index].c_str();
 			
 			mapDict = MultiplayerResolveMapDecl( mapName );
-			if ( mapDict ) {
-				btype = mapDict->GetInt( gameType );
-				if(btype)
-				{					
-					cvarSystem->SetCVarString("si_map",mapName);
-					si_map.SetString( mapName );
-					return true;
-					
-				}
+			if ( MPMapSupportsGameTypeName( mapDict, gameType ) ) {
+				cvarSystem->SetCVarString("si_map",mapName);
+				si_map.SetString( mapName );
+				return true;
 			}
 			miss++;
 		
@@ -9697,26 +10265,14 @@ const char *idMultiplayerGame::LocalizeGametype( void ) {
 
 	const char	*gameType;
 		
+	const mpGameTypeInfo_t *info;
+
 	gameType = gameLocal.serverInfo.GetString( "si_gametype" );
 	localisedGametype = gameType;
 
-	if( !idStr::Icmp( gameType, "DM" ) ) {
-		localisedGametype = common->GetLocalizedString( "#str_110011" );
-	}
-	if( !idStr::Icmp( gameType, "Tourney" ) ) {
-		localisedGametype = common->GetLocalizedString( "#str_110012" );
-	}
-	if( !idStr::Icmp( gameType, "Team DM" ) ) {
-		localisedGametype = common->GetLocalizedString( "#str_110013" );
-	}
-	if( !idStr::Icmp( gameType, "CTF" ) ) {
-		localisedGametype = common->GetLocalizedString( "#str_110014" );
-	}
-	if( !idStr::Icmp( gameType, "Arena CTF" ) ) {
-		localisedGametype = common->GetLocalizedString( "#str_110015" );
-	}
-	if( !idStr::Icmp( gameType, "DeadZone" ) ) {
-		localisedGametype = common->GetLocalizedString( "#str_122001" ); // Squirrel@Ritual - Localized for 1.2 Patch
+	info = MPGameTypeByName( gameType );
+	if ( info != NULL ) {
+		localisedGametype = common->GetLocalizedString( info->localizedName );
 	}
 
 	return( localisedGametype.c_str() );

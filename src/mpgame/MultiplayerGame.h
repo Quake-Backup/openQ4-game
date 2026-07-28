@@ -37,8 +37,19 @@ typedef enum {
 // RITUAL BEGIN
 // squirrel: added DeadZone multiplayer mode
 	GAME_DEADZONE,
-	NUM_GAME_TYPES,
 // RITUAL END
+// openQ4: gametypes carried over from Quake Live.  gameType_t is the first
+// byte of every gamestate packet and is compared literally by the .gui files,
+// so this enum is APPEND ONLY - never insert or renumber.
+	GAME_DUEL,
+	GAME_CA,
+	GAME_FREEZETAG,
+	GAME_REDROVER,
+	GAME_OVERLOAD,
+	GAME_HARVESTER,
+	GAME_DOMINATION,
+	GAME_ATTACK_DEFEND,
+	NUM_GAME_TYPES,
 } gameType_t;
 
 
@@ -199,6 +210,30 @@ enum announcerSound_t {
 	AS_NUM_SOUNDS
 };
 
+// openQ4 BEGIN
+// Announcer events for the modes carried over from Quake Live.  Quake 4 ships
+// no round, overtime or elimination voice-overs, and openQ4's rule is to run
+// on the retail assets, so these are aliases onto stock clips rather than new
+// announcerSound_t values.  announcerSoundDefs[] is index-parallel with no
+// compile-time check, so aliasing also avoids the easiest way to break it.
+// Point these at dedicated shaders if a voice pack ever ships.
+const announcerSound_t AS_ROUND_PREPARE			= AS_GENERAL_PREPARE_TO_FIGHT;
+const announcerSound_t AS_ROUND_FIGHT			= AS_GENERAL_FIGHT;
+const announcerSound_t AS_ROUND_YOU_WIN			= AS_TEAM_YOU_SCORE;
+const announcerSound_t AS_ROUND_YOU_LOSE		= AS_TEAM_ENEMY_SCORES;
+const announcerSound_t AS_ROUND_DRAW			= AS_TEAM_TEAMS_TIED;
+const announcerSound_t AS_MATCH_OVERTIME		= AS_GENERAL_SUDDEN_DEATH;
+const announcerSound_t AS_MATCH_LAST_STANDING	= AS_GENERAL_ONE_FRAG;
+const announcerSound_t AS_OBJECTIVE_ATTACKED	= AS_CTF_ENEMY_HAS_FLAG;
+const announcerSound_t AS_OBJECTIVE_SECURED		= AS_CTF_YOUR_FLAG_RETURNED;
+
+// Localized team name and colour escape, used by every message that names a
+// team.  Quake 4's teams are Marine and Strogg, which stand in for Quake
+// Live's red and blue throughout the port.
+const char *	MPLocalizedTeamName( int team );
+const char *	MPTeamColor( int team );
+// openQ4 END
+
 const int VOTEMAPS_WAITING_MAPLIST		= (1<<0);
 const int VOTEMAPS_WAITING_SAMAPLIST	= (1<<1);
 const int VOTEMAPS_WAITING_LISTMAPS		= (1<<2);
@@ -229,6 +264,10 @@ const int MP_PLAYER_MAXPING	= 999;
 const int MP_PLAYER_MAXKILLS = 999;
 const int MP_PLAYER_MAXDEATHS = 999;
 
+// openQ4: team scores ride the snapshot as a short.  Domination accrues a
+// point per control point per tick, so an unclamped total could wrap.
+const int MP_TEAM_MAXSCORE = 30000;
+
 const int MAX_AP = 5;
 
 const int CHAT_HISTORY_SIZE = 2048;
@@ -253,6 +292,10 @@ const int MAX_TEAM_POWERUPS = 5;
 //RITUAL END
 // ddynerman: game state
 #include "mp/GameState.h"
+// openQ4: gametypes carried over from Quake Live
+#include "mp/RoundGameState.h"
+#include "mp/RoundModes.h"
+#include "mp/Duel.h"
 
 typedef struct mpChatLine_s {
 	idStr			line;
@@ -360,6 +403,33 @@ public:
 	void			PrintMessageEvent( int to, msg_evt_t evt, int parm1 = -1, int parm2 = -1 );
 	void			PrintMessage( int to, const char* message );
 
+// openQ4 BEGIN
+// Server driven centre-screen notice.  Quake 4 had no such channel: every big
+// message was derived client side from an observed state delta, which cannot
+// express text that varies with who did what to whom.  The payload is a
+// localization id plus up to two typed parameters, so nothing on the wire is
+// pre-translated.
+	typedef enum {
+		CPARM_NONE = 0,		// slot unused
+		CPARM_INT,			// printed as a number
+		CPARM_CLIENT,		// resolved to that client's name, with team colour
+		CPARM_TEAM			// resolved to the localized team name
+	} centerPrintParm_t;
+
+	// to == -1 broadcasts.  strId must be a #str_ id, never display text.
+	void			CenterPrint( int to, const char *strId, bool persist = false );
+	void			CenterPrint( int to, const char *strId, centerPrintParm_t type1, int parm1, bool persist = false );
+	void			CenterPrint( int to, const char *strId, centerPrintParm_t type1, int parm1, centerPrintParm_t type2, int parm2, bool persist = false );
+	void			CenterPrintTeam( int team, const char *strId, centerPrintParm_t type1 = CPARM_NONE, int parm1 = 0, bool persist = false );
+	void			ReceiveCenterPrint( const idBitMsg &msg );
+
+	// authoritative ready state, set from the client's reliable ready message
+	void			ServerSetPlayerReady( int clientNum, bool ready );
+	static void		Ready_f( const idCmdArgs &args );
+	static void		NotReady_f( const idCmdArgs &args );
+	static void		ReadyUp_f( const idCmdArgs &args );
+// openQ4 END
+
 	void			DisconnectClient( int clientNum );
 	static void		ForceReady_f( const idCmdArgs &args );
 	static void		DropWeapon_f( const idCmdArgs &args );
@@ -415,6 +485,9 @@ public:
 
 // RAVEN BEGIN
 // shouchard:  added enum to remove magic numbers
+	// openQ4: mirrors mpVoteGameTypeOrder[] in mp/GameTypes.cpp, which is the
+	// authority.  The gametype menu dropdowns index this positionally, so it
+	// is append-only.
 	typedef enum {
 		VOTE_GAMETYPE_DM = 0,
 		VOTE_GAMETYPE_TOURNEY,
@@ -425,6 +498,16 @@ public:
 //
 		VOTE_GAMETYPE_DEADZONE,
 //RITUAL END
+		VOTE_GAMETYPE_DUEL,
+		VOTE_GAMETYPE_CA,
+		VOTE_GAMETYPE_FREEZETAG,
+		VOTE_GAMETYPE_REDROVER,
+		VOTE_GAMETYPE_1F_CTF,
+		VOTE_GAMETYPE_ARENA_1F_CTF,
+		VOTE_GAMETYPE_OVERLOAD,
+		VOTE_GAMETYPE_HARVESTER,
+		VOTE_GAMETYPE_DOMINATION,
+		VOTE_GAMETYPE_ATTACK_DEFEND,
 		VOTE_GAMETYPE_COUNT
 	} vote_gametype_t;
 // RAVEN END
@@ -630,6 +713,22 @@ public:
 	idPlayer *		FragLimitHit( void );
 	idPlayer *		FragLeader( void );
 	bool			TimeLimitHit( void );
+// openQ4 BEGIN
+// Exit rules carried over from Quake Live.
+	// true when the match is level at the top, by team score in team modes
+	// and by the top two ranked players otherwise
+	bool			ScoreIsTied( void );
+	// team that has pulled far enough ahead to end the match early, or -1
+	int				MercyLimitHit( void );
+	// team left holding the match when the other side empties out, or -1
+	int				ForfeitTeam( void );
+	// respawn delay in milliseconds while a match is in overtime, 0 otherwise
+	int				GetOvertimeRespawnDelay( void );
+	// total match length in milliseconds including every overtime granted
+	int				GetMatchLengthMsec( void );
+	// true while scoring is turned off, which is warmup unless si_warmupScoring
+	bool			ScoringSuppressed( void ) const;
+// openQ4 END
 	int				GetCurrentMenu( void ) { return currentMenu; }
 
 	void			SetFlagEntity( idEntity* ent, int team );
@@ -820,6 +919,10 @@ private:
 	int				teamScore[ TEAM_MAX ];
 	int				teamDeadZoneScore[ TEAM_MAX];
 	void			ClearTeamScores ( void );
+
+	// openQ4: last ready tally computed by AllPlayersReady, for the warmup HUD
+	int				readyPlayerCount;
+	int				eligiblePlayerCount;
 
 	void			UpdateLeader( idPlayer* oldLeader );
 

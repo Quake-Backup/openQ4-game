@@ -3486,6 +3486,15 @@ void idGameLocal::InitConsoleCommands( void ) {
 
 	cmdSystem->AddCommand( "CheckTeamBalance", idMultiplayerGame::CheckTeamBalance_f, CMD_FL_GAME, "helper for team switching in the guis - <team to switch to> <named event for yes> <named event for no> <named event for same team>" );
 
+	// openQ4: explicit ready commands.  Quake 4 only exposed ready through
+	// _impulse17 and the menu, both of which route through the throttled
+	// ui_ready userinfo key.
+	cmdSystem->AddCommand( "ready",					idMultiplayerGame::Ready_f,		CMD_FL_GAME,	"declare yourself ready to start the match" );
+	cmdSystem->AddCommand( "notready",				idMultiplayerGame::NotReady_f,	CMD_FL_GAME,	"withdraw your ready state" );
+	cmdSystem->AddCommand( "unready",				idMultiplayerGame::NotReady_f,	CMD_FL_GAME,	"withdraw your ready state" );
+	cmdSystem->AddCommand( "readyup",				idMultiplayerGame::ReadyUp_f,	CMD_FL_GAME,	"toggle your ready state" );
+	cmdSystem->AddCommand( "allready",				idMultiplayerGame::ForceReady_f,	CMD_FL_GAME,	"force all players ready" );
+
 	// localization help commands
 	cmdSystem->AddCommand( "nextGUI",				Cmd_NextGUI_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"teleport the player to the next func_static with a gui" );
 	cmdSystem->AddCommand( "testid",				Cmd_TestId_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"output the string for the specified id." );

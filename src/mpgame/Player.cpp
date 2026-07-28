@@ -1425,6 +1425,7 @@ idPlayer::idPlayer() {
 
  	respawning				= false;
  	ready					= false;
+	readyUserInfo			= false;
  	leader					= false;
  	lastSpectateChange		= 0;
 	lastArenaChange			= 0;
@@ -3250,6 +3251,19 @@ void idPlayer::SpawnToPoint( const idVec3 &spawn_origin, const idAngles &spawn_a
 	}
 // RITUAL END
 
+// openQ4 BEGIN
+	// Warmup is for warming up: Quake Live hands out the full arsenal so the
+	// pre-match period is practice rather than a race for the rocket launcher.
+	if ( gameLocal.isMultiplayer && !spectating && gameLocal.serverInfo.GetBool( "si_warmupWeapons" ) ) {
+		mpGameState_t mpState = gameLocal.mpGame.GetGameState()->GetMPGameState();
+
+		if ( mpState == WARMUP || mpState == COUNTDOWN ) {
+			GiveStuffToPlayer( this, "weapons", "" );
+			GiveStuffToPlayer( this, "ammo", "" );
+		}
+	}
+// openQ4 END
+
 	BecomeActive( TH_THINK );
 
 	// run a client frame to drop exactly to the floor,
@@ -3651,10 +3665,16 @@ bool idPlayer::UserInfoChanged( void ) {
 
 	if ( gameLocal.serverInfo.GetBool( "si_useReady" ) ) {
 		newready = ( idStr::Icmp( userInfo->GetString( "ui_ready" ), "Ready" ) == 0 );
-		if ( ready != newready && gameLocal.mpGame.GetGameState()->GetMPGameState() == WARMUP && !wantSpectate ) {
- 			gameLocal.mpGame.AddChatLine( common->GetLocalizedString( "#str_107180" ), userInfo->GetString( "ui_name" ), newready ? common->GetLocalizedString( "#str_104300" ) : common->GetLocalizedString( "#str_104301" ) );
+		// openQ4: only act on a real change in the userinfo string.  A resend
+		// carrying a stale ui_ready must not undo a ready set by the reliable
+		// ready message, which is not subject to the userinfo throttle.
+		if ( newready != readyUserInfo ) {
+			readyUserInfo = newready;
+			if ( ready != newready && gameLocal.mpGame.GetGameState()->GetMPGameState() == WARMUP && !wantSpectate ) {
+				gameLocal.mpGame.AddChatLine( common->GetLocalizedString( "#str_107180" ), userInfo->GetString( "ui_name" ), newready ? common->GetLocalizedString( "#str_104300" ) : common->GetLocalizedString( "#str_104301" ) );
+			}
+			ready = newready;
 		}
-		ready = newready;
 	}
 
 	int newTeam = ( idStr::Icmp( userInfo->GetString( "ui_team" ), "Strogg" ) == 0 );
@@ -9923,6 +9943,13 @@ void idPlayer::Think( void ) {
 	buttonMask &= usercmd.buttons;
 	usercmd.buttons &= ~buttonMask;
 
+	// openQ4: attack lockout.  Quake Live freezes weapons while a round is
+	// being set up or has just been decided; this is the equivalent of its
+	// PMF_ATTACK_LOCKOUT pmove flag, applied where the usercmd is taken in.
+	if ( gameLocal.isMultiplayer && gameLocal.mpGame.GetGameState() != NULL && gameLocal.mpGame.GetGameState()->WeaponsLocked() ) {
+		usercmd.buttons &= ~BUTTON_ATTACK;
+	}
+
 	HandleObjectiveInput();
 	if ( objectiveSystemOpen ) {
 		HandleCheats();
@@ -10394,6 +10421,18 @@ void idPlayer::Killed( idEntity *inflictor, idEntity *attacker, int damage, cons
 		maxRespawnTime = minRespawnTime + MAX_RESPAWN_TIME;
 	}
 
+	// openQ4: while a match is running on overtime the respawn delay grows, so
+	// trading deaths stops being a way to stall out the extension.  This is
+	// what Quake Live means by "sudden death" - a respawn penalty, not a phase.
+	if ( gameLocal.isMultiplayer && !gameLocal.isClient ) {
+		int overtimeDelay = gameLocal.mpGame.GetOvertimeRespawnDelay();
+
+		if ( overtimeDelay > 0 ) {
+			minRespawnTime = Max( minRespawnTime, gameLocal.time + overtimeDelay );
+			maxRespawnTime = minRespawnTime + MAX_RESPAWN_TIME;
+		}
+	}
+
 	physicsObj.SetMovementType( PM_DEAD );
  	StartSound( "snd_death", SND_CHANNEL_VOICE, 0, false, NULL );
  	StopSound( SND_CHANNEL_BODY2, false );
@@ -10767,6 +10806,14 @@ void idPlayer::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &di
 		}
 
 		statManager->Damage( attacker, this, methodOfDeath, damage );
+
+		// openQ4: let the game state score the damage.  Clan Arena and Attack
+		// & Defend pay personal score per hundred points of damage dealt
+		// rather than per frag, so a support player is not stuck on zero.
+		if ( !gameLocal.isClient && gameLocal.mpGame.GetGameState() != NULL &&
+			 attacker != NULL && attacker->IsType( idPlayer::GetClassType() ) ) {
+			gameLocal.mpGame.GetGameState()->PlayerDamage( static_cast< idPlayer * >( attacker ), this, damage );
+		}
 	}
 		
 // RAVEN BEGIN
@@ -12357,6 +12404,13 @@ void idPlayer::LocalClientPredictionThink( void ) {
 		usercmd.buttons &= ~BUTTON_ATTACK;		
 	}
 
+	// openQ4: attack lockout.  Quake Live freezes weapons while a round is
+	// being set up or has just been decided; this is the equivalent of its
+	// PMF_ATTACK_LOCKOUT pmove flag, applied where the usercmd is taken in.
+	if ( gameLocal.isMultiplayer && gameLocal.mpGame.GetGameState() != NULL && gameLocal.mpGame.GetGameState()->WeaponsLocked() ) {
+		usercmd.buttons &= ~BUTTON_ATTACK;
+	}
+
  	// clear the ik before we do anything else so the skeleton doesn't get updated twice
  	walkIK.ClearJointMods();
 
@@ -12547,6 +12601,13 @@ void idPlayer::NonLocalClientPredictionThink( void ) {
 	//jshepard: added this to make sure clients can see other clients and the host switching weapons
 	if ( idealWeapon != currentWeapon )	{
 		usercmd.buttons &= ~BUTTON_ATTACK;		
+	}
+
+	// openQ4: attack lockout.  Quake Live freezes weapons while a round is
+	// being set up or has just been decided; this is the equivalent of its
+	// PMF_ATTACK_LOCKOUT pmove flag, applied where the usercmd is taken in.
+	if ( gameLocal.isMultiplayer && gameLocal.mpGame.GetGameState() != NULL && gameLocal.mpGame.GetGameState()->WeaponsLocked() ) {
+		usercmd.buttons &= ~BUTTON_ATTACK;
 	}
 
  	// clear the ik before we do anything else so the skeleton doesn't get updated twice
