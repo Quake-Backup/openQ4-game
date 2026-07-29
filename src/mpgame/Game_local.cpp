@@ -1236,6 +1236,13 @@ const idDict* idGameLocal::SetUserInfo( int clientNum, const idDict &userInfo, b
 	if ( clientNum >= 0 && clientNum < MAX_CLIENTS ) {
 		idGameLocal::userInfo[ clientNum ] = userInfo;
 
+		// A bot's user info is broadcast by the engine with nothing but a name
+		// in it, so restore the rest of its identity on every update.
+		if ( !isClient && botManager.IsBot( clientNum ) ) {
+			botManager.FillUserInfo( clientNum, idGameLocal::userInfo[ clientNum ] );
+			modifiedInfo = true;
+		}
+
 		// server sanity
 		if ( !isClient ) {
 
@@ -2767,8 +2774,11 @@ idGameLocal::MapShutdown
 */
 void idGameLocal::MapShutdown( void ) {
 	Printf( "------------ Game Map Shutdown --------------\n" );
-	
+
 	gamestate = GAMESTATE_SHUTDOWN;
+
+	// The navmesh describes the map that is going away.
+	botManager.OnMapShutdown();
 
 	if ( soundSystem ) {
 		//soundSystem->ResetListener();
@@ -3472,9 +3482,6 @@ idGameLocal::SpawnPlayer
 ============
 */
 void idGameLocal::SpawnPlayer( int clientNum, bool isBot, const char* botName ) {
-	(void)isBot;
-	(void)botName;
-
 	TIME_THIS_SCOPE( __FUNCLINE__);
 
 	idEntity	*ent;
@@ -3486,6 +3493,14 @@ void idGameLocal::SpawnPlayer( int clientNum, bool isBot, const char* botName ) 
 
 	// they can connect
 	common->DPrintf( "SpawnPlayer: %i\n", clientNum );
+
+	// Claim the slot before the entity exists: idPlayer::Spawn reads the user
+	// info, and a bot with only the engine's bare name in there would decide it
+	// was a spectator sitting in the join menu.
+	botManager.OnSpawnPlayer( clientNum, isBot, botName );
+	if ( isBot && clientNum >= 0 && clientNum < MAX_CLIENTS ) {
+		botManager.FillUserInfo( clientNum, userInfo[ clientNum ] );
+	}
 
 	args.SetInt( "spawn_entnum", clientNum );
 	args.Set( "name", va( "player%d", clientNum + 1 ) );
@@ -3866,7 +3881,14 @@ idGameLocal::InPlayerConnectedArea
 */
 bool idGameLocal::InPlayerConnectedArea( idEntity *ent ) const {
 	if ( playerConnectedAreas.i == -1 ) {
-		return false;
+		// openQ4: playerConnectedAreas is only ever built by SetupPlayerPVS, which
+		// runs from RunFrame - a path a network client never takes.  The one caller
+		// that matters on a client is rvClientEffect::Think, which feeds this
+		// straight into renderEffect.inConnectedArea; answering "no" there declares
+		// every bound effect unreachable from the view.  With no connected-area set
+		// to consult, the honest answer on a client is "can't tell", and the only
+		// safe reading of that is visible.
+		return isClient;
 	}
     return pvs.InCurrentPVS( playerConnectedAreas, ent->GetPVSAreas(), ent->GetNumPVSAreas() );
 }
@@ -4114,6 +4136,9 @@ TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 		
 		// set the user commands for this frame
 		usercmds = clientCmds;
+
+		// bots fill in their own slots of that array before anything reads it
+		botManager.Think();
 
 		// create a merged pvs for all players
 		// do this before we process events, which may rely on PVS info
@@ -8323,7 +8348,10 @@ idEntity* idGameLocal::HitScan(
 	ignore    = owner;
 	penetrate = hitscanDict.GetFloat( "penetrate" );
 
-	if( hitscanDict.GetBool( "hitscanTint" ) && owner->IsType( idPlayer::GetClassType() ) ) {
+	// openQ4: owner comes straight off the wire in ClientHitScan and is NULL whenever
+	// the shooter has not been spawned locally yet, so guard it the same way the
+	// powerup lookup below already does.
+	if( owner && hitscanDict.GetBool( "hitscanTint" ) && owner->IsType( idPlayer::GetClassType() ) ) {
 		hitscanTint = ((idPlayer*)owner)->GetHitscanTint();
 	}
 

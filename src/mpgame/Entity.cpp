@@ -6076,18 +6076,25 @@ bool idEntity::ClientReceiveEvent( int event, int time, const idBitMsg &msg ) {
 			loop = ( msg.ReadBits ( 1 ) != 0 );
 			predictBit = ( msg.ReadBits ( 1 ) != 0 );
 
-			if ( bse->CanPlayRateLimited( category ) && ( !predictBit || !g_predictedProjectiles.GetBool() ) ) {
-				// mwhitlock: Dynamic memory consolidation
-				RV_PUSH_SYS_HEAP_ID(RV_HEAP_ID_MULTIPLE_FRAME);
-				clientEffect = new rvClientEffect( effect );
-				RV_POP_HEAP();
-
-				clientEffect->SetOrigin( vec3_origin );
-				clientEffect->SetAxis( mat3_identity );
-				clientEffect->Bind( this, jointHandle );
-
-				clientEffect->Play( time, loop, origin );
+			if ( !effect || ( predictBit && g_predictedProjectiles.GetBool() ) ) {
+				return true;
 			}
+			if ( bse->Filtered( effect->GetName(), category ) ) {
+				return true;
+			}
+
+			// Filtered() already applies category rate-limiting.
+			// mwhitlock: Dynamic memory consolidation
+			RV_PUSH_SYS_HEAP_ID(RV_HEAP_ID_MULTIPLE_FRAME);
+			clientEffect = new rvClientEffect( effect );
+			RV_POP_HEAP();
+
+			clientEffect->SetOrigin( vec3_origin );
+			clientEffect->SetAxis( mat3_identity );
+			clientEffect->Bind( this, jointHandle );
+			clientEffect->SetGravity( gameLocal.GetCurrentGravity( this ) );
+
+			clientEffect->Play( time, loop, origin );
 			return true;
 		}
 		
@@ -6116,18 +6123,25 @@ bool idEntity::ClientReceiveEvent( int event, int time, const idBitMsg &msg ) {
 			origin2.z = msg.ReadFloat( );
 			category = ( effectCategory_t )msg.ReadByte();
 
-			if ( bse->CanPlayRateLimited( category ) ) {
-				// mwhitlock: Dynamic memory consolidation
-				RV_PUSH_SYS_HEAP_ID(RV_HEAP_ID_MULTIPLE_FRAME);
-				clientEffect = new rvClientEffect( effect );
-				RV_POP_HEAP();
-
-				clientEffect->SetOrigin ( origin );
-				clientEffect->SetAxis ( quat.ToMat3() );
-				clientEffect->Bind ( this );
-
-				clientEffect->Play ( time, loop, origin2 );
+			if ( !effect ) {
+				return true;
 			}
+			if ( bse->Filtered( effect->GetName(), category ) ) {
+				return true;
+			}
+
+			// Filtered() already applies category rate-limiting.
+			// mwhitlock: Dynamic memory consolidation
+			RV_PUSH_SYS_HEAP_ID(RV_HEAP_ID_MULTIPLE_FRAME);
+			clientEffect = new rvClientEffect( effect );
+			RV_POP_HEAP();
+
+			clientEffect->SetOrigin ( origin );
+			clientEffect->SetAxis ( quat.ToMat3() );
+			clientEffect->Bind ( this );
+			clientEffect->SetGravity( gameLocal.GetCurrentGravity( this ) );
+
+			clientEffect->Play ( time, loop, origin2 );
 			return true;
 		}
 // RAVEN END		

@@ -344,7 +344,10 @@ enum {
 	GAME_UNRELIABLE_MESSAGE_EVENT,
 	GAME_UNRELIABLE_MESSAGE_EFFECT,
 	GAME_UNRELIABLE_MESSAGE_HITSCAN,
-	GAME_UNRELIABLE_MESSAGE_VOICEDATA_SERVER
+	GAME_UNRELIABLE_MESSAGE_VOICEDATA_SERVER,
+	// openQ4: attacker only hit feedback.  Append only - these ordinals are
+	// the wire format.
+	GAME_UNRELIABLE_MESSAGE_HITINFO
 };
 
 enum {
@@ -1449,6 +1452,8 @@ const int	CINEMATIC_SKIP_DELAY	= SEC2MS( 2.0f );
 #include "mp/CTF.h"
 #include "mp/stats/StatManager.h"
 #include "mp/Tourney.h"
+#include "bots/NavMesh.h"
+#include "bots/Bot.h"
 #include "Instance.h"
 // RAVEN END
 #include "anim/Anim_Testmodel.h"

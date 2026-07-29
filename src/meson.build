@@ -180,10 +180,15 @@ elif is_linux
   common_defines += ['ID_GL_HARDLINK']
 endif
 
+# Deliberately no _DEBUG / NDEBUG here. The engine defines neither: release
+# builds pass -Db_ndebug=true and everything else lets src/idlib/precompiled.h
+# fall through to its own `#define NDEBUG`. Defining _DEBUG on this side changed
+# shared struct layouts across the module boundary -- srfTriangles_t grows a
+# description[64] under _DEBUG, and Heap.h grows the MemScopedTag stack -- so a
+# debug GameLibs module and a debug engine disagreed about the size of types
+# they pass to each other.
 if release_like
   common_defines += ['NDEBUG']
-else
-  common_defines += ['_DEBUG']
 endif
 
 inline_debug_enabled = get_option('inline_debug') and not release_like
@@ -202,19 +207,15 @@ endforeach
 game_dll_define_arg = define_arg_prefix + 'GAME_DLL'
 game_mpapi_define_arg = define_arg_prefix + 'GAME_MPAPI'
 
+# Keep this list identical to the engine repo's game_idlib_discovery, which
+# excludes Simd_AltiVec.cpp and nothing else. The per-architecture SIMD sources
+# guard their own bodies (Simd_SSE2.h only defines ID_SIMD_SSE2_AVAILABLE on
+# x86/x86-64), and idSIMD::InitProcessor constructs idSIMD_SSE2 unconditionally
+# on x86-64 -- so excluding Simd_SSE2.cpp there left the archive without the
+# definition the module needs.
 idlib_excludes = [
   'idlib/math/Simd_AltiVec.cpp',
 ]
-
-if host_cpu_family != 'x86'
-  idlib_excludes += [
-    'idlib/math/Simd_3DNow.cpp',
-    'idlib/math/Simd_MMX.cpp',
-    'idlib/math/Simd_SSE.cpp',
-    'idlib/math/Simd_SSE2.cpp',
-    'idlib/math/Simd_SSE3.cpp',
-  ]
-endif
 
 idlib_source_output = run_command(
   py,
@@ -233,13 +234,28 @@ foreach source_line : idlib_source_output
   endif
 endforeach
 
+# One archive per game flavour, mirroring the engine repo. idlib/precompiled.h
+# includes mpgame/Game_local.h under GAME_MPAPI and game/Game_local.h otherwise,
+# and every idlib translation unit includes precompiled.h -- so a single
+# single-player-flavoured archive linked into both modules put two different
+# definitions of the same game types into each multiplayer binary.
 idlib = static_library(
   'idLib',
   idlib_sources,
   include_directories : source_inc,
   cpp_args : common_cpp_args + common_define_args + [game_dll_define_arg],
   pic : not is_windows,
-  gnu_symbol_visibility : is_linux ? 'hidden' : 'default',
+  gnu_symbol_visibility : is_windows ? 'default' : 'hidden',
+  install : false,
+)
+
+idlib_mp = static_library(
+  'idLibMP',
+  idlib_sources,
+  include_directories : source_inc,
+  cpp_args : common_cpp_args + common_define_args + [game_dll_define_arg, game_mpapi_define_arg],
+  pic : not is_windows,
+  gnu_symbol_visibility : is_windows ? 'default' : 'hidden',
   install : false,
 )
 
@@ -279,6 +295,18 @@ elif is_darwin
       module_link_args += link_arg
     endif
   endforeach
+  # Darwin peer of the Linux version script and the Windows .def files; only
+  # the module entry point may be exported. See the engine repo's
+  # tools/build/darwin_game_module.exp for why (issue #90).
+  darwin_game_module_export_list = files('../tools/build/darwin_game_module.exp')
+  darwin_game_module_export_list_path = join_paths(
+    meson.project_source_root(),
+    'tools',
+    'build',
+    'darwin_game_module.exp',
+  )
+  module_link_args += '-Wl,-exported_symbols_list,' + darwin_game_module_export_list_path
+  module_link_depends += darwin_game_module_export_list
 elif is_linux
   foreach link_arg : [
     '-Wl,-z,relro',
@@ -340,6 +368,8 @@ if get_option('build_spgame')
       link_with : idlib,
       cpp_args : common_cpp_args + common_define_args + [game_dll_define_arg] + game_forced_include_args,
       link_args : module_link_args + ['-Wl,-install_name,@loader_path/' + sp_module_name + '.dylib'],
+      link_depends : module_link_depends,
+      gnu_symbol_visibility : 'hidden',
       name_prefix : '',
       name_suffix : 'dylib',
       install : false,
@@ -384,7 +414,7 @@ if get_option('build_mpgame')
       mp_module_name,
       mpgame_sources,
       include_directories : source_inc,
-      link_with : idlib,
+      link_with : idlib_mp,
       cpp_args : common_cpp_args + common_define_args + [
         game_dll_define_arg,
         game_mpapi_define_arg,
@@ -399,12 +429,14 @@ if get_option('build_mpgame')
       mp_module_name,
       mpgame_sources,
       include_directories : source_inc,
-      link_with : idlib,
+      link_with : idlib_mp,
       cpp_args : common_cpp_args + common_define_args + [
         game_dll_define_arg,
         game_mpapi_define_arg,
       ] + game_forced_include_args,
       link_args : module_link_args + ['-Wl,-install_name,@loader_path/' + mp_module_name + '.dylib'],
+      link_depends : module_link_depends,
+      gnu_symbol_visibility : 'hidden',
       name_prefix : '',
       name_suffix : 'dylib',
       install : false,
@@ -414,7 +446,7 @@ if get_option('build_mpgame')
       mp_module_name,
       mpgame_sources,
       include_directories : source_inc,
-      link_with : idlib,
+      link_with : idlib_mp,
       cpp_args : common_cpp_args + common_define_args + [
         game_dll_define_arg,
         game_mpapi_define_arg,

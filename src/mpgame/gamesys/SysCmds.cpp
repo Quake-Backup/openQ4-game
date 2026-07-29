@@ -3237,6 +3237,91 @@ void Cmd_BuyItem_f( const idCmdArgs& args ) {
 }
 // RITUAL END
 
+/*
+===============================================================================
+
+	openQ4 multiplayer bots
+
+===============================================================================
+*/
+
+/*
+==================
+Cmd_AddBot_f
+==================
+*/
+void Cmd_AddBot_f( const idCmdArgs &args ) {
+	botManager.AddBot( args.Argc() > 1 ? args.Argv( 1 ) : NULL );
+}
+
+/*
+==================
+Cmd_RemoveBot_f
+==================
+*/
+void Cmd_RemoveBot_f( const idCmdArgs &args ) {
+	const char *name = ( args.Argc() > 1 ) ? args.Argv( 1 ) : NULL;
+
+	if ( !botManager.RemoveBot( name ) ) {
+		if ( name ) {
+			gameLocal.Printf( "removebot: no bot called '%s'\n", name );
+		} else {
+			gameLocal.Printf( "removebot: no bots in the match\n" );
+		}
+	}
+}
+
+/*
+==================
+Cmd_KickBots_f
+==================
+*/
+void Cmd_KickBots_f( const idCmdArgs &args ) {
+	botManager.RemoveAll();
+}
+
+/*
+==================
+Cmd_BotList_f
+==================
+*/
+void Cmd_BotList_f( const idCmdArgs &args ) {
+	botManager.ListBots();
+}
+
+/*
+==================
+Cmd_NavMesh_f
+==================
+*/
+void Cmd_NavMesh_f( const idCmdArgs &args ) {
+	const char *sub = ( args.Argc() > 1 ) ? args.Argv( 1 ) : "info";
+
+	if ( !idStr::Icmp( sub, "build" ) ) {
+		// Generation is a long collision sweep and only the server routes bots,
+		// so a connected client must not be able to run it.
+		if ( !gameLocal.isServer || gameLocal.isClient ) {
+			gameLocal.Printf( "navmesh build: only the server can build a navmesh\n" );
+			return;
+		}
+		navMesh.Build();
+		return;
+	}
+
+	if ( !idStr::Icmp( sub, "info" ) ) {
+		if ( !navMesh.IsValid() ) {
+			gameLocal.Printf( "navmesh: not built\n" );
+			return;
+		}
+
+		gameLocal.Printf( "navmesh: %d nodes, %d links, built in %d ms\n",
+						  navMesh.NumNodes(), navMesh.NumLinks(), navMesh.GetBuildMilliseconds() );
+		return;
+	}
+
+	gameLocal.Printf( "usage: navmesh <build|info>\n" );
+}
+
 void Cmd_PlayerEmote_f( const idCmdArgs& args ) {
 	if( gameLocal.GetLocalPlayer() == NULL ) {
 		gameLocal.Warning( "Cmd_Emote_f() - local player is NULL" );
@@ -3544,6 +3629,12 @@ void idGameLocal::InitConsoleCommands( void ) {
 	cmdSystem->AddCommand( "buy",					Cmd_BuyItem_f,				CMD_FL_GAME,				"Buy an item (if in a buy zone and the game type supports it)" );
 // RITUAL END
 
+	// openQ4: multiplayer bots
+	cmdSystem->AddCommand( "addbot",				Cmd_AddBot_f,				CMD_FL_GAME,				"add a bot to the match, optionally with a given name" );
+	cmdSystem->AddCommand( "removebot",				Cmd_RemoveBot_f,			CMD_FL_GAME,				"remove a bot from the match, optionally by name" );
+	cmdSystem->AddCommand( "kickbots",				Cmd_KickBots_f,				CMD_FL_GAME,				"remove every bot from the match" );
+	cmdSystem->AddCommand( "botlist",				Cmd_BotList_f,				CMD_FL_GAME,				"list the bots in the match and the state of the navmesh" );
+	cmdSystem->AddCommand( "navmesh",				Cmd_NavMesh_f,				CMD_FL_GAME,				"navmesh <build|info> - generate or report the bot navigation mesh" );
 }
 
 /*

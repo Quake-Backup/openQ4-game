@@ -175,6 +175,11 @@ extern idCVar	hud_showSpeed;
 extern idCVar	hud_showInput;
 extern idCVar	hud_inputPosition;
 extern idCVar	hud_inputColor;
+// openQ4 BEGIN
+extern idCVar	hud_damageNumbers;
+extern idCVar	hud_damageNumberStyle;
+extern idCVar	hud_damageNumberScale;
+// openQ4 END
 
 extern idCVar	ik_enable;
 extern idCVar	ik_debug;
@@ -429,6 +434,7 @@ extern idCVar	si_obeliskRespawn;
 extern idCVar	si_skullTimeout;
 extern idCVar	si_domCaptureTime;
 extern idCVar	si_domScoreRate;
+extern idCVar	g_hitFeedback;
 // openQ4 END
 
 extern idCVar	g_gamelog;
@@ -466,5 +472,13 @@ extern idCVar pm_powerslide;
 extern idCVar g_playerLean;
 
 extern idCVar net_clientPredictWeaponSwitch;
+
+extern idCVar bot_enable;
+extern idCVar bot_minPlayers;
+extern idCVar bot_skill;
+extern idCVar bot_debug;
+extern idCVar bot_debugNav;
+extern idCVar bot_navCellSize;
+extern idCVar bot_pause;
 
 #endif /* !__SYS_CVAR_H__ */

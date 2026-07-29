@@ -991,6 +991,7 @@ void idMultiplayerGame::Clear() {
 	}
 	memset( &switchThrottle, 0, sizeof( switchThrottle ) );
 	voiceChatThrottle = 0;
+	damageNumbers.Clear();
 
 	voteValue.Clear();
 	voteString.Clear();

@@ -15,6 +15,7 @@
 */
 
 #include "mp/Buying.h"
+#include "mp/HitFeedback.h"
 class idPlayer;
 class rvCTF_AssaultPoint;
 class rvItemCTFFlag;
@@ -856,6 +857,10 @@ public:
 	idList<idPlayer*>		unrankedPlayers;
 
 	rvPair<int, int>		rankedTeams[ TEAM_MAX ];
+
+	// openQ4: live damage numbers for the local view.  Client side only, but
+	// a listen server host stages into the same slab.
+	rvDamageNumbers			damageNumbers;
 
 private:
 

@@ -658,9 +658,16 @@ void idPlayerView::SingleView( idUserInterface *hud, const renderView_t *view, i
 			DrawAspectCorrectFullscreenMaterial( tunnelMaterial );
 		}
 
+		// openQ4: damage numbers project against the view that was just
+		// submitted, so they have to be drawn after the scene and before the
+		// HUD proper takes the foreground
+		if ( gameLocal.isMultiplayer ) {
+			gameLocal.mpGame.damageNumbers.Draw( view );
+		}
+
 		player->DrawHUD( hud );
 
-			
+
 /*
 		// tunnel vision
 		float	health = 0.0f;

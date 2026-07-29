@@ -118,6 +118,10 @@ idCVar si_skullTimeout(				"si_skullTimeout",			"30",			CVAR_GAME | CVAR_SERVERI
 // Domination
 idCVar si_domCaptureTime(			"si_domCaptureTime",		"7",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds of standing on a control point needed to take it", 1, 60 );
 idCVar si_domScoreRate(				"si_domScoreRate",			"5",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds between score ticks for each control point held", 1, 60 );
+
+// Hit feedback.  Server side permission only - what an attacker actually sees
+// is theirs to choose through the hud_damageNumber* settings below.
+idCVar g_hitFeedback(				"g_hitFeedback",			"2",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "attacker hit feedback permitted by this server: 0 none, 1 announce the hit without the amount, 2 include the damage amount", 0, 2 );
 // openQ4 END
 idCVar si_fragLimit(				"si_fragLimit",				"10",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "frag limit", 0, MP_PLAYER_MAXFRAGS );
 idCVar si_timeLimit(				"si_timeLimit",				"10",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "time limit in minutes", 0, 60 );
@@ -194,7 +198,16 @@ idCVar hud_showSpeed(				"hud_showSpeed",			"0",			CVAR_GAME | CVAR_ARCHIVE | CV
 idCVar hud_showInput(				"hud_showInput",			"0",			CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "When set to 1, shows the players movement controls on the HUD");
 idCVar hud_inputPosition(			"hud_inputPosition",		"580 90",		CVAR_GAME | CVAR_ARCHIVE, "Input display position (x y)");
 idCVar hud_inputColor(				"hud_inputColor",			"1 0 0",		CVAR_GAME | CVAR_ARCHIVE, "Input display color (r g b, range 0 to 1)");
-	
+
+// openQ4 BEGIN
+// Floating damage numbers, ported from Quake Live's damage plums.  Purely a
+// display choice: the server decides only whether it is allowed at all, through
+// g_hitFeedback.
+idCVar hud_damageNumbers(			"hud_damageNumbers",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_INTEGER, "floating damage numbers over the players you hit: 0 off, 1 opponents only, 2 all damage you deal including team mates and yourself", 0, 2 );
+idCVar hud_damageNumberStyle(		"hud_damageNumberStyle",	"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_INTEGER, "damage number colouring: 1 white through red across the damage range, 2 one colour per damage band, 3 one colour per weapon", 1, 3 );
+idCVar hud_damageNumberScale(		"hud_damageNumberScale",	"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_FLOAT, "damage number size multiplier", 0.25f, 4.0f );
+// openQ4 END
+
 // change anytime vars
 idCVar developer(					"developer",				"0",			CVAR_GAME | CVAR_BOOL, "" );
 
@@ -700,4 +713,14 @@ idCVar pm_powerslide(						"pm_powerslide",					"0.09",			CVAR_GAME | CVAR_FLOAT
 idCVar g_playerLean(						"g_playerLean",						"1",			CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "scale down or disable client-side player lean" );
 
 idCVar net_clientPredictWeaponSwitch(		"net_clientPredictWeaponSwitch",	"1",			CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "predict weapon switches locally (most noticeable on high ping servers)" );
+
+// Multiplayer bots.  Navigation is generated at map load from the collision
+// world, so none of this needs per-map authoring.
+idCVar bot_enable(							"bot_enable",						"1",			CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "allow bots to be added to multiplayer matches" );
+idCVar bot_minPlayers(						"bot_minPlayers",					"0",			CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "keep the match topped up to this many players with bots, 0 disables" );
+idCVar bot_skill(							"bot_skill",						"3",			CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "bot difficulty, 1 (easiest) to 5 (hardest)", 1, 5 );
+idCVar bot_debug(							"bot_debug",						"0",			CVAR_GAME | CVAR_INTEGER | CVAR_NOCHEAT, "log bot decisions: 1 navigation events, 2 adds a periodic per-bot status line" );
+idCVar bot_debugNav(						"bot_debugNav",						"0",			CVAR_GAME | CVAR_INTEGER | CVAR_NOCHEAT, "draw the navmesh (1) and bot routes (2) near the local player" );
+idCVar bot_navCellSize(						"bot_navCellSize",					"24",			CVAR_GAME | CVAR_FLOAT | CVAR_NOCHEAT, "navmesh sampling resolution in world units; smaller finds more ground and costs more to build", 8, 64 );
+idCVar bot_pause(							"bot_pause",						"0",			CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "freeze all bot input" );
 

@@ -980,9 +980,16 @@ void rvWeapon::InitDefs( void ) {
 			gameLocal.Warning( "Unknown hitscan '%s' for weapon '%s'", name, weaponDef->GetName ( ) );
 		} else {
 			attackAltDict = def->dict;
+			if ( hitscanAttackDef < 0 ) {
+				// openQ4: rvWeapon::Hitscan transmits this index for both fire modes and
+				// the client resolves its impact effects from it, so a weapon whose only
+				// hitscan is the alt one has to leave a valid index here - it used to
+				// stay -1 and put DeclByIndex( -1 ) on the receiving end.
+				hitscanAttackDef = def->Index();
+			}
 		}
 		wfl.attackAltHitscan = true;
-	} 
+	}
 
 	// get the melee damage def
 	meleeDistance = spawnArgs.GetFloat( "melee_distance" );

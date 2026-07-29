@@ -512,6 +512,8 @@ void idGameLocal::ServerClientDisconnect( int clientNum ) {
 	idBitMsg	outMsg;
 	byte		msgBuf[MAX_GAME_MESSAGE_SIZE];
 
+	botManager.OnClientDisconnect( clientNum );
+
 	if ( clientNum < MAX_CLIENTS ) {
 		outMsg.Init( msgBuf, sizeof( msgBuf ) );
 		outMsg.BeginWriting();
@@ -841,6 +843,7 @@ void idGameLocal::WriteSnapshot( snapshot_t *&clientSnapshot, entityState_t *ent
 	snapshot_t *snapshot;
 	entityState_t *base, *newBase;
 	int numSourceAreas, sourceAreas[ idEntity::MAX_PVS_AREAS ];
+	int pvsResendMask[ENTITY_PVS_SIZE];
 
 	// free too old snapshots
 	// ( that's a security, normal acking from server keeps a smaller backlog of snaps )
@@ -853,6 +856,22 @@ void idGameLocal::WriteSnapshot( snapshot_t *&clientSnapshot, entityState_t *ent
 	snapshot->next = clientSnapshot;
 	clientSnapshot = snapshot;
 	memset( snapshot->pvs, 0, sizeof( snapshot->pvs ) );
+
+	// openQ4: collect the entities that have dropped out of this recipient's PVS at or since the
+	// snapshot its delta baseline is built from. PVS holds the bits of the last acknowledged
+	// snapshot ( ApplySnapshot copies them there as it installs that snapshot's entity states ),
+	// and the snapshots still on the list are the ones sent since, none of which are acknowledged
+	// yet. An entity flagged here has to be written in full the next time it is in PVS, see the
+	// rollback below, and stays flagged until an acknowledged snapshot carries it again - which is
+	// the same retry-until-acked rule the delta baselines themselves follow.
+	for ( i = 0; i < ENTITY_PVS_SIZE; i++ ) {
+		pvsResendMask[i] = ~PVS[i];
+	}
+	for ( const snapshot_t *sent = snapshot->next; sent != NULL; sent = sent->next ) {
+		for ( i = 0; i < ENTITY_PVS_SIZE; i++ ) {
+			pvsResendMask[i] |= ~sent->pvs[i];
+		}
+	}
 
 	if ( doPVS ) {
 		// get PVS for this player
@@ -903,6 +922,19 @@ void idGameLocal::WriteSnapshot( snapshot_t *&clientSnapshot, entityState_t *ent
 		// add the entity to the snapshot PVS
 		snapshot->pvs[ ent->entityNumber >> 5 ] |= 1 << ( ent->entityNumber & 31 );
 
+		// openQ4: an entity that left this recipient's PVS and is back has to be written even when
+		// nothing in its state changed while it was away. Clients destroy entities whose
+		// ClientStale() returns true - idProjectile is one, and it expects to be "re-spawned" when
+		// it pops back into PVS - so rolling it back out of the message here leaves the client with
+		// no entity, and nothing but a state change would ever bring it back. A rocket keeps
+		// writing the same launch time, origin and direction for its whole flight, so it would stay
+		// invisible until it explodes inside the PVS.
+		// Note this forces a write instead of dropping the delta baseline: idBitMsgDelta lays the
+		// bits out differently when its base is NULL, so writer and reader have to agree on base
+		// nullity or the entire snapshot decodes as garbage. Whether an entity block is present is
+		// self describing on the wire, so forcing one needs no agreement with the reader at all.
+		const bool leftPVSSinceAck = ( pvsResendMask[ ent->entityNumber >> 5 ] & ( 1 << ( ent->entityNumber & 31 ) ) ) != 0;
+
 		// save the write state to which we can revert when the entity didn't change at all
 		msg.SaveWriteState( msgSize, msgWriteBit );
 
@@ -938,7 +970,7 @@ void idGameLocal::WriteSnapshot( snapshot_t *&clientSnapshot, entityState_t *ent
 			}
 		}
 
-		if ( !deltaMsg.HasChanged() ) {
+		if ( !leftPVSSinceAck && !deltaMsg.HasChanged() ) {
 			msg.RestoreWriteState( msgSize, msgWriteBit );
 			entityStateAllocator.Free( newBase );
 		} else {
@@ -3674,17 +3706,30 @@ void idGameLocal::ProcessUnreliableMessage( const idBitMsg &msg ) {
 			bool loop = msg.ReadBits( 1 ) != 0;
 			bool predictBit = msg.ReadBits( 1 ) != 0;
 
-			if ( bse->CanPlayRateLimited( category ) && ( !predictBit || !g_predictedProjectiles.GetBool() ) ) {
-				effect = new rvClientEffect( decl );
-				effect->SetOrigin( origin );
-				effect->SetAxis( quat.ToMat3() );
-				effect->Play( time, loop, origin2 );
+			if ( !decl || ( predictBit && g_predictedProjectiles.GetBool() ) ) {
+				break;
 			}
-			
+			if ( bse->Filtered( decl->GetName(), category ) ) {
+				break;
+			}
+
+			// Filtered() already applies category rate-limiting.
+			const idMat3 axis = quat.ToMat3();
+			effect = new rvClientEffect( decl );
+			effect->SetOrigin( origin );
+			effect->SetAxis( axis );
+			effect->SetGravity( GetCurrentGravity( origin, axis ) );
+			effect->Play( time, loop, origin2 );
+
 			break;
 		}
 		case GAME_UNRELIABLE_MESSAGE_HITSCAN: {
 			ClientHitScan( msg );
+			break;
+		}
+		// openQ4: attacker only hit feedback
+		case GAME_UNRELIABLE_MESSAGE_HITINFO: {
+			mpGame.damageNumbers.ClientReceive( msg );
 			break;
 		}
 #ifdef _USE_VOICECHAT

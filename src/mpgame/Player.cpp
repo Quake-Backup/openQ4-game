@@ -10814,6 +10814,11 @@ void idPlayer::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &di
 			 attacker != NULL && attacker->IsType( idPlayer::GetClassType() ) ) {
 			gameLocal.mpGame.GetGameState()->PlayerDamage( static_cast< idPlayer * >( attacker ), this, damage );
 		}
+
+		// openQ4: floating damage numbers, ported from Quake Live's damage
+		// plums.  Quake Live reports the damage the shot was worth, so armour
+		// counts towards the number rather than being subtracted from it.
+		rvDamageNumbers::ServerSend( this, attacker, methodOfDeath, damage + armorSave );
 	}
 		
 // RAVEN BEGIN
@@ -14197,6 +14202,17 @@ void idPlayer::SetupHead( const char* headModel, idVec3 headOffset ) {
 		}
 
 		headEnt->SetBody ( this, headDict->GetString ( "model" ), joint );
+
+		// A head that survived a previous SetupHead (a respawn re-runs this with
+		// the same client entity) is still bound to us, and while it is bound
+		// SetOrigin/SetAxis write the *bind offset* rather than the world
+		// transform.  rvClientEntity::Bind then re-seeds that offset from the
+		// world transform it still carries, so the head would be re-bound at
+		// its old world position expressed as a local offset - hundreds or
+		// thousands of units away from the joint, outside the map, in no portal
+		// area, and therefore never drawn.  Unbind first so the calls below
+		// land on the world transform exactly as they do for a fresh head.
+		headEnt->Unbind();
 		headEnt->SetOrigin( vec3_origin + headOffset );
 		headEnt->SetAxis( mat3_identity );
 		UpdateModelTransform();
