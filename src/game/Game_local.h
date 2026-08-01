@@ -179,6 +179,8 @@ void gameDebugLogDamage( const char *source, idEntity *victim, idEntity *inflict
 
 #include "FreeView.h"
 
+#include "HitMarker.h"
+
 //============================================================================
 
 const int MAX_GAME_MESSAGE_SIZE		= 8192;
@@ -283,6 +285,7 @@ enum {
 enum {
 	GAME_UNRELIABLE_RECORD_CLIENTNUM,
 	GAME_UNRELIABLE_RECORD_AREAS,
+	GAME_UNRELIABLE_RECORD_AREAS_INSTANCE,
 
 	GAME_UNRELIABLE_RECORD_COUNT
 };
@@ -649,7 +652,7 @@ public:
 	virtual void			ServerProcessReliableMessage( int clientNum, const idBitMsg &msg );
 	virtual bool			RepeaterApplySnapshot( int clientNum, int sequence ) { assert(false); return false; }
 	virtual void			RepeaterProcessReliableMessage( int clientNum, const idBitMsg &msg ) { assert(false); }
-	virtual void			ClientReadSnapshot( int clientNum, int snapshotSequence, const int gameFrame, const int gameTime, const int dupeUsercmds, const int aheadOfServer, const idBitMsg &msg );
+	virtual bool			ClientReadSnapshot( int clientNum, int snapshotSequence, const int gameFrame, const int gameTime, const int dupeUsercmds, const int aheadOfServer, const idBitMsg &msg, bool readEntityInstances = false );
 	virtual bool			ClientApplySnapshot( int clientNum, int sequence );
 	virtual void			ClientProcessReliableMessage( int clientNum, const idBitMsg &msg );
 	virtual gameReturn_t	ClientPrediction( int clientNum, const usercmd_t *clientCmds, bool lastPredictFrame = true, ClientStats_t *cs = NULL );
@@ -725,15 +728,19 @@ public:
 	virtual void			WriteNetworkInfo( idFile* file, int clientNum );
 	virtual void			ReadNetworkInfo( int gameTime, idFile* file, int clientNum );
 	virtual bool			ValidateDemoProtocol( int minor_ref, int minor );
+	virtual bool			IsDemoProtocolCompatible( int minor_ref, int minor ) const;
+	virtual void			GetMVDSchemaVersion( int &major, int &minor ) const;
+	virtual bool			IsMVDSchemaCompatible( int major, int minor ) const;
 
-	virtual void			ServerWriteServerDemoSnapshot( int sequence, idBitMsg &msg, int lastSnapshotFrame );
-	virtual void			ClientReadServerDemoSnapshot( int sequence, const int gameFrame, const int gameTime, const idBitMsg &msg );
+	virtual void			ServerWriteServerDemoSnapshot( int sequence, idBitMsg &msg, int lastSnapshotFrame, bool fullWorldInstances );
+	virtual bool			ClientReadServerDemoSnapshot( int sequence, const int gameFrame, const int gameTime, const idBitMsg &msg, bool fullWorldInstances );
 
 	virtual void			RepeaterWriteSnapshot( int clientNum, int sequence, idBitMsg &msg, dword *clientInPVS, int numPVSClients, const userOrigin_t &pvs_origin, int lastSnapshotFrame ) {assert(false);};
 	virtual void			RepeaterEndSnapshots( void ) {};
 	virtual void			ClientReadRepeaterSnapshot( int sequence, const int gameFrame, const int gameTime, const int aheadOfServer, const idBitMsg &msg ) {assert(false);};
 
 	virtual int				GetDemoFollowClient( void ) { return serverDemo ? followPlayer : -1; }
+	virtual bool			SetDemoFollowClient( int clientNum ) { return false; }
 
 	virtual void			GetBotInput( int clientNum, usercmd_t &userCmd ) { Error( "Bot input requested\n" ); };
 

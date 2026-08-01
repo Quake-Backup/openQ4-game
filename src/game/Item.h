@@ -39,6 +39,10 @@ public:
 	virtual void			InstanceLeave( void );
 	virtual bool			GetPhysicsToVisualTransform( idVec3 &origin, idMat3 &axis );
 
+	static int				GetSimpleItemStyle( void );
+	static void				ResolveFlatDiffuseColor( const idDict &args, idVec4 &color );
+	void					UpdateFlatDiffusePresentation( void );
+
 // RAVEN BEGIN
 // mekberg: added
 	virtual bool			Collide( const trace_t &collision, const idVec3 &velocity );
@@ -74,6 +78,7 @@ public:
 
 	rvClientEntityPtr<rvClientEffect>	effectIdle;
 	bool					simpleItem;
+	float					simpleItemScale;
 	bool					pickedUp;
 	const idDeclSkin*		pickupSkin;
 	void					Event_DropToFloor	( void );

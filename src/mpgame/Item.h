@@ -39,6 +39,10 @@ public:
 	virtual void			InstanceLeave( void );
 	virtual bool			GetPhysicsToVisualTransform( idVec3 &origin, idMat3 &axis );
 
+	static int				GetSimpleItemStyle( void );
+	static void				ResolveFlatDiffuseColor( const idDict &args, idVec4 &color );
+	void					UpdateFlatDiffusePresentation( void );
+
 // RAVEN BEGIN
 // mekberg: added
 	virtual bool			Collide( const trace_t &collision, const idVec3 &velocity );
@@ -69,6 +73,11 @@ public:
 	bool					simpleItem;
 	float					simpleItemScale;
 	bool					pickedUp;
+
+	// Who took it, so a bot that watched the pickup happen can name them.
+	// Server side only: the client never needs it and never gets told.
+	int						pickedUpByClientNum;
+
 	const idDeclSkin*		pickupSkin;
 	void					Event_DropToFloor	( void );
 protected:

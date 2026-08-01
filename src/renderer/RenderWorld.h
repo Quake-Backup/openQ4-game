@@ -105,7 +105,23 @@ struct renderView_s;
 typedef bool(*deferredEntityCallback_t)( renderEntity_s *, const renderView_s * );
 
 enum {
-	REF_OUTLINE_NODEPTH = 1 << 0
+	// Draw the outline through whatever geometry is in front of the entity. Only
+	// the outline: the rimlight and the brightskin stay depth tested, because a
+	// ring marks a position where a shaded body seen through a wall does not.
+	REF_OUTLINE_NODEPTH = 1 << 0,
+
+	// Force the entity into every view for its outline, whether or not the portal
+	// walk reached it, so an entity on the far side of the level still gets a
+	// ring. Implies REF_OUTLINE_NODEPTH - such an entity contributes no depth, so
+	// there is nothing for a depth test to compare against.
+	REF_OUTLINE_THROUGH_WORLD = 1 << 1
+};
+
+// Presentation-only replacement of an entity's lit diffuse texture.  The
+// renderer keeps bump, specular, ambient and authored alpha coverage intact.
+enum {
+	REF_FLAT_DIFFUSE = 1 << 0,
+	REF_FLAT_DIFFUSE_SWEEP = 1 << 1
 };
 
 // RAVEN BEGIN
@@ -184,6 +200,12 @@ typedef struct renderEntity_s {
 	idVec4					brightSkinColor;
 	float					outlineWidth;
 	int						outlineFlags;
+
+	// Optional client-side diffuse presentation used by multiplayer pickups
+	// and world weapons.  REF_FLAT_DIFFUSE_SWEEP adds the world-item-only
+	// upward lightness band; first-person weapon spaces are always excluded.
+	idVec4					flatDiffuseColor;
+	int						flatDiffuseFlags;
   
 // RAVEN BEGIN
 // mwhitlock: Xenon texture streaming

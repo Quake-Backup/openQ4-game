@@ -653,6 +653,11 @@ void idGameLocal::Init( void ) {
 		common->Warning( "Failed to load viseme file" );
 	}
 
+	// Bot personalities are read once here rather than per map: a character
+	// describes an opponent, and opponents outlive a map change because bots
+	// hold their client slots across one.
+	botCharacterManager.Init();
+
 // jnewquist: Tag scope and callees to track allocations using "new".
 	MEM_SCOPED_TAG(tag,MA_RENDER);
 // shouchard:  make sure ban list starts out in a known state
@@ -701,6 +706,9 @@ void idGameLocal::Shutdown( void ) {
 // RAVEN BEGIN
 // jscott: FAS
 	FAS_Shutdown();
+
+	botCharacterManager.Shutdown();
+
 // shouchard:  clean up ban list stuff
 	SaveBanList();
 	FlushBanList();
@@ -1490,6 +1498,7 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
 	int mapParseMsec = 0;
 	int mapResolveMsec = 0;
 	int collisionMsec = 0;
+	int entityStringMsec = 0;
 
 	networkSystem->SetLoadingText( mapName );
 
@@ -1542,12 +1551,18 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
 	phaseStartMsec = Sys_Milliseconds();
 	collisionModelManager->LoadMap( mapFile, false );
 	collisionMsec = Sys_Milliseconds() - phaseStartMsec;
+	phaseStartMsec = Sys_Milliseconds();
+	if ( !mapFile->ApplyEntityStringFiles() ) {
+		Error( "Couldn't apply entity-string files for %s", mapName );
+	}
+	entityStringMsec = Sys_Milliseconds() - phaseStartMsec;
 	if ( cvarSystem->GetCVarBool( "com_showLevelLoadTimes" ) ) {
 		Printf(
-			"Game LoadMap phases: mapParse=%d mapResolve=%d collision=%d total=%d msec\n",
+			"Game LoadMap phases: mapParse=%d mapResolve=%d collision=%d entityStrings=%d total=%d msec\n",
 			mapParseMsec,
 			mapResolveMsec,
 			collisionMsec,
+			entityStringMsec,
 			Sys_Milliseconds() - loadStartMsec );
 	}
 
@@ -5813,6 +5828,10 @@ void idGameLocal::SpawnMapEntities( int instance, unsigned short* entityNumIn, u
 	numEntities = mapFile->GetNumEntities();
 	if ( numEntities == 0 ) {
 		Error( "...no entities" );
+	}
+	const int maxInitialMapEntities = ENTITYNUM_MAX_NORMAL - MAX_CLIENTS + 1;
+	if ( numEntities > maxInitialMapEntities ) {
+		Error( "Map entity string contains %d entities; the runtime limit is %d", numEntities, maxInitialMapEntities );
 	}
 
 // RAVEN BEGIN

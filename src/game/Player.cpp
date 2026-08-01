@@ -2655,6 +2655,8 @@ void idPlayer::Spawn( void ) {
 	}
 
 	SetLastHitTime( 0, false );
+	// openQ4: never carry a live hit marker across a spawn
+	rvHitMarker::Clear();
 
 	// load the armor sound feedback
 	declManager->FindSound( "player_sounds_hitArmor" );
@@ -4456,6 +4458,9 @@ void idPlayer::UpdateMultiplayerVisibilityEffects( renderEntity_t *headRenderEnt
 	Player_ClearVisibilityEffects( &renderEntity );
 	Player_ClearVisibilityEffects( headRenderEnt );
 	Player_ClearVisibilityEffects( weaponRenderEnt );
+	if ( weaponRenderEnt != NULL ) {
+		weaponRenderEnt->flatDiffuseFlags = 0;
+	}
 
 	if ( !gameLocal.isMultiplayer || IsHidden() || fl.hidden || spectating || health <= 0 ) {
 		return;
@@ -4484,6 +4489,11 @@ void idPlayer::UpdateMultiplayerVisibilityEffects( renderEntity_t *headRenderEnt
 	}
 
 	const bool teammate = gameLocal.IsTeamGame() && viewer->team == team;
+	if ( g_mpFlatOpponentWeapons.GetBool() && !teammate && weaponRenderEnt != NULL &&
+		weaponRenderEnt->flatDiffuseColor.w > 0.0f ) {
+		weaponRenderEnt->flatDiffuseFlags = REF_FLAT_DIFFUSE;
+	}
+
 	const float outlineStrength = Player_ClampedVisibilityCVar( teammate ? cl_player_outline_team : cl_player_outline_enemy );
 	const float rimlightStrength = Player_ClampedVisibilityCVar( teammate ? cl_player_rimlight_team : cl_player_rimlight_enemy );
 	const float brightSkinStrength = Player_ClampedVisibilityCVar( teammate ? cl_player_brightskin_team : cl_player_brightskin_enemy );
@@ -4731,8 +4741,12 @@ void idPlayer::DrawHUD( idUserInterface *_hud ) {
 				cursor->SetStateInt( "g_crosshairSize", crossSize );
 // RAVEN END
 				cursor->Redraw( gameLocal.time );
+
+				// openQ4: over the crosshair, and under the crosshair's own
+				// gating - no marker in a gui, a vehicle, or while dead
+				rvHitMarker::Draw();
 			}
-		}	
+		}
 
 		UpdateHudStats( _hud );
 
@@ -12951,10 +12965,20 @@ void idPlayer::SetLastHitTime( int time, bool armorHit ) {
 	}
 
 	if ( lastHitTime != time ) {
-		if ( cursor ) {
+		if ( cursor && rvHitMarker::CrosshairFlashEnabled() ) {
 			cursor->HandleNamedEvent( "weaponHit" );
 		}
-		if ( gameLocal.isMultiplayer ) {			
+
+		// openQ4: the marker's fallback path.  DamageFeedback stages a marker
+		// that knows the amount before it gets here, and rvHitMarker drops this
+		// one when it does; anything else that reports a hit still lands a
+		// marker through here.
+		if ( spectated || this == gameLocal.GetLocalPlayer() ) {
+			rvHitMarker::Trigger( HITMARKER_DAMAGE_UNKNOWN, armorHit ? HITMARKER_ARMOR : 0,
+								  HITMARKER_COARSE );
+		}
+
+		if ( gameLocal.isMultiplayer ) {
 			// spectated so we get sounds for a client we're following
 			// localClientNum check so listen server plays only for local player
 			if ( spectated || gameLocal.localClientNum == entityNumber ) {
@@ -14736,7 +14760,24 @@ void idPlayer::DamageFeedback( idEntity *victim, idEntity *inflictor, int &damag
 		if( ((idPlayer*)victim)->inventory.armor > 0 ) {
 			armorHit = true;
 		}
-	} 
+	}
+
+	// openQ4: the crosshair hit marker's precise path.  Single player has no hit
+	// info to send - the shooter is the server - so this is where the amount and
+	// the killing blow are known, and the damage has yet to be applied below the
+	// caller.
+	if ( this == gameLocal.GetLocalPlayer() ) {
+		int markerFlags = armorHit ? HITMARKER_ARMOR : 0;
+
+		if ( this == victim ) {
+			markerFlags |= HITMARKER_SELF;
+		}
+		if ( victim->health - damage <= 0 ) {
+			markerFlags |= HITMARKER_KILL;
+		}
+
+		rvHitMarker::Trigger( damage, markerFlags, HITMARKER_PRECISE );
+	}
 
 	SetLastHitTime( gameLocal.time, armorHit );
 }

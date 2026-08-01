@@ -78,6 +78,8 @@ protected:
 
 	// a round has just gone live
 	virtual void	RoundBegin( void );
+	// last chance to normalize mode-specific state before the next respawn
+	virtual void	PrepareNextRound( void );
 	// the round is over; winningTeam is TEAM_NONE for a draw
 	virtual void	RoundEnd( int winningTeam );
 	// true when the round has been decided; sets winningTeam

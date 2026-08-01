@@ -98,6 +98,11 @@ public:
 
 	virtual void			ServerSendReliableMessage( int clientNum, const idBitMsg &msg );
 	virtual void			ServerSendReliableMessageExcluding( int clientNum, const idBitMsg &msg );
+	// Instance-scoped game helpers fan out one logical message to several
+	// clients. These variants avoid recording each physical delivery.
+	virtual void			ServerSendReliableMessageNoDemo( int clientNum, const idBitMsg &msg );
+	virtual void			ServerSendReliableMessageExcludingNoDemo( int clientNum, const idBitMsg &msg );
+	virtual void			ServerRecordInstanceReliableMessage( int instance, int excludeClient, const idBitMsg &msg );
 	virtual int				ServerGetClientPing( int clientNum );
 	virtual int				ServerGetClientPrediction( int clientNum );
 	virtual int				ServerGetClientTimeSinceLastPacket( int clientNum );

@@ -3031,6 +3031,46 @@ static void Cmd_TestDeath_f( const idCmdArgs &args ) {
 
 /*
 ==================
+Cmd_TestHitMarker_f
+
+Stages one crosshair hit marker, so its timing and its damage tiers can be seen
+without having to line up a real shot.  An amount picks the tier; the named
+arguments ask for the other lanes.
+==================
+*/
+static void Cmd_TestHitMarker_f( const idCmdArgs &args ) {
+	int		damage = HITMARKER_DAMAGE_UNKNOWN;
+	int		flags = 0;
+	int		i;
+
+	if ( gameLocal.GetLocalPlayer() == NULL || !gameLocal.CheatsOk() ) {
+		return;
+	}
+
+	for ( i = 1; i < args.Argc(); i++ ) {
+		const char *arg = args.Argv( i );
+
+		if ( !idStr::Icmp( arg, "kill" ) ) {
+			flags |= HITMARKER_KILL;
+		} else if ( !idStr::Icmp( arg, "team" ) ) {
+			flags |= HITMARKER_TEAM;
+		} else if ( !idStr::Icmp( arg, "self" ) ) {
+			flags |= HITMARKER_SELF;
+		} else if ( !idStr::Icmp( arg, "armor" ) ) {
+			flags |= HITMARKER_ARMOR;
+		} else if ( idStr::IsNumeric( arg ) ) {
+			damage = atoi( arg );
+		} else {
+			gameLocal.Printf( "usage: testHitMarker [damage] [kill] [team] [self] [armor]\n" );
+			return;
+		}
+	}
+
+	rvHitMarker::Trigger( damage, flags, HITMARKER_PRECISE );
+}
+
+/*
+==================
 Cmd_WeaponSplat_f
 ==================
 */
@@ -4071,6 +4111,7 @@ void idGameLocal::InitConsoleCommands( void ) {
 	cmdSystem->AddCommand( "testPointLight",		Cmd_TestPointLight_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"tests a point light" );
 	cmdSystem->AddCommand( "popLight",				Cmd_PopLight_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"removes the last created light" );
 	cmdSystem->AddCommand( "testDeath",				Cmd_TestDeath_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"tests death" );
+	cmdSystem->AddCommand( "testHitMarker",		Cmd_TestHitMarker_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"tests the crosshair hit marker" );
 	cmdSystem->AddCommand( "testSave",				Cmd_TestSave_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"writes out a test savegame" );
 	cmdSystem->AddCommand( "testModel",				idTestModel::TestModel_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"tests a model", idTestModel::ArgCompletion_TestModel );
 	cmdSystem->AddCommand( "testSkin",				idTestModel::TestSkin_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"tests a skin on an existing testModel", idCmdSystem::ArgCompletion_Decl<DECL_SKIN> );

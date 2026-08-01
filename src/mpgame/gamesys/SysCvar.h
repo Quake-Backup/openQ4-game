@@ -179,6 +179,9 @@ extern idCVar	hud_inputColor;
 extern idCVar	hud_damageNumbers;
 extern idCVar	hud_damageNumberStyle;
 extern idCVar	hud_damageNumberScale;
+extern idCVar	hud_hitMarker;
+extern idCVar	hud_hitMarkerScale;
+extern idCVar	hud_crosshairHitFlash;
 // openQ4 END
 
 extern idCVar	ik_enable;
@@ -285,6 +288,7 @@ extern idCVar	g_skipPlayerShadowsMP;
 extern idCVar	g_skipItemShadowsMP;
 
 extern idCVar	g_simpleItems;
+extern idCVar	g_mpFlatOpponentWeapons;
 extern idCVar	g_showHud;
 // RAVEN BEGIN
 extern idCVar	g_crosshairColor;
@@ -395,6 +399,7 @@ extern idCVar	si_fragLimit;
 extern idCVar	si_gameType;
 extern idCVar	si_map;
 extern idCVar	si_mapCycle;
+extern idCVar	si_arenaCampaign;
 extern idCVar	si_spectators;
 extern idCVar	si_minPlayers;
 // RAVEN BEGIN
@@ -480,5 +485,12 @@ extern idCVar bot_debug;
 extern idCVar bot_debugNav;
 extern idCVar bot_navCellSize;
 extern idCVar bot_pause;
+extern idCVar bot_characters;
+extern idCVar bot_forceCharacter;
+extern idCVar bot_skillVariance;
+extern idCVar bot_chat;
+extern idCVar bot_chatDelay;
+extern idCVar bot_chatCPM;
+extern idCVar bot_debugAim;
 
 #endif /* !__SYS_CVAR_H__ */

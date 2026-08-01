@@ -547,7 +547,8 @@ public:
 	void			SwitchToTeam( int clientNum, int oldteam, int newteam );
 	
 	bool			IsPureReady( void ) const;
-	void			ProcessChatMessage( int clientNum, bool team, const char *name, const char *text, const char *sound );
+	void			ProcessChatMessage( int clientNum, bool team, const char *name, const char *text,
+									const char *sound, bool triggerBotReplies );
 	void			ProcessVoiceChat( int clientNum, bool team, int index );
 // RAVEN BEGIN
 // shouchard:  added commands to mute/unmute voice chat
@@ -705,6 +706,21 @@ public:
 	rvTourneyGUI	tourneyGUI;
 
 	void			ShowStatSummary( void );
+	// Called by rvGameState at the authoritative GAMEON/GAMEREVIEW
+	// transitions.  Keeping campaign result capture on the transition itself
+	// means disconnect/forfeit paths cannot skip it by changing state outside
+	// idMultiplayerGame::Run.
+	void			OnMatchStarted( void );
+	void			OnMatchEnded( void );
+	// The Arena campaign is a local single-player experience hosted by the MP
+	// game.  Keep its staging and review presentation behind the campaign token
+	// so ordinary multiplayer retains the stock ready, spectate and camera flow.
+	bool			IsArenaCampaignMatch( void ) const;
+	bool			ArenaCampaignLocksPlayers( void ) const;
+	bool			BuildArenaCampaignPresentationView( idPlayer *viewer, renderView_t *view );
+	void			BeginArenaCampaignEntrancePresentation( void );
+	void			ShowArenaCampaignVictoryPresentation( void );
+	void			ClearArenaCampaignPresentation( void );
 	bool			CanCapture( int team );
 	void			FlagCaptured( idPlayer *player );
 	
@@ -716,9 +732,9 @@ public:
 	bool			TimeLimitHit( void );
 // openQ4 BEGIN
 // Exit rules carried over from Quake Live.
-	// true when the match is level at the top, by team score in team modes
-	// and by the top two ranked players otherwise
-	bool			ScoreIsTied( void );
+	// true when the match is level at the top.  The optional output receives
+	// the authoritative leading score, including valid zero/negative scores.
+	bool			ScoreIsTied( int *leadingScore = NULL );
 	// team that has pulled far enough ahead to end the match early, or -1
 	int				MercyLimitHit( void );
 	// team left holding the match when the other side empties out, or -1
@@ -786,6 +802,30 @@ private:
 
 	// game state
 	rvGameState*	gameState;
+	void			BeginArenaCampaignResult( void );
+	void			UpdateArenaCampaignResult( void );
+
+	bool			arenaResultPending;
+	bool			arenaResultReported;
+	int				arenaResultToken;
+	int				arenaResultOutcome;	// 0 loss, 1 win, 2 draw; framework handoff contract
+	int				arenaResultPlayerScore;
+	int				arenaResultOpponentScore;
+	int				arenaResultReportTime;
+	int				arenaPresentationVictor;
+	int				arenaPresentationFocus;
+	bool			arenaPresentationBlurEnabled;
+	bool			arenaEntranceCameraResolved;
+	bool			arenaEntranceCameraFallback;
+	bool			arenaEntranceCameraValid;
+	idVec3			arenaEntranceCameraForward;
+	idVec3			arenaEntranceCameraLeft;
+	idVec3			arenaEntranceCameraRadial;
+	float			arenaEntranceCameraHeightLimit;
+
+	void			SelectArenaCampaignPresentationFocus( idPlayer *host );
+	idPlayer *		GetArenaCampaignPresentationFocus( void ) const;
+	void			SetArenaCampaignDepthOfField( bool enabled, float focusDistance = 0.0f, float strength = 0.0f );
 
 	// vote vars
 	vote_flags_t	vote;					// active vote or VOTE_NONE

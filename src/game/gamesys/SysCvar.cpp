@@ -496,7 +496,8 @@ bool G_ShadowMapCorpseShadowsEnabled( void ) {
 
 idCVar g_skipPlayerShadowsMP(		"g_skipPlayerShadowsMP",	"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "disables all player shadows in multiplayer" );
 idCVar g_skipItemShadowsMP(			"g_skipItemShadowsMP",		"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "disables all item shadows in multiplayer" );
-idCVar g_simpleItems(				"g_simpleItems",			"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "render icon representations of items instead of the actual model" );
+idCVar g_simpleItems(				"g_simpleItems",			"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_INTEGER, "multiplayer item presentation: 0 original models, 1 legacy icons, 2 flat icon colors, 3 flat icon colors with an upward light sweep", 0, 3 );
+idCVar g_mpFlatOpponentWeapons(		"g_mpFlatOpponentWeapons",	"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "flat-shade weapons held by multiplayer opponents using their icon colors" );
 idCVar g_showHud(					"g_showHud",				"1",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "" );
 idCVar g_showProjectilePct(			"g_showProjectilePct",		"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "enables display of player hit percentage" );
 // RAVEN BEGIN
@@ -528,6 +529,17 @@ idCVar g_crosshairColor(			"g_crosshairColor",			"1 1 1 1", CVAR_GAME | CVAR_ARC
 idCVar g_crosshairCustom(			"g_crosshairCustom",		"0",			CVAR_GAME | PC_CVAR_ARCHIVE, "sets the custom combat crosshair" );
 idCVar g_crosshairCustomFile(		"g_crosshairCustomFile",	"0",			CVAR_GAME | PC_CVAR_ARCHIVE, "stores the custom crosshair's filename" );
 idCVar g_crosshairCharInfoFar(		"g_crosshairCharInfoFar",	"1",			CVAR_GAME | CVAR_BOOL, "instead of a green crosshair from far away, full character info always draws" );
+// openQ4 BEGIN
+// Crosshair hit marker.  Four angled marks bloom out of the crosshair and fade
+// on every hit the player lands, sized by how much the hit was worth.  It
+// replaces stock Quake 4's crosshair recolour, which hud_crosshairHitFlash can
+// bring back; turning the marker off restores that flash on its own so a player
+// is never left with no hit cue at all.  Kept in step with the multiplayer
+// module so the setting means the same thing in both.
+idCVar hud_hitMarker(				"hud_hitMarker",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "crosshair hit marker on hits you land" );
+idCVar hud_hitMarkerScale(			"hud_hitMarkerScale",		"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_FLOAT, "hit marker size multiplier, on top of g_crosshairSize", 0.25f, 4.0f );
+idCVar hud_crosshairHitFlash(		"hud_crosshairHitFlash",	"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "recolour the crosshair on a hit, as stock Quake 4 does; implied when hud_hitMarker is off" );
+// openQ4 END
 // bdube: database entries
 idCVar g_showHudPopups(				"g_showHudPopups",			"1",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "displays objective and database popups on the hud" );
 idCVar g_showRange(					"g_showRange",				"0",			CVAR_GAME | CVAR_CHEAT | CVAR_BOOL, "shows the range from the player to the first collision under the players crosshair" );

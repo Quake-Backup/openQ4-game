@@ -941,7 +941,7 @@ static void Cmd_Say( bool team, const idCmdArgs &args ) {
 		outMsg.WriteString( "" );
 		networkSystem->ClientSendReliableMessage( outMsg );
 	} else {
-		gameLocal.mpGame.ProcessChatMessage( gameLocal.localClientNum, team, name, text, NULL );
+		gameLocal.mpGame.ProcessChatMessage( gameLocal.localClientNum, team, name, text, NULL, true );
 	}
 }
 
@@ -2389,6 +2389,46 @@ static void Cmd_TestDeath_f( const idCmdArgs &args ) {
 
 /*
 ==================
+Cmd_TestHitMarker_f
+
+Stages one crosshair hit marker, so its timing and its damage tiers can be seen
+without having to line up a real shot.  An amount picks the tier; the named
+arguments ask for the other lanes.
+==================
+*/
+static void Cmd_TestHitMarker_f( const idCmdArgs &args ) {
+	int		damage = HITMARKER_DAMAGE_UNKNOWN;
+	int		flags = 0;
+	int		i;
+
+	if ( gameLocal.GetLocalPlayer() == NULL || !gameLocal.CheatsOk() ) {
+		return;
+	}
+
+	for ( i = 1; i < args.Argc(); i++ ) {
+		const char *arg = args.Argv( i );
+
+		if ( !idStr::Icmp( arg, "kill" ) ) {
+			flags |= HITMARKER_KILL;
+		} else if ( !idStr::Icmp( arg, "team" ) ) {
+			flags |= HITMARKER_TEAM;
+		} else if ( !idStr::Icmp( arg, "self" ) ) {
+			flags |= HITMARKER_SELF;
+		} else if ( !idStr::Icmp( arg, "armor" ) ) {
+			flags |= HITMARKER_ARMOR;
+		} else if ( idStr::IsNumeric( arg ) ) {
+			damage = atoi( arg );
+		} else {
+			gameLocal.Printf( "usage: testHitMarker [damage] [kill] [team] [self] [armor]\n" );
+			return;
+		}
+	}
+
+	rvHitMarker::Trigger( damage, flags, HITMARKER_PRECISE );
+}
+
+/*
+==================
 Cmd_WeaponSplat_f
 ==================
 */
@@ -3248,10 +3288,35 @@ void Cmd_BuyItem_f( const idCmdArgs& args ) {
 /*
 ==================
 Cmd_AddBot_f
+
+addbot [name] [skill] [exact].  The skill argument is a per-bot override that
+bypasses bot_skill and bot_skillVariance entirely, which is how a server
+operator puts one hard opponent in an otherwise gentle match without editing a
+character file.  "exact" is used by authored matches: the named character must
+exist and be available, so a typo can never silently seat a different opponent.
 ==================
 */
 void Cmd_AddBot_f( const idCmdArgs &args ) {
-	botManager.AddBot( args.Argc() > 1 ? args.Argv( 1 ) : NULL );
+	const char *name = ( args.Argc() > 1 ) ? args.Argv( 1 ) : NULL;
+	int skill = -1;			// -1 means no override: follow bot_skill
+	bool requireExactCharacter = false;
+
+	if ( args.Argc() > 2 ) {
+		skill = atoi( args.Argv( 2 ) );
+		if ( skill < 1 || skill > BOT_SKILL_LEVELS ) {
+			gameLocal.Printf( "usage: addbot [name] [skill 1-%d]\n", BOT_SKILL_LEVELS );
+			return;
+		}
+	}
+	if ( args.Argc() > 3 ) {
+		if ( idStr::Icmp( args.Argv( 3 ), "exact" ) != 0 || args.Argc() > 4 ) {
+			gameLocal.Printf( "usage: addbot [name] [skill 1-%d] [exact]\n", BOT_SKILL_LEVELS );
+			return;
+		}
+		requireExactCharacter = true;
+	}
+
+	botManager.AddBot( name, skill, requireExactCharacter );
 }
 
 /*
@@ -3287,6 +3352,42 @@ Cmd_BotList_f
 */
 void Cmd_BotList_f( const idCmdArgs &args ) {
 	botManager.ListBots();
+}
+
+/*
+==================
+Cmd_BotCharacters_f
+==================
+*/
+void Cmd_BotCharacters_f( const idCmdArgs &args ) {
+	botCharacterManager.ListCharacters();
+}
+
+/*
+==================
+Cmd_BotReload_f
+
+Re-reads the style and character files in place.  Bots keep the character they
+are already wearing where the name survives the reload, so an author can retune
+a personality and watch it change without restarting the match.
+==================
+*/
+void Cmd_BotReload_f( const idCmdArgs &args ) {
+	const bool loaded = botCharacterManager.Reload();
+
+	// Unconditional, and before the early return: Reload has already freed the
+	// old roster either way, so every live bot is holding a dangling pointer
+	// from here until it is re-bound.  Skipping this on the failure path would
+	// leave the bots reading freed memory for the rest of the match.
+	botManager.RebindCharacters();
+
+	if ( !loaded ) {
+		gameLocal.Printf( "botreload: no bot style or character files were loaded\n" );
+		return;
+	}
+
+	gameLocal.Printf( "botreload: %d characters, %d styles\n",
+					  botCharacterManager.NumCharacters(), botCharacterManager.NumStyles() );
 }
 
 /*
@@ -3488,6 +3589,7 @@ void idGameLocal::InitConsoleCommands( void ) {
 	cmdSystem->AddCommand( "testPointLight",		Cmd_TestPointLight_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"tests a point light" );
 	cmdSystem->AddCommand( "popLight",				Cmd_PopLight_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"removes the last created light" );
 	cmdSystem->AddCommand( "testDeath",				Cmd_TestDeath_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"tests death" );
+	cmdSystem->AddCommand( "testHitMarker",		Cmd_TestHitMarker_f,		CMD_FL_GAME|CMD_FL_CHEAT,	"tests the crosshair hit marker" );
 	cmdSystem->AddCommand( "testSave",				Cmd_TestSave_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"writes out a test savegame" );
 	cmdSystem->AddCommand( "testModel",				idTestModel::TestModel_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"tests a model", idTestModel::ArgCompletion_TestModel );
 	cmdSystem->AddCommand( "testSkin",				idTestModel::TestSkin_f,			CMD_FL_GAME|CMD_FL_CHEAT,	"tests a skin on an existing testModel", idCmdSystem::ArgCompletion_Decl<DECL_SKIN> );
@@ -3630,10 +3732,12 @@ void idGameLocal::InitConsoleCommands( void ) {
 // RITUAL END
 
 	// openQ4: multiplayer bots
-	cmdSystem->AddCommand( "addbot",				Cmd_AddBot_f,				CMD_FL_GAME,				"add a bot to the match, optionally with a given name" );
+	cmdSystem->AddCommand( "addbot",				Cmd_AddBot_f,				CMD_FL_GAME,				"addbot [name] [skill] [exact] - add a bot; exact requires that named character" );
 	cmdSystem->AddCommand( "removebot",				Cmd_RemoveBot_f,			CMD_FL_GAME,				"remove a bot from the match, optionally by name" );
 	cmdSystem->AddCommand( "kickbots",				Cmd_KickBots_f,				CMD_FL_GAME,				"remove every bot from the match" );
 	cmdSystem->AddCommand( "botlist",				Cmd_BotList_f,				CMD_FL_GAME,				"list the bots in the match and the state of the navmesh" );
+	cmdSystem->AddCommand( "botcharacters",			Cmd_BotCharacters_f,		CMD_FL_GAME,				"list the loaded bot characters, their play style and their skill band" );
+	cmdSystem->AddCommand( "botreload",				Cmd_BotReload_f,			CMD_FL_GAME,				"re-read the bot style and character files without a map change" );
 	cmdSystem->AddCommand( "navmesh",				Cmd_NavMesh_f,				CMD_FL_GAME,				"navmesh <build|info> - generate or report the bot navigation mesh" );
 }
 

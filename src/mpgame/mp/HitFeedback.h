@@ -15,7 +15,9 @@ class idEntity;
 // decides which hits its own hud_damageNumbers setting wants to see.
 typedef enum {
 	HITFLAG_TEAM	= BIT( 0 ),		// victim shares the attacker's team
-	HITFLAG_SELF	= BIT( 1 )		// attacker damaged themselves
+	HITFLAG_SELF	= BIT( 1 ),		// attacker damaged themselves
+	HITFLAG_ARMOR	= BIT( 2 ),		// armour absorbed part of the hit
+	HITFLAG_KILL	= BIT( 3 )		// the hit finished the victim
 } hitFeedbackFlags_t;
 
 // hud_damageNumbers
@@ -64,8 +66,10 @@ public:
 	void					Draw( const renderView_t *view );
 
 	// server side.  Gates on g_hitFeedback and decides nothing about
-	// presentation - that is the recipient's business.
-	static void				ServerSend( idPlayer *victim, idEntity *attacker, int weapon, int damage );
+	// presentation - that is the recipient's business.  hitFlags carries what
+	// only the damage site knows: whether armour soaked part of the hit and
+	// whether it finished the victim.
+	static void				ServerSend( idPlayer *victim, idEntity *attacker, int weapon, int damage, int hitFlags );
 
 private:
 	// Quake Live sizes its world marker slab at 32 and drops new markers when

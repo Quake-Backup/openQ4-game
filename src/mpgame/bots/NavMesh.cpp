@@ -36,6 +36,7 @@ static const float	NAV_GROUND_OFFSET		= 1.0f;		// lift traces off the surface th
 static const int	NAV_MAX_NODES			= 65536;
 static const int	NAV_SMOOTH_LOOKAHEAD	= 8;		// nodes a single string-pull step may skip
 static const float	NAV_SMOOTH_MAX_DIP		= 48.0f;	// how far a shortcut may float above the ground it crosses
+static const int	NAV_MAX_ROUTE_REPAIRS	= 16;		// blocked graph edges excluded before giving up
 
 // Extra cost so a route prefers walking around to falling or jumping, when
 // more than one works.
@@ -52,6 +53,142 @@ static const int	navNeighbourY[8] = { 0,  1,  1,  1,  0, -1, -1, -1 };
 // per trace dominates generation time otherwise.
 static idClipModel *		navAgentModel = NULL;
 static idBounds				navAgentBounds;
+
+/*
+================
+NavTravelVolumeBounds
+
+Jump pads move their brush clip out of the entity physics object and into the
+force-field evaluator during Spawn.  Teleporter triggers retain ordinary
+physics bounds.  This keeps both generation and execution aimed at the volume
+that actually activates.
+================
+*/
+static bool NavTravelVolumeBounds( idEntity *ent, idBounds &bounds ) {
+	if ( !ent ) {
+		return false;
+	}
+
+	if ( ent->IsType( rvJumpPad::GetClassType() ) ) {
+		return static_cast<rvJumpPad *>( ent )->GetForceFieldBounds( bounds );
+	}
+
+	if ( !ent->GetPhysics() ) {
+		return false;
+	}
+
+	bounds = ent->GetPhysics()->GetAbsBounds();
+	return true;
+}
+
+/*
+================
+NavDoorIsWalkActivated
+
+Only an ordinary unlocked proximity door is equivalent to open floor.  Script,
+key, shoot, and locked doors need decisions the movement layer cannot make and
+must remain solid until their game logic opens them.
+================
+*/
+static bool NavDoorIsWalkActivated( idEntity *ent ) {
+	if ( !ent || !ent->IsType( idDoor::GetClassType() ) ) {
+		return false;
+	}
+
+	idDoor *door = static_cast<idDoor *>( ent );
+	return !door->IsLocked() && !door->IsNoTouch() &&
+		   !door->spawnArgs.GetString( "requires", "" )[0];
+}
+
+/*
+================
+NavTranslationThroughDoors
+
+A navmesh built while a normal multiplayer door is closed must still contain
+the floor on its far side.  Players activate these doors simply by approaching
+them, so they are traversable rather than permanent walls.  Repeat a blocked
+trace while ignoring at most two door leaves; all other solid entities remain
+real obstructions and are reconsidered by route searches at run time.
+================
+*/
+static bool NavTranslationThroughDoors( trace_t &trace, const idVec3 &start,
+										const idVec3 &end, const idClipModel *model ) {
+	const idEntity *passEntity = NULL;
+	const idEntity *passEntity2 = NULL;
+
+	for ( int attempt = 0; attempt < 3; attempt++ ) {
+		gameLocal.Translation( NULL, trace, start, end, model, mat3_identity,
+						   NAV_CLIP_MASK, passEntity, passEntity2 );
+		if ( trace.fraction >= 1.0f ) {
+			return true;
+		}
+
+		if ( trace.c.entityNum < 0 || trace.c.entityNum >= MAX_GENTITIES ) {
+			return false;
+		}
+
+		idEntity *blocker = gameLocal.entities[trace.c.entityNum];
+		if ( !NavDoorIsWalkActivated( blocker ) ||
+			 blocker == passEntity || blocker == passEntity2 ) {
+			return false;
+		}
+
+		if ( !passEntity ) {
+			passEntity = blocker;
+		} else if ( !passEntity2 ) {
+			passEntity2 = blocker;
+		} else {
+			return false;
+		}
+	}
+
+	return false;
+}
+
+/*
+================
+NavEntityTranslationThroughDoors
+
+The sampled graph remains authoritative for static world geometry.  Runtime
+route repair only needs to discover solid entities that have moved into a link
+since generation; re-sampling the floor and stair geometry makes a stricter,
+different test than the one which created the edge.  Normal touch doors are
+ignored because approaching them is the action that opens them.
+================
+*/
+static bool NavEntityTranslationThroughDoors( trace_t &trace, const idVec3 &start,
+										  const idVec3 &end, const idClipModel *model ) {
+	const idEntity *passEntity = NULL;
+	const idEntity *passEntity2 = NULL;
+
+	for ( int attempt = 0; attempt < 3; attempt++ ) {
+		gameLocal.TranslationEntities( NULL, trace, start, end, model, mat3_identity,
+									  NAV_CLIP_MASK, passEntity, passEntity2 );
+		if ( trace.fraction >= 1.0f ) {
+			return true;
+		}
+
+		if ( trace.c.entityNum < 0 || trace.c.entityNum >= MAX_GENTITIES ) {
+			return false;
+		}
+
+		idEntity *blocker = gameLocal.entities[trace.c.entityNum];
+		if ( !NavDoorIsWalkActivated( blocker ) ||
+			 blocker == passEntity || blocker == passEntity2 ) {
+			return false;
+		}
+
+		if ( !passEntity ) {
+			passEntity = blocker;
+		} else if ( !passEntity2 ) {
+			passEntity2 = blocker;
+		} else {
+			return false;
+		}
+	}
+
+	return false;
+}
 
 /*
 ================
@@ -82,11 +219,12 @@ const idBounds &rvNavMesh::GetAgentBounds( void ) {
 rvNavPath::Append
 ================
 */
-void rvNavPath::Append( const idVec3 &origin, int travelType ) {
+void rvNavPath::Append( const idVec3 &origin, int travelType, int actionEntityNum ) {
 	navCorner_t corner;
 
-	corner.origin		= origin;
-	corner.travelType	= (short)travelType;
+	corner.origin			= origin;
+	corner.travelType		= (short)travelType;
+	corner.actionEntityNum	= (short)actionEntityNum;
 
 	corners.Append( corner );
 }
@@ -107,6 +245,42 @@ float rvNavPath::Length( void ) const {
 }
 
 /*
+================
+rvNavPath::LengthFrom
+
+Length() describes only the geometry between stored corners.  A route created
+by FindPath also retains its graph cost, including the exact first/last legs,
+jump/drop penalties, and cheap authored transports.  The geometric fallback
+keeps manually assembled paths useful from another origin.
+================
+*/
+float rvNavPath::LengthFrom( const idVec3 &origin ) const {
+	if ( corners.Num() == 0 ) {
+		return 0.0f;
+	}
+	if ( hasTravelCost && ( origin - travelStart ).LengthSqr() <= 1.0f ) {
+		return travelCost;
+	}
+
+	return ( corners[0].origin - origin ).Length() + Length();
+}
+
+/*
+================
+rvNavPath::SetTravelCost
+
+String pulling removes intermediate nodes, but their jump/drop penalties and
+cheap transport edges still matter when comparing goals.  Keep the exact graph
+cost alongside the steering corners without changing the movement interface.
+================
+*/
+void rvNavPath::SetTravelCost( const idVec3 &origin, float cost ) {
+	travelStart = origin;
+	travelCost = Max( 0.0f, cost );
+	hasTravelCost = true;
+}
+
+/*
 ===============================================================================
 
 	rvNavMesh construction
@@ -124,6 +298,7 @@ rvNavMesh::rvNavMesh( void ) {
 	cellSize		= 24.0f;
 	numAreas		= 0;
 	buildMsec		= 0;
+	heuristicScale = 1.0f;
 	searchSerial	= 0;
 
 	nodes.SetGranularity( 1024 );
@@ -158,6 +333,7 @@ void rvNavMesh::Clear( void ) {
 
 	numAreas		= 0;
 	buildMsec		= 0;
+	heuristicScale = 1.0f;
 	searchSerial	= 0;
 
 	if ( navAgentModel ) {
@@ -235,26 +411,34 @@ int rvNavMesh::AddNode( int gx, int gy, const idVec3 &origin ) {
 rvNavMesh::LinkNodes
 ================
 */
-void rvNavMesh::LinkNodes( int from, int to, float cost, int travelType ) {
+void rvNavMesh::LinkNodes( int from, int to, float cost, int travelType, int actionEntityNum ) {
 	navLink_t link;
+	const float geometricCost = ( nodes[to].origin - nodes[from].origin ).Length();
+	const float edgeScale = ( geometricCost > idMath::FLOAT_EPSILON )
+		? Max( 0.0f, cost / geometricCost )
+		: 1.0f;
 
 	// Do not duplicate a link that already exists with a cheaper cost.
 	for ( int i = nodes[from].firstLink; i != -1; i = links[i].next ) {
 		if ( links[i].node == to ) {
 			if ( cost < links[i].cost ) {
-				links[i].cost		= cost;
-				links[i].travelType	= (short)travelType;
+				links[i].cost				= cost;
+				links[i].travelType			= (short)travelType;
+				links[i].actionEntityNum	= (short)actionEntityNum;
+				heuristicScale = Min( heuristicScale, edgeScale );
 			}
 			return;
 		}
 	}
 
-	link.node		= to;
-	link.next		= nodes[from].firstLink;
-	link.cost		= cost;
-	link.travelType	= (short)travelType;
+	link.node				= to;
+	link.next				= nodes[from].firstLink;
+	link.cost				= cost;
+	link.travelType			= (short)travelType;
+	link.actionEntityNum	= (short)actionEntityNum;
 
 	nodes[from].firstLink = links.Append( link );
+	heuristicScale = Min( heuristicScale, edgeScale );
 }
 
 /*
@@ -272,7 +456,7 @@ bool rvNavMesh::SampleFloor( const idVec3 &start, float maxDrop, idVec3 &floorOu
 	end = start;
 	end.z -= maxDrop;
 
-	gameLocal.Translation( NULL, trace, start, end, navAgentModel, mat3_identity, NAV_CLIP_MASK, NULL );
+	NavTranslationThroughDoors( trace, start, end, navAgentModel );
 
 	if ( trace.fraction >= 1.0f ) {
 		return false;
@@ -325,8 +509,7 @@ bool rvNavMesh::TryStep( const idVec3 &fromFloor, const idVec3 &toCentre, idVec3
 			end = start;
 			end.z = fromFloor.z + lifts[attempt];
 
-			gameLocal.Translation( NULL, trace, start, end, navAgentModel, mat3_identity, NAV_CLIP_MASK, NULL );
-			if ( trace.fraction < 1.0f ) {
+			if ( !NavTranslationThroughDoors( trace, start, end, navAgentModel ) ) {
 				return false;
 			}
 			start = trace.endpos;
@@ -335,8 +518,7 @@ bool rvNavMesh::TryStep( const idVec3 &fromFloor, const idVec3 &toCentre, idVec3
 		end = toCentre;
 		end.z = start.z;
 
-		gameLocal.Translation( NULL, trace, start, end, navAgentModel, mat3_identity, NAV_CLIP_MASK, NULL );
-		if ( trace.fraction < 1.0f ) {
+		if ( !NavTranslationThroughDoors( trace, start, end, navAgentModel ) ) {
 			continue;
 		}
 
@@ -389,7 +571,10 @@ void rvNavMesh::GatherSeeds( idList<idVec3> &seeds ) const {
 
 		// A jump pad launches into space; its target is where a player lands.
 		if ( ent->IsType( rvJumpPad::GetClassType() ) ) {
-			seeds.Append( ent->GetPhysics()->GetAbsBounds().GetCenter() );
+			idBounds padBounds;
+			if ( NavTravelVolumeBounds( ent, padBounds ) ) {
+				seeds.Append( padBounds.GetCenter() );
+			}
 			for ( int i = 0; i < ent->targets.Num(); i++ ) {
 				if ( ent->targets[i].GetEntity() ) {
 					seeds.Append( ent->targets[i].GetEntity()->GetPhysics()->GetOrigin() );
@@ -557,14 +742,19 @@ void rvNavMesh::AddOffMeshLinks( void ) {
 			continue;
 		}
 
-		const int from = NodeForEntityPoint( ent->GetPhysics()->GetAbsBounds().GetCenter() );
+		idBounds entryBounds;
+		if ( !NavTravelVolumeBounds( ent, entryBounds ) ) {
+			continue;
+		}
+
+		const int from = NodeForEntityPoint( entryBounds.GetCenter() );
 		const int to   = NodeForEntityPoint( ent->targets[0].GetEntity()->GetPhysics()->GetOrigin() );
 
 		if ( from == -1 || to == -1 || from == to ) {
 			continue;
 		}
 
-		LinkNodes( from, to, cost, travelType );
+		LinkNodes( from, to, cost, travelType, ent->entityNumber );
 		numLinksAdded++;
 	}
 
@@ -728,7 +918,7 @@ Searches the grid cells around the point outwards, so the common case - the
 point is standing on a node - costs one cell lookup.
 ================
 */
-int rvNavMesh::FindNearestNode( const idVec3 &origin, float maxRadius ) const {
+int rvNavMesh::FindNearestNode( const idVec3 &origin, float maxRadius, bool requireWalkable ) const {
 	if ( nodes.Num() == 0 ) {
 		return -1;
 	}
@@ -758,7 +948,8 @@ int rvNavMesh::FindNearestNode( const idVec3 &origin, float maxRadius ) const {
 					}
 
 					const float distSqr = ( nodes[i].origin - origin ).LengthSqr();
-					if ( distSqr < bestDistSqr ) {
+					if ( distSqr < bestDistSqr &&
+						 ( !requireWalkable || WalkableLine( origin, nodes[i].origin ) ) ) {
 						bestDistSqr	= distSqr;
 						best		= i;
 					}
@@ -781,14 +972,8 @@ rvNavMesh::IsReachable
 ================
 */
 bool rvNavMesh::IsReachable( const idVec3 &start, const idVec3 &goal ) const {
-	const int startNode = FindNearestNode( start );
-	const int goalNode  = FindNearestNode( goal );
-
-	if ( startNode == -1 || goalNode == -1 ) {
-		return false;
-	}
-
-	return nodes[startNode].area == nodes[goalNode].area;
+	rvNavPath path;
+	return FindPath( start, goal, path );
 }
 
 /*
@@ -796,27 +981,67 @@ bool rvNavMesh::IsReachable( const idVec3 &start, const idVec3 &goal ) const {
 rvNavMesh::RandomReachablePoint
 ================
 */
-bool rvNavMesh::RandomReachablePoint( const idVec3 &origin, idVec3 &result ) const {
+bool rvNavMesh::RandomReachablePoint( const idVec3 &origin, idVec3 &result, rvNavPath *pathOut ) const {
+	if ( pathOut ) {
+		pathOut->Clear();
+	}
+
 	if ( nodes.Num() == 0 ) {
 		return false;
 	}
 
-	const int startNode = FindNearestNode( origin );
-	const int area		= ( startNode != -1 ) ? nodes[startNode].area : -1;
+	const int startNode = FindNearestNode( origin, 256.0f, true );
+	if ( startNode == -1 ) {
+		return false;
+	}
 
-	// The mesh is one component on almost every map, so a handful of tries is
-	// plenty; falling back to any node beats not moving at all.
-	for ( int attempt = 0; attempt < 16; attempt++ ) {
-		const int candidate = gameLocal.random.RandomInt( nodes.Num() );
+	// Build the directed closure once, then choose uniformly from it.  Weak
+	// areas intentionally treat a one-way drop as undirected, while a handful
+	// of random probes can miss the small set that is truly reachable from a
+	// ledge or island.  Following outgoing links is both exact and linear.
+	BeginSearch();
 
-		if ( area != -1 && nodes[candidate].area != area ) {
-			continue;
+	idList<int> reachable;
+	reachable.SetGranularity( 256 );
+	reachable.Append( startNode );
+	openTag[startNode] = searchSerial;
+
+	for ( int cursor = 0; cursor < reachable.Num(); cursor++ ) {
+		const int node = reachable[cursor];
+
+		for ( int l = nodes[node].firstLink; l != -1; l = links[l].next ) {
+			const int destination = links[l].node;
+			if ( openTag[destination] == searchSerial ) {
+				continue;
+			}
+
+			openTag[destination] = searchSerial;
+			reachable.Append( destination );
 		}
-		if ( candidate == startNode ) {
+	}
+
+	if ( reachable.Num() <= 1 ) {
+		return false;
+	}
+
+	// The directed closure reflects the generated graph, while movers can make
+	// one branch temporarily unavailable.  Sample without replacement so one
+	// obstructed random pick does not cancel roaming when many others work.
+	const int maxAttempts = Min( NAV_MAX_ROUTE_REPAIRS, reachable.Num() - 1 );
+	for ( int attempt = 0; attempt < maxAttempts; attempt++ ) {
+		const int candidateIndex = 1 + gameLocal.random.RandomInt( reachable.Num() - 1 );
+		const int candidate = reachable[candidateIndex];
+		reachable.RemoveIndex( candidateIndex );
+
+		rvNavPath candidatePath;
+		if ( !FindPath( origin, nodes[candidate].origin, candidatePath ) ) {
 			continue;
 		}
 
 		result = nodes[candidate].origin;
+		if ( pathOut ) {
+			*pathOut = candidatePath;
+		}
 		return true;
 	}
 
@@ -836,38 +1061,135 @@ bool rvNavMesh::WalkableLine( const idVec3 &from, const idVec3 &to ) const {
 	trace_t		trace;
 	const float	stepSize = pm_stepsize.GetFloat();
 
-	idVec3 start = from;
-	idVec3 end   = to;
+	idVec3 start = from + idVec3( 0.0f, 0.0f, NAV_GROUND_OFFSET );
+	idVec3 end   = to   + idVec3( 0.0f, 0.0f, NAV_GROUND_OFFSET );
+	float probeLift = NAV_GROUND_OFFSET;
 
-	start.z += stepSize;
-	end.z   += stepSize;
+	// Most shortcuts are ordinary floor movement.  Test at standing height
+	// first so a legal low corridor is not rejected merely because a
+	// step-height-raised player hull would overlap its ceiling.
+	if ( !NavTranslationThroughDoors( trace, start, end, navAgentModel ) ) {
+		// A flat sweep can hit a stair that player physics will step over.  The
+		// raised alternative is only needed in that case.
+		start = from + idVec3( 0.0f, 0.0f, stepSize );
+		end   = to   + idVec3( 0.0f, 0.0f, stepSize );
+		probeLift = stepSize;
 
-	gameLocal.Translation( NULL, trace, start, end, navAgentModel, mat3_identity, NAV_CLIP_MASK, NULL );
-	if ( trace.fraction < 1.0f ) {
-		return false;
+		if ( !NavTranslationThroughDoors( trace, start, end, navAgentModel ) ) {
+			return false;
+		}
 	}
 
-	const idVec3	delta	= end - start;
+	const idVec3	delta	= to - from;
 	const float		length	= delta.Length();
-	const int		samples	= (int)( length / cellSize );
+	const int		samples	= ( length > idMath::FLOAT_EPSILON )
+								? Max( 2, (int)idMath::Ceil( length / cellSize ) )
+								: 1;
 
 	for ( int i = 1; i < samples; i++ ) {
 		const float	frac  = (float)i / (float)samples;
-		idVec3		probe = start + delta * frac;
+		const idVec3	expected = from + delta * frac;
+		idVec3		probe = expected + idVec3( 0.0f, 0.0f, probeLift );
 		idVec3		floor;
 
-		if ( !SampleFloor( probe, stepSize + NAV_SMOOTH_MAX_DIP, floor ) ) {
+		if ( !SampleFloor( probe, probeLift + NAV_SMOOTH_MAX_DIP, floor ) ) {
 			return false;
 		}
 
 		// The straight line must stay close to the ground it crosses, or the
 		// shortcut is really a fall.
-		if ( probe.z - floor.z > NAV_SMOOTH_MAX_DIP ) {
+		if ( expected.z - floor.z > NAV_SMOOTH_MAX_DIP ) {
 			return false;
 		}
 	}
 
 	return true;
+}
+
+/*
+================
+rvNavMesh::FindLink
+================
+*/
+int rvNavMesh::FindLink( int fromNode, int toNode ) const {
+	if ( fromNode < 0 || fromNode >= nodes.Num() ) {
+		return -1;
+	}
+
+	for ( int l = nodes[fromNode].firstLink; l != -1; l = links[l].next ) {
+		if ( links[l].node == toNode ) {
+			return l;
+		}
+	}
+
+	return -1;
+}
+
+/*
+================
+rvNavMesh::LinkTraversable
+
+Generation records the map's topology, but solid movers can change after the
+mesh is built.  Validate only the links on a selected route (rather than every
+edge A* examines) and let the caller exclude any stale link before searching
+again.  Ordinary doors remain usable because approaching them activates them.
+================
+*/
+bool rvNavMesh::LinkTraversable( int fromNode, int linkIndex ) const {
+	if ( fromNode < 0 || fromNode >= nodes.Num() ||
+		 linkIndex < 0 || linkIndex >= links.Num() ) {
+		return false;
+	}
+
+	const navLink_t &link = links[linkIndex];
+	if ( link.node < 0 || link.node >= nodes.Num() ) {
+		return false;
+	}
+
+	switch ( link.travelType ) {
+		case NAVTRAVEL_WALK:
+		case NAVTRAVEL_DROP:
+		case NAVTRAVEL_JUMP: {
+			idVec3 start = nodes[fromNode].origin;
+			idVec3 end = nodes[link.node].origin;
+			trace_t trace;
+
+			start.z += NAV_GROUND_OFFSET;
+			end.z += NAV_GROUND_OFFSET;
+
+			// The static world and traversal type were proven when this graph edge
+			// was generated.  Only dynamic solid entities can make that proof stale.
+			return NavEntityTranslationThroughDoors( trace, start, end, navAgentModel );
+		}
+
+		case NAVTRAVEL_JUMPPAD:
+		case NAVTRAVEL_TELEPORT: {
+			if ( link.actionEntityNum < 0 || link.actionEntityNum >= MAX_GENTITIES ) {
+				return false;
+			}
+
+			idEntity *action = gameLocal.entities[link.actionEntityNum];
+			if ( !action || action->targets.Num() < 1 || !action->targets[0].GetEntity() ) {
+				return false;
+			}
+
+			if ( link.travelType == NAVTRAVEL_JUMPPAD ) {
+				if ( !action->IsType( rvJumpPad::GetClassType() ) ||
+					 !action->IsActive( TH_THINK ) ) {
+					return false;
+				}
+			} else if ( !action->IsType( idTrigger_Multi::GetClassType() ) ||
+						!action->targets[0].GetEntity()->IsType( idPlayerStart::GetClassType() ) ) {
+				return false;
+			}
+
+			idBounds activationBounds;
+			return NavTravelVolumeBounds( action, activationBounds );
+		}
+
+		default:
+			return false;
+	}
 }
 
 /*
@@ -879,13 +1201,22 @@ linked - the result of a string pull - are walked.
 ================
 */
 int rvNavMesh::LinkTravelType( int fromNode, int toNode ) const {
-	for ( int l = nodes[fromNode].firstLink; l != -1; l = links[l].next ) {
-		if ( links[l].node == toNode ) {
-			return links[l].travelType;
-		}
-	}
+	const int link = FindLink( fromNode, toNode );
+	return ( link != -1 ) ? links[link].travelType : NAVTRAVEL_WALK;
+}
 
-	return NAVTRAVEL_WALK;
+/*
+================
+rvNavMesh::LinkActionEntity
+
+Volume traversal has to retain the pad or trigger that owns the graph edge.
+The bot uses its live bounds to enter the volume before steering toward the
+remote exit.
+================
+*/
+int rvNavMesh::LinkActionEntity( int fromNode, int toNode ) const {
+	const int link = FindLink( fromNode, toNode );
+	return ( link != -1 ) ? links[link].actionEntityNum : -1;
 }
 
 /*
@@ -906,12 +1237,35 @@ void rvNavMesh::StringPull( const idList<int> &nodePath, const idVec3 &goal, rvN
 		// How far ahead smoothing is even allowed to look: never past a link
 		// that has to be travelled deliberately.
 		int limit = Min( i + NAV_SMOOTH_LOOKAHEAD, nodePath.Num() - 1 );
+		int immediateTravel = NAVTRAVEL_WALK;
 
 		for ( int j = i + 1; j <= limit; j++ ) {
-			if ( LinkTravelType( nodePath[j - 1], nodePath[j] ) != NAVTRAVEL_WALK ) {
+			const int travelType = LinkTravelType( nodePath[j - 1], nodePath[j] );
+			if ( travelType != NAVTRAVEL_WALK ) {
 				limit = j - 1;
+				if ( j == i + 1 ) {
+					immediateTravel = travelType;
+				}
 				break;
 			}
+		}
+
+		// A mature reachability carries both its entry and exit.  If the route
+		// begins with an action (or resumes immediately after one), preserve the
+		// source explicitly before its destination.  The bot can then align
+		// with a jump takeoff or enter a pad/teleporter volume instead of aiming
+		// directly at a remote endpoint.
+		if ( immediateTravel != NAVTRAVEL_WALK ) {
+			const idVec3 &source = nodes[nodePath[i]].origin;
+			if ( path.Num() == 0 ||
+				 ( path[path.Num() - 1].origin - source ).LengthSqr() > 1.0f ) {
+				path.Append( source, NAVTRAVEL_WALK );
+			}
+
+			path.Append( nodes[nodePath[i + 1]].origin, immediateTravel,
+						 LinkActionEntity( nodePath[i], nodePath[i + 1] ) );
+			i++;
+			continue;
 		}
 
 		// Walk forward while the shortcut still holds.  Stopping at the first
@@ -929,9 +1283,36 @@ void rvNavMesh::StringPull( const idList<int> &nodePath, const idVec3 &goal, rvN
 	}
 
 	// Finish at the caller's actual goal rather than the node under it, but
-	// only when walking straight there is safe.
-	if ( path.Num() == 0 || WalkableLine( path[path.Num() - 1].origin, goal ) ) {
+	// only when walking straight there is safe.  The old empty-path shortcut
+	// skipped this proof when start and goal snapped to the same node, which
+	// could invent a walk through a wall or between stacked floors.
+	const idVec3 &lastOrigin = ( path.Num() > 0 )
+		? path[path.Num() - 1].origin
+		: nodes[nodePath[0]].origin;
+
+	if ( WalkableLine( lastOrigin, goal ) ) {
 		path.Append( goal, NAVTRAVEL_WALK );
+	}
+}
+
+/*
+================
+rvNavMesh::BeginSearch
+
+The serial-tagged scratch arrays avoid clearing tens of thousands of entries
+for every query.  Reset them explicitly before the signed serial can wrap;
+otherwise a very long-running server could inherit stale open/closed tags.
+================
+*/
+void rvNavMesh::BeginSearch( void ) const {
+	if ( searchSerial >= 0x7ffffffe ) {
+		for ( int i = 0; i < openTag.Num(); i++ ) {
+			openTag[i] = 0;
+			closedTag[i] = 0;
+		}
+		searchSerial = 1;
+	} else {
+		searchSerial++;
 	}
 }
 
@@ -1002,16 +1383,15 @@ int rvNavMesh::HeapPop( void ) const {
 ================
 rvNavMesh::FindPath
 
-A* with a euclidean heuristic.  The scratch arrays are tagged with a search
-serial instead of being cleared, so a search costs only the nodes it opens.
-Improved nodes are re-pushed rather than sifted in place, and the stale copies
-are discarded when they surface, which is cheaper than tracking heap positions.
+A* uses Euclidean distance scaled by the cheapest cost-to-distance ratio in the
+graph.  This remains admissible and consistent for jump pads and teleporters,
+without making every search on those maps a wide Dijkstra pass.
 
-The heuristic is not admissible: a teleporter crosses the map for a flat cost
-far below the straight line distance, so a route through one can be undervalued
-and A* may settle for a slightly longer path than the true optimum.  That is a
-deliberate trade - the alternative is a zero heuristic and a much wider search -
-and it never yields an invalid path, only an imperfect one.
+The generated graph describes topology, not a promise that every mover remains
+where it was at build time.  After A* selects a route, only that small set of
+edges is checked against live collision.  Blocked edges are excluded and A* is
+retried, allowing a bot to choose another corridor without tracing every link
+the search merely considered.
 ================
 */
 bool rvNavMesh::FindPath( const idVec3 &start, const idVec3 &goal, rvNavPath &path ) const {
@@ -1021,8 +1401,26 @@ bool rvNavMesh::FindPath( const idVec3 &start, const idVec3 &goal, rvNavPath &pa
 		return false;
 	}
 
-	const int startNode = FindNearestNode( start );
-	const int goalNode  = FindNearestNode( goal );
+	idVec3 routeStart = start;
+	idVec3 routeGoal = goal;
+
+	// A player can legitimately request a route while airborne.  Preserve the
+	// strict endpoint proof for grounded items and objectives, but route an
+	// endpoint that is clearly more than one step above standable ground from or
+	// to that landing point.  A grounded endpoint starts its hull sweep touching
+	// the floor and therefore cannot project through it onto a stacked level.
+	idVec3 projected;
+	if ( SampleFloor( start, NAV_MAX_DROP, projected ) &&
+		 start.z - projected.z > pm_stepsize.GetFloat() ) {
+		routeStart = projected;
+	}
+	if ( SampleFloor( goal, NAV_MAX_DROP, projected ) &&
+		 goal.z - projected.z > pm_stepsize.GetFloat() ) {
+		routeGoal = projected;
+	}
+
+	const int startNode = FindNearestNode( routeStart, 256.0f, true );
+	const int goalNode  = FindNearestNode( routeGoal, 256.0f, true );
 
 	if ( startNode == -1 || goalNode == -1 ) {
 		return false;
@@ -1033,81 +1431,175 @@ bool rvNavMesh::FindPath( const idVec3 &start, const idVec3 &goal, rvNavPath &pa
 
 	if ( startNode == goalNode ) {
 		// Same cell, but "same cell" is not the same as "nothing in the way" -
-		// a pillar can sit between the two points.
-		if ( !WalkableLine( start, goal ) ) {
-			path.Append( nodes[goalNode].origin, NAVTRAVEL_WALK );
+		// a pillar can sit between the two exact points.  Both endpoints snapped
+		// to this node through individually walkable legs, so use the node as a
+		// real corner when the direct shortcut is blocked.  Recheck the outbound
+		// direction because WalkableLine's floor sampling is directional.
+		if ( !WalkableLine( routeStart, routeGoal ) ) {
+			const idVec3 &via = nodes[startNode].origin;
+			if ( !WalkableLine( routeStart, via ) || !WalkableLine( via, routeGoal ) ) {
+				return false;
+			}
+
+			if ( ( via - routeStart ).LengthSqr() > 1.0f &&
+				 ( via - routeGoal ).LengthSqr() > 1.0f ) {
+				path.Append( via, NAVTRAVEL_WALK );
+			}
 		}
-		path.Append( goal, NAVTRAVEL_WALK );
-		return true;
+
+		if ( path.Num() == 0 ||
+			 ( path[path.Num() - 1].origin - routeGoal ).LengthSqr() > 1.0f ) {
+			path.Append( routeGoal, NAVTRAVEL_WALK );
+		}
+
+		const float exactCost = path.LengthFrom( start );
+		path.SetTravelCost( start, exactCost );
+		return path.Num() > 0;
 	}
 
-	searchSerial++;
-
 	const idVec3 goalOrigin = nodes[goalNode].origin;
+	idList<int> rejectedLinks;
+	rejectedLinks.SetGranularity( 16 );
 
-	heap.SetNum( 0, false );
+	for ( int repair = 0; repair <= NAV_MAX_ROUTE_REPAIRS; repair++ ) {
+		BeginSearch();
+		heap.SetNum( 0, false );
 
-	gScore[startNode]	= 0.0f;
-	fScore[startNode]	= ( goalOrigin - nodes[startNode].origin ).Length();
-	cameFrom[startNode]	= -1;
-	openTag[startNode]	= searchSerial;
+		gScore[startNode]	= 0.0f;
+		fScore[startNode]	= heuristicScale *
+			( goalOrigin - nodes[startNode].origin ).Length();
+		cameFrom[startNode]	= -1;
+		openTag[startNode]	= searchSerial;
 
-	HeapPush( startNode, fScore[startNode] );
+		HeapPush( startNode, fScore[startNode] );
 
-	bool found = false;
+		bool found = false;
+		while ( heap.Num() ) {
+			const int current = HeapPop();
 
-	while ( heap.Num() ) {
-		const int current = HeapPop();
+			// A stale copy of a node that has already been expanded.
+			if ( closedTag[current] == searchSerial ) {
+				continue;
+			}
+			closedTag[current] = searchSerial;
 
-		// A stale copy of a node that has already been expanded.
-		if ( closedTag[current] == searchSerial ) {
-			continue;
+			if ( current == goalNode ) {
+				found = true;
+				break;
+			}
+
+			for ( int l = nodes[current].firstLink; l != -1; l = links[l].next ) {
+				bool rejected = false;
+				for ( int r = 0; r < rejectedLinks.Num(); r++ ) {
+					if ( rejectedLinks[r] == l ) {
+						rejected = true;
+						break;
+					}
+				}
+				if ( rejected ) {
+					continue;
+				}
+
+				const int next = links[l].node;
+				const float tentative = gScore[current] + links[l].cost;
+
+				if ( openTag[next] == searchSerial && tentative >= gScore[next] ) {
+					continue;
+				}
+
+				openTag[next]	= searchSerial;
+				gScore[next]	= tentative;
+				fScore[next]	= tentative + heuristicScale *
+					( goalOrigin - nodes[next].origin ).Length();
+				cameFrom[next]	= current;
+
+				HeapPush( next, fScore[next] );
+			}
 		}
-		closedTag[current] = searchSerial;
 
-		if ( current == goalNode ) {
-			found = true;
-			break;
+		if ( !found ) {
+			path.Clear();
+			return false;
 		}
 
-		for ( int l = nodes[current].firstLink; l != -1; l = links[l].next ) {
-			const int	next		= links[l].node;
-			const float tentative	= gScore[current] + links[l].cost;
+		// Unwind, then reverse.
+		idList<int> nodePath;
+		nodePath.SetGranularity( 64 );
 
-			if ( openTag[next] == searchSerial && tentative >= gScore[next] ) {
+		for ( int node = goalNode; node != -1; node = cameFrom[node] ) {
+			nodePath.Append( node );
+		}
+
+		for ( int i = 0, j = nodePath.Num() - 1; i < j; i++, j-- ) {
+			const int swap = nodePath[i];
+			nodePath[i] = nodePath[j];
+			nodePath[j] = swap;
+		}
+
+		// Recheck only the selected route against the current collision world.
+		// Add every stale edge found in this pass, so wide blockers usually need
+		// one repair search rather than one search per blocked cell.
+		bool routeValid = true;
+		for ( int i = 0; i + 1 < nodePath.Num(); i++ ) {
+			const int link = FindLink( nodePath[i], nodePath[i + 1] );
+			if ( link == -1 ) {
+				path.Clear();
+				return false;
+			}
+			if ( LinkTraversable( nodePath[i], link ) ) {
 				continue;
 			}
 
-			openTag[next]	= searchSerial;
-			gScore[next]	= tentative;
-			fScore[next]	= tentative + ( goalOrigin - nodes[next].origin ).Length();
-			cameFrom[next]	= current;
-
-			HeapPush( next, fScore[next] );
+			rejectedLinks.Append( link );
+			routeValid = false;
 		}
+
+		if ( !routeValid ) {
+			continue;
+		}
+
+		const float exactTravelCost =
+			( routeStart - start ).Length() +
+			( nodes[startNode].origin - routeStart ).Length() +
+			gScore[goalNode] +
+			( routeGoal - nodes[goalNode].origin ).Length();
+
+		StringPull( nodePath, routeGoal, path );
+
+		// The routed start (the exact origin or an airborne landing projection) was
+		// proven against startNode when it was selected, but a later string pull can
+		// replace that first node with a farther corner.  Two individually clear legs
+		// around a wall do not prove their diagonal.  Put the start node back when
+		// that final shortcut is not itself clear.
+		if ( path.Num() > 0 && !WalkableLine( routeStart, path[0].origin ) ) {
+			rvNavPath safeStartPath;
+			safeStartPath.Append( nodes[startNode].origin, NAVTRAVEL_WALK );
+
+			for ( int i = 0; i < path.Num(); i++ ) {
+				safeStartPath.Append( path[i].origin, path[i].travelType,
+									  path[i].actionEntityNum );
+			}
+
+			path = safeStartPath;
+		}
+
+		// StringPull deliberately refuses an unsafe final shortcut from the last
+		// sampled node to the exact goal or projected landing point.  That refusal is
+		// a failed route, not a useful partial path: handing it to goal selection
+		// makes the bot arrive at the wall or wrong floor and immediately choose the
+		// same target again.
+		if ( path.Num() == 0 ||
+			 ( path[path.Num() - 1].origin - routeGoal ).LengthSqr() > 1.0f ) {
+			path.Clear();
+			return false;
+		}
+
+		path.SetTravelCost( start, exactTravelCost );
+		return true;
 	}
 
-	if ( !found ) {
-		return false;
-	}
-
-	// Unwind, then reverse.
-	idList<int> nodePath;
-	nodePath.SetGranularity( 64 );
-
-	for ( int node = goalNode; node != -1; node = cameFrom[node] ) {
-		nodePath.Append( node );
-	}
-
-	for ( int i = 0, j = nodePath.Num() - 1; i < j; i++, j-- ) {
-		const int swap = nodePath[i];
-		nodePath[i] = nodePath[j];
-		nodePath[j] = swap;
-	}
-
-	StringPull( nodePath, goal, path );
-
-	return path.Num() > 0;
+	path.Clear();
+	return false;
 }
 
 /*

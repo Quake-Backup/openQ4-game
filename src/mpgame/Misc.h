@@ -255,6 +255,7 @@ public:
 	void				Spawn( void );
 
 	virtual void		Think( void );
+	bool				GetForceFieldBounds( idBounds &bounds ) const;
 
 // RAVEN BEGIN
 // kfuller: idDamagable may want to change some things on the fly

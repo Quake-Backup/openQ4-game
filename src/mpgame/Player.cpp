@@ -15,6 +15,7 @@
 #include "vehicle/Vehicle.h"
 #include "client/ClientModel.h"
 #include "ai/AAS_tactical.h"
+#include "bots/Bot.h"
 #include "Healing_Station.h"
 #include "ai/AI_Medic.h"
 
@@ -41,6 +42,7 @@ idCVar cl_player_brightskin_enemy( "cl_player_brightskin_enemy", "0", CVAR_FLOAT
 idCVar cl_player_brightskin_team( "cl_player_brightskin_team", "0", CVAR_FLOAT | CVAR_GAME | CVAR_ARCHIVE, "teammate player brightskin strength in multiplayer", 0.0f, 1.0f );
 idCVar cl_player_brightskin_enemy_color( "cl_player_brightskin_enemy_color", "1 0.05 0.02", CVAR_GAME | CVAR_ARCHIVE, "enemy player brightskin color as RGB floats" );
 idCVar cl_player_brightskin_team_color( "cl_player_brightskin_team_color", "0.05 1 0.22", CVAR_GAME | CVAR_ARCHIVE, "teammate player brightskin color as RGB floats" );
+idCVar g_showPlayerVisibilityEffects( "g_showPlayerVisibilityEffects", "0", CVAR_GAME | CVAR_BOOL, "log which players receive the outline / rimlight / brightskin overlays and why the rest do not" );
 
 
 /*
@@ -119,6 +121,138 @@ static bool Player_UseCorpseSinkNoRagdoll( void ) {
 
 static float Player_ClampedVisibilityCVar( const idCVar &cvar ) {
 	return idMath::ClampFloat( 0.0f, 1.0f, cvar.GetFloat() );
+}
+
+// Identifies the answer the overlay decision reached, so a steady state prints one
+// line instead of one per frame. An id rather than the message text, because the
+// applied case varies along several axes and enumerating a literal per combination
+// stopped scaling the moment spectating and through-world joined the set.
+enum playerVisibilityReason_t {
+	PVR_NONE = 0,
+	PVR_NOT_MULTIPLAYER,
+	PVR_HIDDEN,
+	PVR_SPECTATING,
+	PVR_DEAD,
+	PVR_NO_VIEWER,
+	PVR_IS_VIEWER,
+	PVR_VIEWER_DEAD,
+	PVR_OTHER_INSTANCE,
+	PVR_NO_STRENGTH,
+	PVR_APPLIED,
+
+	PVR_APPLIED_TEAM_COLOR	= 1 << 8,
+	PVR_APPLIED_SPECTATING	= 1 << 9,
+	PVR_APPLIED_HEAD		= 1 << 10,
+	PVR_APPLIED_WEAPON		= 1 << 11,
+	PVR_APPLIED_THROUGH		= 1 << 12
+};
+
+/*
+================
+Player_ReportVisibilityEffects
+
+Says what happened to one player's overlays, once per change of answer. The last
+answer is forgotten while the diagnostic is off - otherwise turning it on to ask
+why a player has no overlay is met with silence, because that same answer was
+already printed the last time it was on.
+================
+*/
+static void Player_ReportVisibilityEffects( const int clientNum, const int reasonId, const char *reason ) {
+	static int lastReason[MAX_CLIENTS] = { PVR_NONE };
+
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+	if ( !g_showPlayerVisibilityEffects.GetBool() ) {
+		lastReason[clientNum] = PVR_NONE;
+		return;
+	}
+	if ( reasonId == lastReason[clientNum] ) {
+		return;
+	}
+	lastReason[clientNum] = reasonId;
+
+	const char *name = gameLocal.userInfo[clientNum].GetString( "ui_name" );
+	gameLocal.Printf( "player visibility: client %d '%s'%s %s\n",
+		clientNum,
+		( name != NULL && name[0] != '\0' ) ? name : "?",
+		botManager.IsBot( clientNum ) ? " (bot)" : "",
+		reason );
+}
+
+/*
+================
+Player_VisibilityReference
+
+The player whose side the overlays are judged from.
+
+A live viewer is its own reference. A spectator following someone borrows that
+player's side, which is what makes team colours mean the same thing to the
+spectator as to the player being followed. Free flight has no side at all, and
+that is a state the colour choice has to answer for rather than a reason to skip:
+a free spectator is exactly who most needs to see everyone.
+================
+*/
+static idPlayer *Player_VisibilityReference( idPlayer *localViewer, bool &spectatorView ) {
+	spectatorView = localViewer->spectating;
+	if ( !spectatorView ) {
+		return localViewer;
+	}
+
+	if ( localViewer->spectator >= 0 && localViewer->spectator != localViewer->entityNumber ) {
+		idPlayer *followed = gameLocal.GetClientByNum( localViewer->spectator );
+		if ( followed != NULL && !followed->spectating ) {
+			return followed;
+		}
+	}
+
+	return NULL;
+}
+
+/*
+================
+Player_VisibilityUsesTeamColor
+
+Which of the two visibility colours a player takes.
+
+With a reference player it is the ordinary question - ally or opponent. Free
+flight has no side, so in a team game the two colours become the two teams, keyed
+on the team index so the assignment holds for a whole match instead of shifting
+with whoever happens to be on screen. Outside a team game there are no sides and
+everyone reads as an opponent, which is the same single colour a player sees.
+================
+*/
+static bool Player_VisibilityUsesTeamColor( const idPlayer *reference, const idPlayer *subject ) {
+	if ( !gameLocal.IsTeamGame() ) {
+		return false;
+	}
+	if ( reference != NULL ) {
+		return reference->team == subject->team;
+	}
+
+	return subject->team == TEAM_MARINE;
+}
+
+/*
+================
+Player_VisibilityStrength
+
+A spectator is watching the whole match, so what it sees must not depend on which
+of a player's two side-specific cvars happens to be set: either one being above
+zero shows everybody. A live viewer keeps the exact cvar for the side it is
+looking at.
+================
+*/
+static float Player_VisibilityStrength( const bool spectatorView, const bool teamColor,
+		const idCVar &teamCVar, const idCVar &enemyCVar ) {
+	const float teamValue = Player_ClampedVisibilityCVar( teamCVar );
+	const float enemyValue = Player_ClampedVisibilityCVar( enemyCVar );
+
+	if ( spectatorView ) {
+		return Max( teamValue, enemyValue );
+	}
+
+	return teamColor ? teamValue : enemyValue;
 }
 
 static bool Player_ParseVisibilityColor( const char *text, idVec3 &color ) {
@@ -1753,6 +1887,8 @@ void idPlayer::Init( void ) {
 
 	lastHitFrame			= 0;
 	lastHitArmor			= false;
+	// openQ4: never carry a live hit marker across a respawn
+	rvHitMarker::Clear();
 
 	lastDmgTime				= 0;
 	
@@ -4102,38 +4238,75 @@ void idPlayer::UpdateMultiplayerVisibilityEffects( renderEntity_t *headRenderEnt
 	Player_ClearVisibilityEffects( &renderEntity );
 	Player_ClearVisibilityEffects( headRenderEnt );
 	Player_ClearVisibilityEffects( weaponRenderEnt );
+	if ( weaponRenderEnt != NULL ) {
+		weaponRenderEnt->flatDiffuseFlags = 0;
+	}
 
-	if ( !gameLocal.isMultiplayer || IsHidden() || fl.hidden || spectating || health <= 0 ) {
+	if ( !gameLocal.isMultiplayer ) {
+		Player_ReportVisibilityEffects( entityNumber, PVR_NOT_MULTIPLAYER, "skipped: not a multiplayer game" );
+		return;
+	}
+	if ( IsHidden() || fl.hidden ) {
+		Player_ReportVisibilityEffects( entityNumber, PVR_HIDDEN, "skipped: body is hidden" );
+		return;
+	}
+	if ( spectating ) {
+		Player_ReportVisibilityEffects( entityNumber, PVR_SPECTATING, "skipped: spectating, so there is no body to mark" );
+		return;
+	}
+	if ( health <= 0 ) {
+		Player_ReportVisibilityEffects( entityNumber, PVR_DEAD, "skipped: dead" );
 		return;
 	}
 
-	idPlayer *viewer = gameLocal.GetLocalPlayer();
-	if ( viewer == NULL ) {
+	idPlayer *localViewer = gameLocal.GetLocalPlayer();
+	if ( localViewer == NULL ) {
 		const int demoFollowClient = gameLocal.GetDemoFollowClient();
 		if ( demoFollowClient >= 0 ) {
-			viewer = gameLocal.GetClientByNum( demoFollowClient );
+			localViewer = gameLocal.GetClientByNum( demoFollowClient );
 		}
 	}
-	if ( viewer == NULL ) {
+	if ( localViewer == NULL ) {
+		Player_ReportVisibilityEffects( entityNumber, PVR_NO_VIEWER,
+			"skipped: no local viewer (dedicated server or demo with no follow)" );
 		return;
 	}
 
-	if ( viewer->spectating && viewer->spectator >= 0 ) {
-		idPlayer *spectatedPlayer = gameLocal.GetClientByNum( viewer->spectator );
-		if ( spectatedPlayer != NULL ) {
-			viewer = spectatedPlayer;
-		}
-	}
+	bool spectatorView = false;
+	idPlayer *reference = Player_VisibilityReference( localViewer, spectatorView );
 
-	if ( viewer == this || viewer->spectating || viewer->health <= 0 || viewer->GetInstance() != instance ) {
+	if ( reference == this ) {
+		Player_ReportVisibilityEffects( entityNumber, PVR_IS_VIEWER, "skipped: this is the viewer" );
+		return;
+	}
+	// A live viewer has to be alive to be shown anything. A spectator always is -
+	// free flight has no reference player to be alive or dead in the first place.
+	if ( !spectatorView && reference->health <= 0 ) {
+		Player_ReportVisibilityEffects( entityNumber, PVR_VIEWER_DEAD, "skipped: viewer is dead" );
+		return;
+	}
+	// Instances partition a match into separate games. A spectator belongs to one
+	// even while flying free, so the test falls back to its own.
+	const idPlayer *instanceOwner = ( reference != NULL ) ? reference : localViewer;
+	if ( instanceOwner->GetInstance() != instance ) {
+		Player_ReportVisibilityEffects( entityNumber, PVR_OTHER_INSTANCE, "skipped: viewer is in another instance" );
 		return;
 	}
 
-	const bool teammate = gameLocal.IsTeamGame() && viewer->team == team;
-	const float outlineStrength = Player_ClampedVisibilityCVar( teammate ? cl_player_outline_team : cl_player_outline_enemy );
-	const float rimlightStrength = Player_ClampedVisibilityCVar( teammate ? cl_player_rimlight_team : cl_player_rimlight_enemy );
-	const float brightSkinStrength = Player_ClampedVisibilityCVar( teammate ? cl_player_brightskin_team : cl_player_brightskin_enemy );
+	const bool teamColor = Player_VisibilityUsesTeamColor( reference, this );
+	if ( g_mpFlatOpponentWeapons.GetBool() && !teamColor && weaponRenderEnt != NULL &&
+		weaponRenderEnt->flatDiffuseColor.w > 0.0f ) {
+		weaponRenderEnt->flatDiffuseFlags = REF_FLAT_DIFFUSE;
+	}
+
+	const float outlineStrength = Player_VisibilityStrength( spectatorView, teamColor,
+		cl_player_outline_team, cl_player_outline_enemy );
+	const float rimlightStrength = Player_VisibilityStrength( spectatorView, teamColor,
+		cl_player_rimlight_team, cl_player_rimlight_enemy );
+	const float brightSkinStrength = Player_VisibilityStrength( spectatorView, teamColor,
+		cl_player_brightskin_team, cl_player_brightskin_enemy );
 	if ( outlineStrength <= 0.0f && rimlightStrength <= 0.0f && brightSkinStrength <= 0.0f ) {
+		Player_ReportVisibilityEffects( entityNumber, PVR_NO_STRENGTH, "skipped: every strength cvar that applies is zero" );
 		return;
 	}
 
@@ -4145,21 +4318,44 @@ void idPlayer::UpdateMultiplayerVisibilityEffects( renderEntity_t *headRenderEnt
 	brightSkinColor.Zero();
 
 	if ( outlineStrength > 0.0f ) {
-		outlineColor = Player_VisibilityColor( teammate, outlineStrength );
+		outlineColor = Player_VisibilityColor( teamColor, outlineStrength );
 	}
 	if ( rimlightStrength > 0.0f ) {
-		rimlightColor = Player_VisibilityColor( teammate, rimlightStrength );
+		rimlightColor = Player_VisibilityColor( teamColor, rimlightStrength );
 	}
 	if ( brightSkinStrength > 0.0f ) {
-		brightSkinColor = Player_BrightSkinColor( teammate, brightSkinStrength );
+		brightSkinColor = Player_BrightSkinColor( teamColor, brightSkinStrength );
 	}
 
-	const int outlineFlags = teammate ? REF_OUTLINE_NODEPTH : 0;
+	// An ally, and everyone once you are spectating, gets a ring wherever they are:
+	// both are cases where knowing where people stand is the whole point, and
+	// neither leaks anything the viewer is not entitled to. An opponent seen by a
+	// live player stays depth tested and bounded by what they can actually see.
+	//
+	// THROUGH_WORLD carries NODEPTH with it - the renderer draws that implication
+	// itself - but both are set here so the flags read as what was asked for.
+	const bool throughWorld = teamColor || spectatorView;
+	const int outlineFlags = throughWorld ? ( REF_OUTLINE_NODEPTH | REF_OUTLINE_THROUGH_WORLD ) : 0;
 	const float outlineWidth = idMath::ClampFloat( 0.5f, 6.0f, cl_player_outline_width.GetFloat() );
 
 	Player_SetVisibilityEffects( &renderEntity, outlineColor, outlineWidth, outlineFlags, rimlightColor, brightSkinColor );
 	Player_SetVisibilityEffects( headRenderEnt, outlineColor, outlineWidth, outlineFlags, rimlightColor, brightSkinColor );
 	Player_SetVisibilityEffects( weaponRenderEnt, outlineColor, outlineWidth, outlineFlags, rimlightColor, brightSkinColor );
+
+	// Body, head and world weapon are three separate render entities, and a missing
+	// one is the likeliest reason an overlay looks like it only half applied.
+	const int reasonId = PVR_APPLIED
+		| ( teamColor ? PVR_APPLIED_TEAM_COLOR : 0 )
+		| ( spectatorView ? PVR_APPLIED_SPECTATING : 0 )
+		| ( headRenderEnt != NULL ? PVR_APPLIED_HEAD : 0 )
+		| ( weaponRenderEnt != NULL ? PVR_APPLIED_WEAPON : 0 )
+		| ( throughWorld ? PVR_APPLIED_THROUGH : 0 );
+	Player_ReportVisibilityEffects( entityNumber, reasonId, va( "applied as %s%s (body%s%s)%s",
+		teamColor ? "team" : "opponent",
+		spectatorView ? ", spectating" : "",
+		headRenderEnt != NULL ? " + head" : ", no head",
+		weaponRenderEnt != NULL ? " + world weapon" : ", no world weapon",
+		throughWorld ? ", outline through the world" : "" ) );
 }
 
 /*
@@ -4352,13 +4548,17 @@ void idPlayer::DrawHUD( idUserInterface *_hud ) {
 			if ( weapon && weapon->GetZoomGui() && zoomed ) {
 				weapon->GetZoomGui()->Redraw( gameLocal.time );
 			}
-			if ( cursor && health > 0 ) {		
+			if ( cursor && health > 0 ) {
 				// Pass the current weapon to the cursor gui for custom crosshairs
 				int crossSize = cvarSystem->GetCVarInteger( "g_crosshairSize" );
 				crossSize = crossSize - crossSize % 8;
 				cvarSystem->SetCVarInteger( "g_crosshairSize", crossSize );
 				cursor->SetStateInt( "g_crosshairSize", crossSize );
 				cursor->Redraw( gameLocal.time );
+
+				// openQ4: over the crosshair, and under the crosshair's own
+				// gating - no marker in a gui, a vehicle, or while dead
+				rvHitMarker::Draw();
 			}
 		}	
 
@@ -8271,6 +8471,13 @@ void idPlayer::UpdateViewAngles( void ) {
 	int i;
 	idAngles delta;
 
+	if ( gameLocal.isMultiplayer && gameLocal.mpGame.ArenaCampaignLocksPlayers() ) {
+		// The Arena entrance and final tableau freeze facing as well as movement.
+		// Keep input deltas current so returning to gameplay cannot snap the view.
+		UpdateDeltaViewAngles( viewAngles );
+		return;
+	}
+
 	if ( !noclip && ( gameLocal.inCinematic || privateCameraView || gameLocal.GetCamera() || influenceActive == INFLUENCE_LEVEL2 ) ) {
 		// no view changes at all, but we still want to update the deltas or else when
 		// we get out of this mode, our view will snap to a kind of random angle
@@ -9516,6 +9723,11 @@ void idPlayer::Move( void ) {
 	} else if ( spectating || ( gameLocal.isClient && gameLocal.GetLocalPlayer() && gameLocal.GetLocalPlayer()->GetInstance() != instance ) ) {
 		physicsObj.SetContents( 0 );
 		physicsObj.SetMovementType( PM_SPECTATOR );
+	} else if ( gameLocal.isMultiplayer && gameLocal.mpGame.ArenaCampaignLocksPlayers() ) {
+		physicsObj.SetContents( health <= 0
+			? CONTENTS_CORPSE | CONTENTS_MONSTERCLIP
+			: CONTENTS_BODY | ( use_combat_bbox ? CONTENTS_SOLID : 0 ) );
+		physicsObj.SetMovementType( PM_FREEZE );
 	} else if ( health <= 0 ) {
 		physicsObj.SetContents( CONTENTS_CORPSE | CONTENTS_MONSTERCLIP );
 		physicsObj.SetMovementType( PM_DEAD );
@@ -10818,7 +11030,19 @@ void idPlayer::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &di
 		// openQ4: floating damage numbers, ported from Quake Live's damage
 		// plums.  Quake Live reports the damage the shot was worth, so armour
 		// counts towards the number rather than being subtracted from it.
-		rvDamageNumbers::ServerSend( this, attacker, methodOfDeath, damage + armorSave );
+		//
+		// The hit flags ride along for the crosshair hit marker: the damage is
+		// still to be applied below, so this is the last place that knows both
+		// what armour soaked and whether the hit is about to be fatal.
+		int hitFlags = 0;
+		if ( armorSave > 0 ) {
+			hitFlags |= HITFLAG_ARMOR;
+		}
+		if ( health - damage <= 0 && !undying ) {
+			hitFlags |= HITFLAG_KILL;
+		}
+
+		rvDamageNumbers::ServerSend( this, attacker, methodOfDeath, damage + armorSave, hitFlags );
 	}
 		
 // RAVEN BEGIN
@@ -10922,6 +11146,14 @@ void idPlayer::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &di
   	lastDamageDir.Normalize();
 	lastDamageDef = damageDef->Index();
 	lastDamageLocation = location;
+
+	// Give server-side bots the same concrete information a player gets from
+	// the hit reaction: who caused it and from which direction.  This avoids
+	// omniscient scans while allowing a sustained attack to trigger one timely
+	// dodge instead of continually postponing it through lastDmgTime.
+	if ( gameLocal.isMultiplayer && !gameLocal.isClient && damage > 0 ) {
+		botManager.OnPlayerDamaged( this, attacker, damage, dir );
+	}
 }
 
 /*
@@ -11655,8 +11887,11 @@ void idPlayer::CalculateRenderView( void ) {
 	renderView->height = SCREEN_HEIGHT;
 	renderView->viewID = 0;
 
-	// check if we should be drawing from a camera's POV
-	if ( !noclip && (gameLocal.GetCamera() || privateCameraView) ) {
+	// Arena campaign entrances and results use a local presentation camera while
+	// leaving the match participants in the world for the tableau.
+	if ( gameLocal.isMultiplayer && gameLocal.mpGame.BuildArenaCampaignPresentationView( this, renderView ) ) {
+		// The presentation view has already supplied its origin, axis, and FOV.
+	} else if ( !noclip && (gameLocal.GetCamera() || privateCameraView) ) {
 		// get origin, axis, and fov
 		if ( privateCameraView ) {
 			privateCameraView->GetViewParms( renderView );
@@ -11869,13 +12104,20 @@ void idPlayer::TriggerHitSound( bool armor ) {
 		spectated = true;
 	}
 
-	if ( cursor ) {
+	if ( cursor && rvHitMarker::CrosshairFlashEnabled() ) {
 		cursor->HandleNamedEvent( "weaponHit" );
 	}
 
 	// spectated so we get blips for a client we're following
 	// localClientNum check so listen server plays only for local player
 	if ( spectated || IsLocalClient() ) {
+		// openQ4: the marker's fallback path.  This pulse is all a pure client
+		// gets when the server withholds hit info, and it knows nothing but
+		// whether armour was in the way; rvHitMarker drops it when the hit-info
+		// pipeline has already covered the same hit.
+		rvHitMarker::Trigger( HITMARKER_DAMAGE_UNKNOWN, armor ? HITMARKER_ARMOR : 0,
+							  HITMARKER_COARSE );
+
 		const char* sound = NULL;
 
 		if ( armor ) {

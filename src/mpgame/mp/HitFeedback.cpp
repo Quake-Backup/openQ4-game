@@ -113,6 +113,34 @@ static void DrawCenteredString( float x, float y, float charWidth, float charHei
 
 /*
 ================
+HitMarkerFlagsForHit
+
+The wire flags and the marker's flags are deliberately separate types - one is a
+network format, the other is a presentation choice - so they are translated
+rather than shared.
+================
+*/
+static int HitMarkerFlagsForHit( int hitFlags ) {
+	int markerFlags = 0;
+
+	if ( hitFlags & HITFLAG_TEAM ) {
+		markerFlags |= HITMARKER_TEAM;
+	}
+	if ( hitFlags & HITFLAG_SELF ) {
+		markerFlags |= HITMARKER_SELF;
+	}
+	if ( hitFlags & HITFLAG_ARMOR ) {
+		markerFlags |= HITMARKER_ARMOR;
+	}
+	if ( hitFlags & HITFLAG_KILL ) {
+		markerFlags |= HITMARKER_KILL;
+	}
+
+	return markerFlags;
+}
+
+/*
+================
 rvDamageNumbers::rvDamageNumbers
 ================
 */
@@ -251,6 +279,11 @@ void rvDamageNumbers::ClientReceive( const idBitMsg &msg ) {
 	weapon = msg.ReadByte();
 	flags = msg.ReadByte();
 
+	// The marker wants every hit this message reports, amount or no amount: it
+	// is the cue that the shot landed, and it is the same message either way.
+	rvHitMarker::Trigger( ( damage > 0 ) ? damage : HITMARKER_DAMAGE_UNKNOWN,
+						  HitMarkerFlagsForHit( flags ), HITMARKER_PRECISE );
+
 	// g_hitFeedback 1 permits the cue but withholds the amount, and the amount
 	// is the whole of this feature
 	if ( damage <= 0 ) {
@@ -346,7 +379,7 @@ and idGameLocal::SendUnreliableMessage already forwards to whoever is
 spectating the attacker, which is what a caster wants.
 ================
 */
-void rvDamageNumbers::ServerSend( idPlayer *victim, idEntity *attacker, int weapon, int damage ) {
+void rvDamageNumbers::ServerSend( idPlayer *victim, idEntity *attacker, int weapon, int damage, int hitFlags ) {
 	idBitMsg	msg;
 	byte		msgBuf[ MAX_GAME_MESSAGE_SIZE ];
 	idPlayer *	attackingPlayer;
@@ -365,7 +398,7 @@ void rvDamageNumbers::ServerSend( idPlayer *victim, idEntity *attacker, int weap
 	}
 	attackingPlayer = static_cast< idPlayer * >( attacker );
 
-	flags = 0;
+	flags = hitFlags & ( HITFLAG_ARMOR | HITFLAG_KILL );
 	if ( attackingPlayer == victim ) {
 		flags |= HITFLAG_SELF;
 	} else if ( gameLocal.IsTeamGame() && attackingPlayer->team == victim->team ) {
@@ -394,7 +427,10 @@ void rvDamageNumbers::ServerSend( idPlayer *victim, idEntity *attacker, int weap
 	// server host has to be staged directly.  Remote spectators following the
 	// host are still served by the send above.
 	if ( attackingPlayer->entityNumber == gameLocal.localClientNum ) {
-		gameLocal.mpGame.damageNumbers.Add( origin, ( g_hitFeedback.GetInteger() >= 2 ) ? damage : 0,
-											weapon, flags );
+		const int reported = ( g_hitFeedback.GetInteger() >= 2 ) ? damage : 0;
+
+		rvHitMarker::Trigger( ( reported > 0 ) ? reported : HITMARKER_DAMAGE_UNKNOWN,
+							  HitMarkerFlagsForHit( flags ), HITMARKER_PRECISE );
+		gameLocal.mpGame.damageNumbers.Add( origin, reported, weapon, flags );
 	}
 }

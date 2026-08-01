@@ -3608,21 +3608,24 @@ void idMultiplayerGame::CommonRun( void ) {
 
 	// do this here rather than in idItem::Think() because clients don't run Think on ents outside their snap
 	if( g_simpleItems.IsModified() ) {
+		const int simpleItemStyle = idItem::GetSimpleItemStyle();
 
 		for( int i = 0; i < MAX_GENTITIES; i++ ) {
 			idEntity* ent = gameLocal.entities[ i ];
-			if( !ent || !ent->IsType( idItem::GetClassType() ) || ent->IsType( rvItemCTFFlag::GetClassType() ) ) {
+			if( !ent || !ent->IsType( idItem::GetClassType() ) ) {
 				continue;
 			}
 			
 			idItem* item = (idItem*)ent;
 
+			item->StopEffect( "fx_idle", true );
+			item->effectIdle = NULL;
 			item->FreeModelDef();
 
 			renderEntity_t* renderEntity = item->GetRenderEntity();
 			memset( renderEntity, 0, sizeof( *renderEntity ) );
 
-			item->simpleItem = g_simpleItems.GetBool() && gameLocal.isMultiplayer && !item->IsType( rvItemCTFFlag::GetClassType() );
+			item->simpleItem = simpleItemStyle == 1 && gameLocal.isMultiplayer && !item->IsType( rvItemCTFFlag::GetClassType() );
 
 			if( item->simpleItem ) {
 				renderEntity->shaderParms[ SHADERPARM_RED ]				= 1.0f;
@@ -3644,8 +3647,6 @@ void idMultiplayerGame::CommonRun( void ) {
 				renderEntity->bounds = renderEntity->hModel->Bounds( renderEntity );
 				renderEntity->axis = mat3_identity;
 
-				item->StopEffect( "fx_idle", true );
-				item->effectIdle = NULL;
 				item->SetAxis( mat3_identity );
 				if( item->pickedUp ) {
 					item->FreeModelDef();
@@ -3664,6 +3665,9 @@ void idMultiplayerGame::CommonRun( void ) {
 					item->SetSkin( item->pickupSkin );
 				}
 			}
+
+			item->UpdateFlatDiffusePresentation();
+
 			if ( !item->spawnArgs.GetBool( "dropped" ) ) {
 				if ( item->spawnArgs.GetBool( "nodrop" ) ) {
 					item->GetPhysics()->PutToRest();
@@ -6224,8 +6228,11 @@ void idMultiplayerGame::PrintMessageEvent( int to, msg_evt_t evt, int parm1, int
 		outMsg.Init( msgBuf, sizeof( msgBuf ) );
 		outMsg.WriteByte( GAME_RELIABLE_MESSAGE_DB );
 		outMsg.WriteByte( evt );
-		outMsg.WriteByte( parm1 );
-		outMsg.WriteByte( parm2 );
+		// -1 means that the event does not use this parameter. Keep the existing
+		// eight-bit wire layout, but write it as signed data so parameterless
+		// events do not overflow the bit-message diagnostics.
+		outMsg.WriteChar( parm1 );
+		outMsg.WriteChar( parm2 );
 		networkSystem->ServerSendReliableMessage( to, outMsg );
 	}
 }

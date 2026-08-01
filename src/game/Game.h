@@ -50,6 +50,7 @@ enum demoState_t {
 enum demoReliableGameMessage_t {
 	DEMO_RECORD_CLIENTNUM,
 	DEMO_RECORD_EXCLUDE,
+	DEMO_RECORD_INSTANCE,
 	DEMO_RECORD_COUNT
 };
 
@@ -243,7 +244,7 @@ public:
 	virtual void				RepeaterProcessReliableMessage( int clientNum, const idBitMsg &msg ) = 0;
 
 	// Reads a snapshot and updates the client game state.
-	virtual void				ClientReadSnapshot( int clientNum, int snapshotSequence, const int gameFrame, const int gameTime, const int dupeUsercmds, const int aheadOfServer, const idBitMsg &msg ) = 0;
+	virtual bool				ClientReadSnapshot( int clientNum, int snapshotSequence, const int gameFrame, const int gameTime, const int dupeUsercmds, const int aheadOfServer, const idBitMsg &msg, bool readEntityInstances = false ) = 0;
 
 	// Patches the network entity states at the client with a snapshot.
 	virtual bool				ClientApplySnapshot( int clientNum, int sequence ) = 0;
@@ -344,11 +345,18 @@ public:
 	// Let gamecode decide if it wants to accept demos from older releases of the engine.
 	virtual bool				ValidateDemoProtocol( int minor_ref, int minor ) = 0;
 
+	// Pure protocol query used while inspecting demos without mutating playback state.
+	virtual bool				IsDemoProtocolCompatible( int minor_ref, int minor ) const = 0;
+
+	// Game-owned schema for multi-view demo snapshot and routed-message payloads.
+	virtual void				GetMVDSchemaVersion( int &major, int &minor ) const = 0;
+	virtual bool				IsMVDSchemaCompatible( int major, int minor ) const = 0;
+
 	// Write a snapshot for server demo recording.
-	virtual void				ServerWriteServerDemoSnapshot( int sequence, idBitMsg &msg, int lastSnapshotFrame ) = 0;
+	virtual void				ServerWriteServerDemoSnapshot( int sequence, idBitMsg &msg, int lastSnapshotFrame, bool fullWorldInstances ) = 0;
 
 	// Read a snapshot from a server demo stream.
-	virtual void				ClientReadServerDemoSnapshot( int sequence, const int gameFrame, const int gameTime, const idBitMsg &msg ) = 0;
+	virtual bool				ClientReadServerDemoSnapshot( int sequence, const int gameFrame, const int gameTime, const idBitMsg &msg, bool fullWorldInstances ) = 0;
 
 	// Write a snapshot for repeater clients.
 	virtual void				RepeaterWriteSnapshot( int clientNum, int sequence, idBitMsg &msg, dword *clientInPVS, int numPVSClients, const userOrigin_t &pvs_origin, int lastSnapshotFrame ) = 0;
@@ -361,6 +369,7 @@ public:
 
 	// Get the currently followed client in demo playback
 	virtual int					GetDemoFollowClient( void ) = 0;
+	virtual bool				SetDemoFollowClient( int clientNum ) = 0;
 
 	// Build a bot's userCmd
 	virtual void				GetBotInput( int clientNum, usercmd_t &userCmd ) = 0;
@@ -669,7 +678,9 @@ extern rvGameLog *				gameLog;
 // 26: 1.4 beta
 // 30: 1.4
 // 37: 1.4.2
-const int GAME_API_VERSION		= 38;
+// 39: renderEntity_t flat diffuse presentation fields
+// 40: versioned MVD schema, routed instance messages, and fallible snapshot decoding
+const int GAME_API_VERSION		= 40;
 
 struct gameImport_t {
 

@@ -9,6 +9,8 @@
 
 #include "GameState.h"
 
+static const int ARENA_CAMPAIGN_ENTRANCE_MIN_MSEC = 3000;
+
 /*
 ===============================================================================
 
@@ -91,6 +93,8 @@ bool rvGameState::StartOvertime( void ) {
 	overtimeCount++;
 	overtimeAccumulatedMsec += overtimeSeconds * 1000;
 	overtimeStartTime = gameLocal.time;
+	gameLocal.Printf( "overtime: period %d extended match by %d seconds\n",
+		overtimeCount, overtimeSeconds );
 
 	// the frag limit timeout must not carry into the extension, or the match
 	// ends on the stale deadline the instant overtime begins
@@ -252,8 +256,12 @@ void rvGameState::GameStateChanged( void ) {
 
 	// Check for a currentState change
 	if( currentState != previousGameState->currentState ) {
+		const bool arenaCampaign = gameLocal.mpGame.IsArenaCampaignMatch();
 		if( currentState == WARMUP ) {
-			if( gameLocal.gameType != GAME_TOURNEY ) {
+			if ( arenaCampaign ) {
+				gameLocal.mpGame.ClearArenaCampaignPresentation();
+				player->GUIMainNotice( "" );
+			} else if( gameLocal.gameType != GAME_TOURNEY ) {
 				player->GUIMainNotice( common->GetLocalizedString( "#str_107706" ), true );		
 			}
 			soundSystem->SetActiveSoundWorld( true );
@@ -263,7 +271,9 @@ void rvGameState::GameStateChanged( void ) {
 				statManager->Init();
 			}
 		} else if( currentState == COUNTDOWN ) {
-			if( gameLocal.gameType != GAME_TOURNEY ) {
+			if ( arenaCampaign ) {
+				player->GUIMainNotice( "" );
+			} else if( gameLocal.gameType != GAME_TOURNEY ) {
 				player->GUIMainNotice( common->GetLocalizedString( "#str_107706" ), true );		
 			}
 			soundSystem->SetActiveSoundWorld(true);
@@ -278,7 +288,13 @@ void rvGameState::GameStateChanged( void ) {
 				gameLocal.mpGame.ScheduleAnnouncerSound( AS_GENERAL_TWO, nextStateTime - 2000 );
 				gameLocal.mpGame.ScheduleAnnouncerSound( AS_GENERAL_ONE, nextStateTime - 1000 );
 			}
+			if ( arenaCampaign ) {
+				gameLocal.mpGame.BeginArenaCampaignEntrancePresentation();
+			}
 		} else if( currentState == GAMEON ) {
+			if ( arenaCampaign ) {
+				gameLocal.mpGame.ClearArenaCampaignPresentation();
+			}
 			if ( !player->vsMsgState ) {
 				player->GUIMainNotice( "" );
 				player->GUIFragNotice( "" );
@@ -451,7 +467,14 @@ void rvGameState::Run( void ) {
 			
 #endif
 //RAVEN END
-			if( !gameLocal.serverInfo.GetBool( "si_warmup" ) && gameLocal.gameType != GAME_TOURNEY ) {
+			if ( gameLocal.mpGame.IsArenaCampaignMatch() ) {
+				if ( gameLocal.mpGame.AllPlayersReady() ) {
+					NewState( COUNTDOWN );
+					nextState = GAMEON;
+					nextStateTime = gameLocal.time + Max( ARENA_CAMPAIGN_ENTRANCE_MIN_MSEC,
+						1000 * gameLocal.serverInfo.GetInt( "si_countDown" ) );
+				}
+			} else if( !gameLocal.serverInfo.GetBool( "si_warmup" ) && gameLocal.gameType != GAME_TOURNEY ) {
 				// tourney always needs a warmup, to ensure that at least 2 players get seeded for the tournament.
 				NewState( GAMEON );
 			} else if ( gameLocal.mpGame.AllPlayersReady() ) {			
@@ -614,17 +637,25 @@ void rvGameState::NewState( mpGameState_t newState ) {
 			}
 
 			gameLocal.mpGame.ClearTeamScores();
+			gameLocal.mpGame.OnMatchStarted();
 
 			cvarSystem->SetCVarString( "ui_ready", "Not Ready" );
 			gameLocal.mpGame.switchThrottle[ 1 ] = 0;	// passby the throttle
 			break;
 		}
 		case GAMEREVIEW: {
+			// Capture every authoritative end-of-match consumer before review
+			// spectates the field.  This also covers disconnect/forfeit transitions
+			// that happen outside idMultiplayerGame::Run.
+			if ( currentState == GAMEON || currentState == SUDDENDEATH ) {
+				gameLocal.mpGame.OnMatchEnded();
+			}
 			statManager->EndGame();
 
 			//statManager->DebugPrint();
 			nextState = INACTIVE;	// used to abort a game. cancel out any upcoming state change
 
+			const bool keepArenaTableau = gameLocal.mpGame.IsArenaCampaignMatch();
 			for( i = 0; i < gameLocal.numClients; i++ ) {
 				idEntity *ent = gameLocal.entities[ i ];
 				// RAVEN BEGIN
@@ -639,9 +670,9 @@ void rvGameState::NewState( mpGameState_t newState ) {
 				player->inventory.carryOverWeapons = 0;
 				player->ResetCash();
 				player->forcedReady = false;
-				player->ServerSpectate( true );
-				static_cast< idPlayer *>( ent )->forcedReady = false;
-				static_cast<idPlayer *>(ent)->ServerSpectate( true );
+				if ( !keepArenaTableau ) {
+					player->ServerSpectate( true );
+				}
 // RITUAL END
 			}
 			break;
@@ -810,7 +841,7 @@ rvGameState::WeaponsLocked
 ================
 */
 bool rvGameState::WeaponsLocked( void ) const {
-	return false;
+	return gameLocal.mpGame.ArenaCampaignLocksPlayers();
 }
 // openQ4 END
 
@@ -887,10 +918,17 @@ void rvGameState::ReadNetworkInfo( idFile *file, int clientNum ) {
 	byte		msgBuf[ MAX_GAME_MESSAGE_SIZE ];
 	int			size;
 
-	file->ReadInt( size );
-	msg.Init( msgBuf, size );
+	if ( file->ReadInt( size ) != sizeof( size ) ||
+		 size <= 0 || size > static_cast<int>( sizeof( msgBuf ) ) ) {
+		common->Warning( "rvGameState::ReadNetworkInfo: invalid state size %d", size );
+		return;
+	}
+	msg.Init( msgBuf, sizeof( msgBuf ) );
 	msg.SetSize( size );
-	file->Read( msg.GetData(), size );
+	if ( file->Read( msg.GetData(), size ) != size ) {
+		common->Warning( "rvGameState::ReadNetworkInfo: truncated state" );
+		return;
+	}
 	ReceiveState( msg );
 }
 
@@ -915,16 +953,9 @@ void rvDMGameState::Run( void ) {
 	switch( currentState ) {
 		case GAMEON: {
 			player = gameLocal.mpGame.FragLimitHit();
-
-			bool tiedForFirst = false;
-			idPlayer* first = gameLocal.mpGame.GetRankedPlayer( 0 );
-			idPlayer* second = gameLocal.mpGame.GetRankedPlayer( 1 );
-
-			if( player == NULL ) {
-				if( first && second && gameLocal.mpGame.GetScore( first ) == gameLocal.mpGame.GetScore( second ) ) {
-					tiedForFirst = true;
-				}
-			}
+			int leadingScore = 0;
+			const bool tiedForFirst = player == NULL &&
+				gameLocal.mpGame.ScoreIsTied( &leadingScore );
 
 			if ( player ) {
 				// delay between detecting frag limit and ending game. let the death anims play
@@ -944,9 +975,9 @@ void rvDMGameState::Run( void ) {
 				//
 				// jshepard: OR it means that the winner killed himself during the fraglimit delay, and the
 				// game needs to roll on.
-				if( first && second && (gameLocal.mpGame.GetScore( first ) == gameLocal.mpGame.GetScore( second )) )	{
+				if( tiedForFirst ) {
 					//this is a tie...
-					if( gameLocal.mpGame.GetScore( first ) >= gameLocal.serverInfo.GetInt( "si_fragLimit" ) )	{
+					if( leadingScore >= gameLocal.serverInfo.GetInt( "si_fragLimit" ) )	{
 						// openQ4: tied at the frag limit.  Extend the match the
 						// way Quake Live does; fall back to Quake 4 sudden
 						// death only when the server has overtime turned off.
@@ -969,7 +1000,7 @@ void rvDMGameState::Run( void ) {
 					// or just end the game
 					NewState( GAMEREVIEW );
 				}
-			} else if( tiedForFirst && gameLocal.serverInfo.GetInt( "si_fragLimit" ) > 0 && gameLocal.mpGame.GetScore( first ) >= gameLocal.serverInfo.GetInt( "si_fragLimit" ) ) {
+			} else if( tiedForFirst && gameLocal.serverInfo.GetInt( "si_fragLimit" ) > 0 && leadingScore >= gameLocal.serverInfo.GetInt( "si_fragLimit" ) ) {
 				// check for the rare case that two players both hit the fraglimit the same frame
 				// two people tied at fraglimit, advance to sudden death after a delay
 				fragLimitTimeout = gameLocal.time + FRAGLIMIT_DELAY;
@@ -2165,7 +2196,13 @@ void rvTourneyGameState::UnpackState( const idBitMsg& inMsg ) {
 				int rnd = inMsg.ReadChar();
 				int maxr = inMsg.ReadByte();
 				
-				assert( rnd >= 1 ); // something is uninitialized
+				if ( startRound < 1 || startRound > MAX_ARENAS ||
+					 rnd < 1 || rnd > MAX_ARENAS ||
+					 maxr < 1 || maxr > MAX_ARENAS ) {
+					common->Warning( "Ignoring invalid tourney history range %d/%d/%d",
+						startRound, rnd, maxr );
+					break;
+				}
 
 				for( int i = startRound - 1; i <= Min( (rnd - 1), (maxr - 1) ); i++ ) {
 					for( int j = 0; j < MAX_ARENAS / (i + 1); j++ ) {

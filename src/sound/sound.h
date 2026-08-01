@@ -312,7 +312,8 @@ public:
 	virtual void			StopWritingDemo() = 0;
 
 	// read a sound command from a demo file
-	virtual void			ProcessDemoCommand( idDemoFile* demo ) = 0;
+	// returns false when malformed or truncated input stops demo playback
+	virtual bool			ProcessDemoCommand( idDemoFile* demo ) = 0;
 
 	// when cinematics are skipped, we need to advance sound time this much
 	virtual void			Skip( int time ) = 0;

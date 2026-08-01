@@ -58,6 +58,7 @@ idCVar si_dropWeaponsInBuyingModes(	"si_dropWeaponsInBuyingModes",	"0",		CVAR_GA
 idCVar si_gameType(					"si_gameType",				si_gameTypeArgs[ 0 ],	CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE, "game type - singleplayer, DM, Tourney, Team DM, CTF, Arena CTF, or DeadZone", si_gameTypeArgs, idCmdSystem::ArgCompletion_String<si_gameTypeArgs> );
 idCVar si_map(						"si_map",					"mp/q4dm1",				CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE, "map to be played next on server", idCmdSystem::ArgCompletion_MapName );
 idCVar si_mapCycle(					"si_mapCycle",				"",						CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE, "map cycle list semicolon delimited" );
+idCVar si_arenaCampaign(				"si_arenaCampaign",			"0",					CVAR_GAME | CVAR_SERVERINFO | CVAR_INTEGER, "single-player arena campaign match token, 0 for a normal multiplayer match", 0, 20 );
 // bdube: raise player limit
 idCVar si_maxPlayers(				"si_maxPlayers",			"12",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "max number of players allowed on the server", 1, 16 );
 // ddynerman: min players to start
@@ -206,6 +207,15 @@ idCVar hud_inputColor(				"hud_inputColor",			"1 0 0",		CVAR_GAME | CVAR_ARCHIVE
 idCVar hud_damageNumbers(			"hud_damageNumbers",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_INTEGER, "floating damage numbers over the players you hit: 0 off, 1 opponents only, 2 all damage you deal including team mates and yourself", 0, 2 );
 idCVar hud_damageNumberStyle(		"hud_damageNumberStyle",	"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_INTEGER, "damage number colouring: 1 white through red across the damage range, 2 one colour per damage band, 3 one colour per weapon", 1, 3 );
 idCVar hud_damageNumberScale(		"hud_damageNumberScale",	"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_FLOAT, "damage number size multiplier", 0.25f, 4.0f );
+
+// Crosshair hit marker.  Four angled marks bloom out of the crosshair and fade
+// on every hit the player lands, sized by how much the hit was worth.  It
+// replaces stock Quake 4's crosshair recolour, which hud_crosshairHitFlash can
+// bring back; turning the marker off restores that flash on its own so a player
+// is never left with no hit cue at all.
+idCVar hud_hitMarker(				"hud_hitMarker",			"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "crosshair hit marker on hits you land" );
+idCVar hud_hitMarkerScale(			"hud_hitMarkerScale",		"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_FLOAT, "hit marker size multiplier, on top of g_crosshairSize", 0.25f, 4.0f );
+idCVar hud_crosshairHitFlash(		"hud_crosshairHitFlash",	"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "recolour the crosshair on a hit, as stock Quake 4 does; implied when hud_hitMarker is off" );
 // openQ4 END
 
 // change anytime vars
@@ -547,7 +557,8 @@ idCVar g_showPlayerShadow(			"g_showPlayerShadow",		"0",			CVAR_GAME | PC_CVAR_A
 
 idCVar g_skipPlayerShadowsMP(		"g_skipPlayerShadowsMP",	"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "disables all player shadows in multiplayer" );
 idCVar g_skipItemShadowsMP(			"g_skipItemShadowsMP",		"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "disables all item shadows in multiplayer" );
-idCVar g_simpleItems(				"g_simpleItems",			"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "render icon representations of items instead of the actual model" );
+idCVar g_simpleItems(				"g_simpleItems",			"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_INTEGER, "multiplayer item presentation: 0 original models, 1 legacy icons, 2 flat icon colors, 3 flat icon colors with an upward light sweep", 0, 3 );
+idCVar g_mpFlatOpponentWeapons(		"g_mpFlatOpponentWeapons",	"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "flat-shade weapons held by multiplayer opponents using their icon colors" );
 idCVar g_showHud(					"g_showHud",				"1",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "" );
 idCVar g_showProjectilePct(			"g_showProjectilePct",		"0",			CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_BOOL, "enables display of player hit percentage" );
 // RAVEN BEGIN
@@ -723,4 +734,15 @@ idCVar bot_debug(							"bot_debug",						"0",			CVAR_GAME | CVAR_INTEGER | CVAR
 idCVar bot_debugNav(						"bot_debugNav",						"0",			CVAR_GAME | CVAR_INTEGER | CVAR_NOCHEAT, "draw the navmesh (1) and bot routes (2) near the local player" );
 idCVar bot_navCellSize(						"bot_navCellSize",					"24",			CVAR_GAME | CVAR_FLOAT | CVAR_NOCHEAT, "navmesh sampling resolution in world units; smaller finds more ground and costs more to build", 8, 64 );
 idCVar bot_pause(							"bot_pause",						"0",			CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "freeze all bot input" );
+
+// Bot personalities.  Skill is the baseline curve; a character file layers a
+// play style and a voice on top of it, so two bots at the same skill still play
+// and talk differently.
+idCVar bot_characters(						"bot_characters",					"1",			CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "give bots named characters with their own play style and voice; 0 leaves them on the plain skill curve" );
+idCVar bot_forceCharacter(					"bot_forceCharacter",				"",				CVAR_GAME, "put every bot on this one character, by name; for tuning a single personality" );
+idCVar bot_skillVariance(					"bot_skillVariance",				"0",			CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "spread bot skill this many levels either side of bot_skill, so a match is not all one difficulty", 0, 2 );
+idCVar bot_chat(							"bot_chat",							"1",			CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "bot chat: 0 silent, 1 normal, 2 chatty", 0, 2 );
+idCVar bot_chatDelay(						"bot_chatDelay",					"600",			CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "initial thinking pause before a bot starts typing, in milliseconds" );
+idCVar bot_chatCPM(							"bot_chatCPM",						"900",			CVAR_GAME | CVAR_INTEGER | CVAR_ARCHIVE, "base bot typing speed in visible characters per minute", 60, 6000 );
+idCVar bot_debugAim(						"bot_debugAim",						"0",			CVAR_GAME | CVAR_INTEGER, "log the aim and fire decisions behind every shot, for tuning skill levels" );
 

@@ -299,6 +299,7 @@ extern idCVar	g_skipPlayerShadowsMP;
 extern idCVar	g_skipItemShadowsMP;
 
 extern idCVar	g_simpleItems;
+extern idCVar	g_mpFlatOpponentWeapons;
 extern idCVar	g_showHud;
 // RAVEN BEGIN
 extern idCVar	g_crosshairColor;
@@ -306,6 +307,11 @@ extern idCVar	g_crosshairColor;
 extern idCVar	g_crosshairCustom;
 extern idCVar	g_crosshairCustomFile;
 extern idCVar	g_crosshairCharInfoFar;
+// openQ4 BEGIN
+extern idCVar	hud_hitMarker;
+extern idCVar	hud_hitMarkerScale;
+extern idCVar	hud_crosshairHitFlash;
+// openQ4 END
 // bdube: hud popups
 extern idCVar	g_showHudPopups;
 // bdube: range

@@ -119,6 +119,7 @@ protected:
 	virtual bool	CheckMatchEnd( int &winningTeam );
 	virtual int		ResolveRoundTimeout( void );
 	virtual void	RoundBegin( void );
+	virtual void	PrepareNextRound( void );
 
 private:
 	static gameStateType_t type;

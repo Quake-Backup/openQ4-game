@@ -281,6 +281,14 @@ void rvRoundGameState::RoundBegin( void ) {
 
 /*
 ================
+rvRoundGameState::PrepareNextRound
+================
+*/
+void rvRoundGameState::PrepareNextRound( void ) {
+}
+
+/*
+================
 rvRoundGameState::RoundEnd
 ================
 */
@@ -436,6 +444,7 @@ void rvRoundGameState::ScheduleNextRound( void ) {
 	// NewState( GAMEON ) has just restarted the map for the first round, so
 	// resetting again here would respawn everyone twice in two frames
 	if ( roundNumber > 0 ) {
+		PrepareNextRound();
 		ResetRound();
 	} else {
 		int i;
@@ -651,6 +660,10 @@ or has just been decided, so nobody can open fire during the countdown.
 ================
 */
 bool rvRoundGameState::WeaponsLocked( void ) const {
+	if ( rvGameState::WeaponsLocked() ) {
+		return true;
+	}
+
 	if ( currentState != GAMEON ) {
 		return false;
 	}

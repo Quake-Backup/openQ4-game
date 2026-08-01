@@ -416,8 +416,8 @@ void rvRedRoverGameState::RoundBegin( void ) {
 		return;
 	}
 
-	// a fresh round starts from an even split, or the previous round's winner
-	// simply keeps everybody
+	// Red Rover starts everyone fully stocked; PrepareNextRound has already
+	// restored the sides before ResetRound respawned them.
 	for ( i = 0; i < gameLocal.numClients; i++ ) {
 		idEntity *ent = gameLocal.entities[ i ];
 
@@ -432,6 +432,51 @@ void rvRedRoverGameState::RoundBegin( void ) {
 
 		GiveStuffToPlayer( p, "ammo", "" );
 	}
+}
+
+/*
+================
+rvRedRoverGameState::PrepareNextRound
+
+Deaths progressively move everyone onto the winning side.  Restore a stable,
+balanced roster before ResetRound respawns the field, without routing these
+between-round assignments through SwitchToTeam (which would kill and score
+players a second time).
+================
+*/
+void rvRedRoverGameState::PrepareNextRound( void ) {
+	int activePlayer = 0;
+	int teamCount[TEAM_MAX];
+
+	memset( teamCount, 0, sizeof( teamCount ) );
+
+	for ( int i = 0; i < gameLocal.numClients; i++ ) {
+		idEntity *ent = gameLocal.entities[i];
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+
+		idPlayer *player = static_cast<idPlayer *>( ent );
+		if ( !gameLocal.mpGame.CanPlay( player ) ) {
+			continue;
+		}
+
+		const int targetTeam = ( activePlayer++ & 1 ) ? TEAM_STROGG : TEAM_MARINE;
+		player->team = targetTeam;
+		player->latchedTeam = targetTeam;
+		player->GetUserInfo()->Set( "ui_team", gameLocal.mpGame.teamNames[targetTeam] );
+		if ( player->IsLocalClient() ) {
+			cvarSystem->SetCVarString( "ui_team", gameLocal.mpGame.teamNames[targetTeam] );
+		}
+
+		// Replicate the new side and refresh remote HUDs.  latchedTeam was set
+		// above so the authoritative player deliberately bypasses SwitchToTeam.
+		cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "updateUI %d\n", player->entityNumber ) );
+		teamCount[targetTeam]++;
+	}
+
+	gameLocal.Printf( "red rover: prepared round %d with %d Marine and %d Strogg players\n",
+		roundNumber + 1, teamCount[TEAM_MARINE], teamCount[TEAM_STROGG] );
 }
 
 /*

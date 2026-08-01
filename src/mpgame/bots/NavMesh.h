@@ -54,6 +54,7 @@ typedef struct navLink_s {
 	int						next;			// next link out of the same source node, -1 terminates
 	float					cost;
 	short					travelType;		// navTravelType_t
+	short					actionEntityNum;// pad/teleporter that owns this link, -1 otherwise
 } navLink_t;
 
 //----------------------------------------------------------------
@@ -64,24 +65,45 @@ typedef struct navLink_s {
 typedef struct navCorner_s {
 	idVec3					origin;
 	short					travelType;
+	short					actionEntityNum;// preserves volume identity through string pulling
 } navCorner_t;
 
 class rvNavPath {
 public:
-							rvNavPath( void ) { corners.SetGranularity( 32 ); }
+							rvNavPath( void ) {
+								corners.SetGranularity( 32 );
+								travelStart.Zero();
+								travelCost = 0.0f;
+								hasTravelCost = false;
+							}
 
-	void					Clear( void ) { corners.Clear(); }
+	void					Clear( void ) {
+								corners.Clear();
+								travelStart.Zero();
+								travelCost = 0.0f;
+								hasTravelCost = false;
+							}
 	int						Num( void ) const { return corners.Num(); }
 	bool					IsEmpty( void ) const { return corners.Num() == 0; }
 	const navCorner_t &		operator[]( int index ) const { return corners[index]; }
 
-	void					Append( const idVec3 &origin, int travelType );
+	void					Append( const idVec3 &origin, int travelType, int actionEntityNum = -1 );
 
 	// Total length of the remaining route, used to compare goals.
 	float					Length( void ) const;
+	// Weighted route cost from the exact origin used for the search.  Falls
+	// back to geometric corner length when the caller supplies another origin.
+	float					LengthFrom( const idVec3 &origin ) const;
 
 private:
+	friend class rvNavMesh;
+
+	void					SetTravelCost( const idVec3 &origin, float cost );
+
 	idList<navCorner_t>		corners;
+	idVec3					travelStart;	// exact origin used by the route search
+	float					travelCost;		// graph cost, including traversal penalties/shortcuts
+	bool					hasTravelCost;
 };
 
 //----------------------------------------------------------------
@@ -105,19 +127,26 @@ public:
 
 	const navNode_t &		GetNode( int index ) const { return nodes[index]; }
 
-	// Nearest node the given point can actually stand on.  Returns -1 when the
-	// point is off the mesh entirely.
-	int						FindNearestNode( const idVec3 &origin, float maxRadius = 256.0f ) const;
+	// Nearest sampled standable node.  Returns -1 when the point is too far
+	// from the mesh entirely.  Routing/recovery callers can require a proven
+	// walkable connection from the exact point instead of snapping through a
+	// thin wall or onto another floor layer.
+	int						FindNearestNode( const idVec3 &origin, float maxRadius = 256.0f,
+											 bool requireWalkable = false ) const;
 
 	// A* from start to goal.  Both ends are snapped onto the mesh first.  The
-	// returned path is string-pulled and always ends at goal itself.
+	// returned path is string-pulled and ends at the exact goal, except that an
+	// airborne endpoint may conservatively end at its projected landing floor.
 	bool					FindPath( const idVec3 &start, const idVec3 &goal, rvNavPath &path ) const;
 
-	// Cheap "is there any route at all" test that skips the search.
+	// Directed "is there any route at all" test.  Weak area equality is used
+	// only as an early rejection; one-way drops still require a real search.
 	bool					IsReachable( const idVec3 &start, const idVec3 &goal ) const;
 
-	// Random node in the same connected component as origin, for roaming.
-	bool					RandomReachablePoint( const idVec3 &origin, idVec3 &result ) const;
+	// Random node with a directed route from origin, for roaming.  When
+	// pathOut is supplied, the successful search is returned for immediate use.
+	bool					RandomReachablePoint( const idVec3 &origin, idVec3 &result,
+												 rvNavPath *pathOut = NULL ) const;
 
 	void					DebugDraw( const idVec3 &viewOrigin, float radius ) const;
 
@@ -135,7 +164,8 @@ private:
 
 	int						AddNode( int gx, int gy, const idVec3 &origin );
 	int						FindNode( int gx, int gy, float z ) const;
-	void					LinkNodes( int from, int to, float cost, int travelType );
+	void					LinkNodes( int from, int to, float cost, int travelType,
+									   int actionEntityNum = -1 );
 
 	// Snap a world point onto the mesh, adding a link entity's landing spot.
 	int						NodeForEntityPoint( const idVec3 &point ) const;
@@ -145,8 +175,11 @@ private:
 
 	// -- routing --
 	bool					WalkableLine( const idVec3 &from, const idVec3 &to ) const;
+	bool					LinkTraversable( int fromNode, int linkIndex ) const;
+	int						FindLink( int fromNode, int toNode ) const;
 	void					StringPull( const idList<int> &nodePath, const idVec3 &goal, rvNavPath &path ) const;
 	int						LinkTravelType( int fromNode, int toNode ) const;
+	int						LinkActionEntity( int fromNode, int toNode ) const;
 
 	// The heap carries its own ordering key.  Reading fScore[] at compare time
 	// would be wrong: relaxing a node already in the heap rewrites its score
@@ -158,6 +191,7 @@ private:
 
 	void					HeapPush( int node, float key ) const;
 	int						HeapPop( void ) const;
+	void					BeginSearch( void ) const;
 
 	idList<navNode_t>		nodes;
 	idList<navLink_t>		links;
@@ -168,10 +202,14 @@ private:
 	int						numAreas;
 
 	int						buildMsec;
+	// Smallest stored edge-cost/geometric-distance ratio.  Scaling Euclidean
+	// distance by this keeps A* admissible even with cheap long-range
+	// transports, while retaining more guidance than falling back to Dijkstra.
+	float					heuristicScale;
 
-	// Scratch state for the A* pass.  Mutable because routing is logically a
-	// const query - the alternative is allocating these on every search, and
-	// bots search often.
+	// Scratch state for the A* pass.  Mutable because routing is
+	// logically a const query - the alternative is allocating these on every
+	// search, and bots search often.
 	mutable idList<float>	gScore;
 	mutable idList<float>	fScore;
 	mutable idList<int>		cameFrom;

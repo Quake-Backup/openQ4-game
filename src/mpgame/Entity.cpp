@@ -1631,7 +1631,9 @@ void idEntity::Present( void ) {
 
 	// don't render server demo stuff that's not in our instance
 	if ( gameLocal.IsServerDemoPlaying() ) {
-		if ( instance != 0 ) {
+		const idPlayer *demoViewer = gameLocal.GetLocalPlayer();
+		const int demoInstance = demoViewer != NULL ? demoViewer->GetInstance() : 0;
+		if ( instance != demoInstance ) {
 			FreeModelDef();
 			return;
 		}

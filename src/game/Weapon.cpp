@@ -1147,6 +1147,12 @@ void rvWeapon::InitWorldModel( void ) {
 	const char *model = spawnArgs.GetString( "model_world" );
 	const char *attach = spawnArgs.GetString( "joint_attach" );
 
+	renderEntity_t *worldModelRenderEntity = ent->GetRenderEntity();
+	if ( worldModelRenderEntity ) {
+		worldModelRenderEntity->flatDiffuseColor.Zero();
+		worldModelRenderEntity->flatDiffuseFlags = 0;
+	}
+
 	if ( model[0] && attach[0] ) {
 		ent->Show();
 		ent->SetModel( model );
@@ -1157,11 +1163,14 @@ void rvWeapon::InitWorldModel( void ) {
 		ent->GetPhysics()->SetAxis( mat3_identity );
 
 		// supress model in player views, but allow it in mirrors and remote views
-		renderEntity_t *worldModelRenderEntity = ent->GetRenderEntity();
+		worldModelRenderEntity = ent->GetRenderEntity();
 		if ( worldModelRenderEntity ) {
 			worldModelRenderEntity->suppressSurfaceInViewID = owner->entityNumber+1;
 			worldModelRenderEntity->suppressShadowInViewID = owner->entityNumber+1;
 			worldModelRenderEntity->suppressShadowInLightID = GetFirstPersonShadowSuppressLightId();
+			if ( gameLocal.isMultiplayer ) {
+				idItem::ResolveFlatDiffuseColor( spawnArgs, worldModelRenderEntity->flatDiffuseColor );
+			}
 		}
 	} else {
 		ent->SetModel( "" );

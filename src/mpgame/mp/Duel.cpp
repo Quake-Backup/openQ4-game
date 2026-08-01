@@ -231,18 +231,24 @@ arena restricted to two people at a time.
 void rvDuelGameState::Run( void ) {
 	int i;
 
+	// Seed the two seats before the base state machine runs.  WARMUP can become
+	// COUNTDOWN inside rvDMGameState::Run() on the very frame the second player
+	// joins; doing this afterwards misses the only setup-state promotion window
+	// and leaves both players permanently classified as waiting spectators.
+	if ( !gameLocal.isClient ) {
+		UpdateQueue();
+
+		// Only fill empty seats while a match is being set up, so a duel is never
+		// interrupted by a third player walking in.
+		if ( currentState == WARMUP || currentState == INACTIVE || currentState == NEXTGAME ) {
+			PromoteFromQueue();
+		}
+	}
+
 	rvDMGameState::Run();
 
 	if ( gameLocal.isClient ) {
 		return;
-	}
-
-	UpdateQueue();
-
-	// only fill empty seats while a match is being set up, so a duel is never
-	// interrupted by a third player walking in
-	if ( currentState == WARMUP || currentState == INACTIVE || currentState == NEXTGAME ) {
-		PromoteFromQueue();
 	}
 
 	// hold everyone who is not a contender in spectator

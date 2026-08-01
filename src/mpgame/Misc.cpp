@@ -1263,6 +1263,25 @@ void idForceField::Spawn( void ) {
 }
 
 /*
+================
+idForceField::GetForceFieldBounds
+
+The brush clip belongs to idForce_Field after Spawn, not to the entity physics
+object.  Navigation and other systems that need the live activation volume
+must query the model that actually evaluates contacts.
+================
+*/
+bool idForceField::GetForceFieldBounds( idBounds &bounds ) const {
+	const idClipModel *clipModel = forceField.GetClipModel();
+	if ( !clipModel ) {
+		return false;
+	}
+
+	bounds = clipModel->GetAbsBounds();
+	return true;
+}
+
+/*
 ===============
 idForceField::Event_Toggle
 ================

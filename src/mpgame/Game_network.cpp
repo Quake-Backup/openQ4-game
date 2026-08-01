@@ -835,7 +835,43 @@ idGameLocal::WriteSnapshot
 Write a snapshot of the current game state for the given client.
 ================
 */
-void idGameLocal::WriteSnapshot( snapshot_t *&clientSnapshot, entityState_t *entityStates[MAX_GENTITIES], int PVS[ENTITY_PVS_SIZE], idMsgQueue &unreliable, int sequence, idBitMsg &msg, int transmitEntity, int transmitEntity2, int instance, bool doPVS, const idBounds &pvs_bounds, int lastSnapshotFrame ) {
+/*
+================
+idGameLocal::SnapshotExemptFromPVS
+
+An outline drawn wherever a player is needs that player replicated, and the PVS
+gate is what would otherwise stop it. Only the players the recipient is already
+entitled to see are exempted:
+
+  - every player, when the recipient is spectating. A spectator is watching the
+    whole match; that is what spectating is.
+  - players on the recipient's own team. You are allowed to know where your allies
+    are, and a team outline is only that knowledge drawn.
+
+Opponents of a live player are deliberately not exempt. Sending every client the
+position of every enemy would turn a wallhack into a matter of reading packets
+rather than of beating the game, and this gate is the only thing preventing that.
+So enemy outlines stay bounded by what the player could actually see.
+================
+*/
+bool idGameLocal::SnapshotExemptFromPVS( const idEntity *ent, bool exemptAllPlayers, int exemptTeam ) const {
+	if ( ent == NULL || ent->entityNumber >= MAX_CLIENTS || !ent->IsType( idPlayer::GetClassType() ) ) {
+		return false;
+	}
+
+	const idPlayer *other = static_cast<const idPlayer *>( ent );
+	// Nothing to mark, so nothing worth the bandwidth.
+	if ( other->spectating || other->health <= 0 ) {
+		return false;
+	}
+	if ( exemptAllPlayers ) {
+		return true;
+	}
+
+	return IsTeamGame() && exemptTeam != TEAM_NONE && other->team == exemptTeam;
+}
+
+void idGameLocal::WriteSnapshot( snapshot_t *&clientSnapshot, entityState_t *entityStates[MAX_GENTITIES], int PVS[ENTITY_PVS_SIZE], idMsgQueue &unreliable, int sequence, idBitMsg &msg, int transmitEntity, int transmitEntity2, int instance, bool doPVS, const idBounds &pvs_bounds, int lastSnapshotFrame, bool pvsExemptAllPlayers, int pvsExemptTeam, bool writeEntityInstances ) {
 	int i, msgSize, msgWriteBit;
 	idEntity *ent;
 	pvsHandle_t pvsHandle = { 0, 0 };	// shut warning
@@ -902,10 +938,17 @@ void idGameLocal::WriteSnapshot( snapshot_t *&clientSnapshot, entityState_t *ent
 
 		// if the entity is not in the player PVS
 		if ( doPVS && !ent->PhysicsTeamInPVS( pvsHandle ) && ent->entityNumber != transmitEntity && ent->entityNumber != transmitEntity2 ) {
-			continue;
+			// A player this recipient may see wherever they are still has to reach
+			// them, or no renderer change could draw an outline for someone the
+			// client was never told about. Everything that survives this is marked
+			// in snapshot->pvs below like any other entity, so the client treats it
+			// as present rather than as something that just popped in.
+			if ( !SnapshotExemptFromPVS( ent, pvsExemptAllPlayers, pvsExemptTeam ) ) {
+				continue;
+			}
 		}
 
-		if ( ent->GetInstance() != instance ) {
+		if ( !writeEntityInstances && ent->GetInstance() != instance ) {
 			continue;
 		}
 
@@ -955,6 +998,10 @@ void idGameLocal::WriteSnapshot( snapshot_t *&clientSnapshot, entityState_t *ent
 		deltaMsg.WriteBits( spawnIds[ ent->entityNumber ], 32 - GENTITYNUM_BITS );
 		assert( ent->entityDefNumber > 0 );
 		deltaMsg.WriteBits( ent->entityDefNumber, entityDefBits );
+		if ( writeEntityInstances ) {
+			assert( ent->GetInstance() >= 0 && ent->GetInstance() < MAX_INSTANCES );
+			deltaMsg.WriteBits( idMath::ClampInt( 0, MAX_INSTANCES - 1, ent->GetInstance() ), ASYNC_PLAYER_INSTANCE_BITS );
+		}
 
 		// write the class specific data to the snapshot
 		ent->WriteToSnapshot( deltaMsg );
@@ -1044,6 +1091,13 @@ void idGameLocal::ServerWriteSnapshot( int clientNum, int sequence, idBitMsg &ms
 		spectated = player;
 	}
 
+	// Which players this client may see wherever they stand. A spectator watches
+	// the whole match; a live player is entitled to its own team. The team is taken
+	// from the player being spectated when there is one, so a follow spectator sees
+	// exactly what the player it follows would.
+	const bool pvsExemptAllPlayers = player->spectating;
+	const int pvsExemptTeam = ( !pvsExemptAllPlayers && IsTeamGame() ) ? spectated->team : TEAM_NONE;
+
 	WriteSnapshot(
 		clientSnapshots[ clientNum ],
 		clientEntityStates[ clientNum ],
@@ -1056,7 +1110,9 @@ void idGameLocal::ServerWriteSnapshot( int clientNum, int sequence, idBitMsg &ms
 		player->GetInstance(),
 		true,
 		spectated->GetPlayerPhysics()->GetAbsBounds(),
-		lastSnapshotFrame
+		lastSnapshotFrame,
+		pvsExemptAllPlayers,
+		pvsExemptTeam
 	);
 
 	unreliableMessages[ clientNum ].Init( 0 ); // Flush
@@ -1077,7 +1133,7 @@ void idGameLocal::ServerWriteSnapshot( int clientNum, int sequence, idBitMsg &ms
 idGameLocal::ServerWriteServerDemoSnapshot
 ===============
 */
-void idGameLocal::ServerWriteServerDemoSnapshot( int sequence, idBitMsg &msg, int lastSnapshotFrame ) {
+void idGameLocal::ServerWriteServerDemoSnapshot( int sequence, idBitMsg &msg, int lastSnapshotFrame, bool fullWorldInstances ) {
 	bool ret = ApplySnapshot( clientSnapshots[ MAX_CLIENTS ], clientEntityStates[ MAX_CLIENTS ], clientPVS[ MAX_CLIENTS ], sequence - 1 );
 	ret = ret;	// shut the warning
 	assert( ret || sequence == 1 );	// past the first snapshot of the server demo stream, there's always exactly one to clear
@@ -1096,7 +1152,10 @@ void idGameLocal::ServerWriteServerDemoSnapshot( int sequence, idBitMsg &msg, in
 		0,
 		false,
 		dummy_bounds,
-		lastSnapshotFrame
+		lastSnapshotFrame,
+		false,
+		TEAM_NONE,
+		fullWorldInstances
 	);
 
 	unreliableMessages[ MAX_CLIENTS ].Init( 0 ); // Flush
@@ -1132,7 +1191,11 @@ void idGameLocal::RepeaterWriteSnapshot( int clientNum, int sequence, idBitMsg &
 		0,
 		viewers[ clientNum ].nopvs ? false : true,
 		bounds,
-		lastSnapshotFrame
+		lastSnapshotFrame,
+		// A repeater viewer is a spectator by construction - it plays no part in the
+		// match - so it may see every player wherever they are.
+		true,
+		TEAM_NONE
 	);
 
 	viewerUnreliableMessages[ clientNum ].Init( 0 ); // Flush
@@ -1283,7 +1346,7 @@ void idGameLocal::ServerProcessReliableMessage( int clientNum, const idBitMsg &m
 			// This parameter is ignored - it is only used when going to client from server
 			msg.ReadString( parm, sizeof( parm ) );
 
-			mpGame.ProcessChatMessage( clientNum, id == GAME_RELIABLE_MESSAGE_TCHAT, name, text, NULL );
+			mpGame.ProcessChatMessage( clientNum, id == GAME_RELIABLE_MESSAGE_TCHAT, name, text, NULL, true );
 			break;
 		}
 		case GAME_RELIABLE_MESSAGE_VCHAT: {
@@ -1580,7 +1643,7 @@ void idGameLocal::ClientShowSnapshot( int clientNum ) const {
 idGameLocal::ReadSnapshot
 ================
 */
-void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const int gameFrame, const int gameTime, const int dupeUsercmds, const int aheadOfServer, const idBitMsg &msg ) {
+bool idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const int gameFrame, const int gameTime, const int dupeUsercmds, const int aheadOfServer, const idBitMsg &msg, bool readEntityInstances ) {
 	int						i, entityDefNumber, numBitsRead;
 	idEntity				*ent;
 	idPlayer				*player, *spectated;
@@ -1589,7 +1652,7 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 	idBitMsgDelta			deltaMsg;
 	snapshot_t				*snapshot;
 	entityState_t			*base, *newBase;
-	int						spawnId;
+	int						spawnId, entityInstance;
 	int						numSourceAreas, sourceAreas[ idEntity::MAX_PVS_AREAS ];
 
 	const idDeclEntityDef	*decl;
@@ -1628,12 +1691,17 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 
 #if ASYNC_WRITE_TAGS
 	if ( msg.ReadLong() != tagRandom.RandomInt() ) {
-		Error( "error after read unreliable" );
+		common->Warning( "ClientReadSnapshot: unreliable-message tag mismatch" );
+		return false;
 	}
 #endif
 
 	// read all entities from the snapshot
 	for ( i = msg.ReadBits( GENTITYNUM_BITS ); i != ENTITYNUM_NONE; i = msg.ReadBits( GENTITYNUM_BITS ) ) {
+		if ( i < 0 || i >= ENTITYNUM_NONE ) {
+			common->Warning( "ClientReadSnapshot: invalid or truncated entity number %d", i );
+			return false;
+		}
 		base = clientEntityStates[clientNum][i];
 		if ( base ) {
 			base->state.BeginReading();
@@ -1651,6 +1719,13 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 
 		spawnId = deltaMsg.ReadBits( 32 - GENTITYNUM_BITS );
 		entityDefNumber = deltaMsg.ReadBits( entityDefBits );
+		entityInstance = readEntityInstances ? deltaMsg.ReadBits( ASYNC_PLAYER_INSTANCE_BITS ) : -1;
+		if ( spawnId < 0 || entityDefNumber < 0 ||
+			 entityDefNumber >= declManager->GetNumDecls( DECL_ENTITYDEF ) ||
+			 ( readEntityInstances && ( entityInstance < 0 || entityInstance >= MAX_INSTANCES ) ) ) {
+			common->Warning( "ClientReadSnapshot: invalid entity header %d/%d/%d", spawnId, entityDefNumber, entityInstance );
+			return false;
+		}
 
 		ent = entities[i];
 
@@ -1670,25 +1745,31 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 			args.SetInt( "spawn_entnum", i );
 			args.Set( "name", va( "entity%d", i ) );
 
-			// assume any items spawned from a server-snapshot are in our instance
-			if ( gameLocal.GetLocalPlayer() ) {
+			if ( readEntityInstances ) {
+				args.SetInt( "instance", entityInstance );
+			} else if ( gameLocal.GetLocalPlayer() ) {
+				// Live and legacy snapshots contain only the local instance.
 				args.SetInt( "instance", gameLocal.GetLocalPlayer()->GetInstance() );
 			}
 			
-			assert( entityDefNumber >= 0 );
-			if ( entityDefNumber >= declManager->GetNumDecls( DECL_ENTITYDEF ) ) {
-				Error( "server has %d entityDefs instead of %d", entityDefNumber, declManager->GetNumDecls( DECL_ENTITYDEF ) );
-			}
 			decl = static_cast< const idDeclEntityDef * >( declManager->DeclByIndex( DECL_ENTITYDEF, entityDefNumber, false ) );
-			assert( decl && decl->GetType() == DECL_ENTITYDEF );
+			if ( decl == NULL || decl->GetType() != DECL_ENTITYDEF ) {
+				common->Warning( "ClientReadSnapshot: invalid entityDef %d", entityDefNumber );
+				return false;
+			}
 			args.Set( "classname", decl->GetName() );
 			if ( !SpawnEntityDef( args, &ent ) || !entities[i] ) {
-				Error( "Failed to spawn entity with classname '%s' of type '%s'", decl->GetName(), decl->dict.GetString( "spawnclass" ) );
+				common->Warning( "ClientReadSnapshot: failed to spawn entity '%s'", decl->GetName() );
+				return false;
 			}
 
 			if ( i < MAX_CLIENTS && i >= numClients ) {
 				numClients = i + 1;
 			}
+		}
+
+		if ( readEntityInstances && ent->GetInstance() != entityInstance ) {
+			ent->SetInstance( entityInstance );
 		}
 
 		// add the entity to the snapshot list
@@ -1709,7 +1790,10 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 		// read the player state from player entities
 		if ( ent->entityNumber < MAX_CLIENTS ) {
 			if ( deltaMsg.ReadBits( 1 ) == 1 ) {
-				assert( ent->IsType( idPlayer::GetClassType() ) );
+				if ( !ent->IsType( idPlayer::GetClassType() ) ) {
+					common->Warning( "ClientReadSnapshot: non-player entity %d has player state", ent->entityNumber );
+					return false;
+				}
 				static_cast< idPlayer * >( ent )->ReadPlayerStateFromSnapshot( deltaMsg );
 			}
 		}
@@ -1727,7 +1811,8 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 			assert( entityDefNumber >= 0 );
 			assert( entityDefNumber < declManager->GetNumDecls( DECL_ENTITYDEF ) );
 			const char * classname = declManager->DeclByIndex( DECL_ENTITYDEF, entityDefNumber, false )->GetName();
-			Error( "write to and read from snapshot out of sync for classname '%s'\n", classname );
+			common->Warning( "ClientReadSnapshot: write/read mismatch for classname '%s'", classname );
+			return false;
 		}
 #endif
 	}
@@ -1737,8 +1822,17 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 	} else {
 		player = gameLocal.GetLocalPlayer();
 	}
+	if ( player == NULL || !player->IsType( idPlayer::GetClassType() ) ) {
+		common->Warning( "ClientReadSnapshot: no valid local demo player" );
+		return false;
+	}
 
-	if ( player->spectating && player->spectator != clientNum && entities[ player->spectator ] ) {
+	if ( player->spectating &&
+		 player->spectator != clientNum &&
+		 player->spectator >= 0 &&
+		 player->spectator < MAX_CLIENTS &&
+		 entities[ player->spectator ] != NULL &&
+		 entities[ player->spectator ]->IsType( idPlayer::GetClassType() ) ) {
 		spectated = static_cast< idPlayer * >( entities[ player->spectator ] );
 	} else {
 		spectated = player;
@@ -1889,6 +1983,17 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 		deltaMsg.InitReading( &base->state, NULL, (const idBitMsg *)NULL );
 		spawnId = deltaMsg.ReadBits( 32 - GENTITYNUM_BITS );
 		entityDefNumber = deltaMsg.ReadBits( entityDefBits );
+		if ( readEntityInstances ) {
+			entityInstance = deltaMsg.ReadBits( ASYNC_PLAYER_INSTANCE_BITS );
+			if ( entityInstance < 0 || entityInstance >= MAX_INSTANCES ) {
+				common->Warning( "ClientReadSnapshot: invalid baseline instance %d", entityInstance );
+				pvs.FreeCurrentPVS( pvsHandle );
+				return false;
+			}
+			if ( ent->GetInstance() != entityInstance ) {
+				ent->SetInstance( entityInstance );
+			}
+		}
 
 		// read the class specific data from the base state
 		ent->ReadFromSnapshot( deltaMsg );
@@ -1936,6 +2041,7 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 	// process entity events
 	ClientProcessEntityNetworkEventQueue();
 
+	return true;
 }
 
 /*
@@ -1943,12 +2049,14 @@ void idGameLocal::ClientReadSnapshot( int clientNum, int snapshotSequence, const
 idGameLocal::ClientReadServerDemoSnapshot
 ===============
 */
-void idGameLocal::ClientReadServerDemoSnapshot( int sequence, const int gameFrame, const int gameTime, const idBitMsg &msg ) {
-	bool				ret = ClientApplySnapshot( MAX_CLIENTS, sequence - 1 );
-	ret = ret; // shut the warning
-	assert( ret || sequence == 1 ); // past the first snapshot of the server demo stream, there's always exactly one to clear
+bool idGameLocal::ClientReadServerDemoSnapshot( int sequence, const int gameFrame, const int gameTime, const idBitMsg &msg, bool fullWorldInstances ) {
+	const bool ret = ClientApplySnapshot( MAX_CLIENTS, sequence - 1 );
+	if ( !ret && sequence != 1 ) {
+		common->Warning( "ClientReadServerDemoSnapshot: missing baseline for sequence %d", sequence );
+		return false;
+	}
 
-	ClientReadSnapshot( MAX_CLIENTS, sequence, gameFrame, gameTime, 0, 0, msg );
+	return ClientReadSnapshot( MAX_CLIENTS, sequence, gameFrame, gameTime, 0, 0, msg, fullWorldInstances );
 }
 
 /*
@@ -1957,7 +2065,42 @@ idGameLocal::ClientReadRepeaterSnapshot
 ===============
 */
 void idGameLocal::ClientReadRepeaterSnapshot( int sequence, const int gameFrame, const int gameTime, const int aheadOfServer, const idBitMsg &msg ) {
-	ClientReadSnapshot( MAX_CLIENTS, sequence, gameFrame, gameTime, 0, aheadOfServer, msg );
+	(void)ClientReadSnapshot( MAX_CLIENTS, sequence, gameFrame, gameTime, 0, aheadOfServer, msg );
+}
+
+/*
+===============
+idGameLocal::SetDemoFollowClient
+===============
+*/
+bool idGameLocal::SetDemoFollowClient( int clientNum ) {
+	if ( !IsServerDemoPlaying() || clientNum < -1 || clientNum >= MAX_CLIENTS ) {
+		return false;
+	}
+
+	idPlayer *localPlayer = GetLocalPlayer();
+	if ( localPlayer == NULL || !localPlayer->IsFakeClient() ) {
+		return false;
+	}
+
+	idPlayer *target = NULL;
+	if ( clientNum >= 0 ) {
+		if ( entities[ clientNum ] == NULL || !entities[ clientNum ]->IsType( idPlayer::GetClassType() ) ) {
+			return false;
+		}
+		target = static_cast< idPlayer * >( entities[ clientNum ] );
+	}
+
+	followPlayer = clientNum;
+	localPlayer->spectating = true;
+	localPlayer->spectator = target != NULL ? clientNum : localPlayer->entityNumber;
+
+	if ( target != NULL && localPlayer->GetInstance() != target->GetInstance() ) {
+		localPlayer->SetInstance( target->GetInstance() );
+		mpGame.ServerSetInstance( target->GetInstance() );
+	}
+
+	return true;
 }
 
 /*
@@ -2076,11 +2219,22 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 	InitLocalClient( clientNum );
 
 	if ( IsServerDemoPlaying() ) {
+		if ( msg.GetRemainingReadBits() < 8 ) {
+			common->Warning( "Ignoring truncated server-demo reliable route" );
+			return;
+		}
 		int record_type = msg.ReadByte();
-		assert( record_type < DEMO_RECORD_COUNT );
+		if ( record_type < DEMO_RECORD_CLIENTNUM || record_type >= DEMO_RECORD_COUNT ) {
+			common->Warning( "Ignoring invalid server-demo reliable route %d", record_type );
+			return;
+		}
 		// if you need to do some special filtering:
 		switch ( record_type ) {
 		case DEMO_RECORD_CLIENTNUM: {
+			if ( msg.GetRemainingReadBits() < 8 ) {
+				common->Warning( "Ignoring truncated targeted server-demo reliable route" );
+				return;
+			}
 			toClient = msg.ReadChar();
 			if ( toClient >= 0 && toClient < MAX_CLIENTS ) {
 				// reliable was targetted
@@ -2098,8 +2252,12 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			break;
 		}
 		case DEMO_RECORD_EXCLUDE: {
+			if ( msg.GetRemainingReadBits() < 8 ) {
+				common->Warning( "Ignoring truncated excluded server-demo reliable route" );
+				return;
+			}
 			excludeClient = msg.ReadChar(); // may be -1
-			if ( excludeClient == followPlayer ) {
+			if ( excludeClient >= 0 && excludeClient == followPlayer ) {
 				if ( !isRepeater ) {
 					return;
 				} else {
@@ -2109,10 +2267,50 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			toClient = -1;
 			break;
 		}
+		case DEMO_RECORD_INSTANCE: {
+			if ( msg.GetRemainingReadBits() < 16 ) {
+				common->Warning( "Ignoring truncated instance server-demo reliable route" );
+				return;
+			}
+			excludeClient = msg.ReadChar(); // may be -1
+			const int routeInstance = msg.ReadChar();
+			if ( routeInstance < 0 || routeInstance >= MAX_INSTANCES ||
+				 excludeClient < -1 || excludeClient >= MAX_CLIENTS ) {
+				common->Warning( "Ignoring invalid instance server-demo reliable route %d/%d", routeInstance, excludeClient );
+				return;
+			}
+
+			idEntity *viewEntity = NULL;
+			if ( followPlayer >= 0 && followPlayer < MAX_CLIENTS ) {
+				viewEntity = entities[ followPlayer ];
+			}
+			if ( viewEntity == NULL ) {
+				viewEntity = GetLocalPlayer();
+			}
+			const bool routeMatches = viewEntity != NULL && viewEntity->GetInstance() == routeInstance &&
+				( excludeClient < 0 || excludeClient != followPlayer );
+			if ( !routeMatches ) {
+				if ( !isRepeater ) {
+					return;
+				}
+				noEffect = true;
+			}
+			toClient = -1;
+			break;
+		}
 		}
 	}
 
+	if ( msg.GetRemainingReadBits() < 8 ) {
+		common->Warning( "Ignoring truncated server-demo reliable message" );
+		return;
+	}
 	id = msg.ReadByte();
+	if ( id < GAME_RELIABLE_MESSAGE_SPAWN_PLAYER ||
+		 id > GAME_RELIABLE_MESSAGE_READY ) {
+		common->Warning( "Ignoring invalid server-demo reliable message %d", id );
+		return;
+	}
 
 	if ( isRepeater ) {
 		bool		inhibitRepeater = false;
@@ -2191,6 +2389,10 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 		case GAME_RELIABLE_MESSAGE_SPAWN_PLAYER: {
 			int client = msg.ReadByte();
 			int spawnId = msg.ReadLong();
+			if ( client < 0 || client >= MAX_CLIENTS ) {
+				common->Warning( "Ignoring invalid spawn-player client %d in server demo", client );
+				break;
+			}
 			if ( !entities[ client ] ) {
 				SpawnPlayer( client );
 				entities[ client ]->FreeModelDef();
@@ -2229,8 +2431,8 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 		case GAME_RELIABLE_MESSAGE_DB: {
 			msg_evt_t msg_evt = (msg_evt_t)msg.ReadByte();
 			int parm1, parm2;
-			parm1 = msg.ReadByte( );
-			parm2 = msg.ReadByte( );
+			parm1 = msg.ReadChar( );
+			parm2 = msg.ReadChar( );
 			mpGame.PrintMessageEvent( -1, msg_evt, parm1, parm2 );
 			break;
 		}
@@ -3246,19 +3448,16 @@ void idGameLocal::ServerSendInstanceReliableMessageExcluding( const idEntity* ow
 			continue;
 		}
 
-		networkSystem->ServerSendReliableMessage( i, msg );
+		networkSystem->ServerSendReliableMessageNoDemo( i, msg );
 	}
 
-	if ( owner->GetInstance() == 0 ) {
-		// record this message into the demo client if server demo is active
-		// the message will also go in the server demo data through the above individual client ServerSendReliableMessage,
-		// but will be ignored on replay unless you are following that particular client
-		networkSystem->ServerSendReliableMessage( MAX_CLIENTS, msg );
+	// Record one semantic instance route instead of duplicating every physical
+	// recipient in the demo stream.
+	networkSystem->ServerRecordInstanceReliableMessage( owner->GetInstance(), excludeClient, msg );
 
 // jmarshall - engine has no repeater reliable channel
-		//networkSystem->RepeaterSendReliableMessageExcluding( excludeClient, msg );
+	//networkSystem->RepeaterSendReliableMessageExcluding( excludeClient, msg );
 // jmarshall end
-	}
 }
 
 /*
@@ -3286,16 +3485,13 @@ void idGameLocal::ServerSendInstanceReliableMessage( const idEntity* owner, int 
 				continue;
 			}
 
-			networkSystem->ServerSendReliableMessage( i, msg );
+			networkSystem->ServerSendReliableMessageNoDemo( i, msg );
 		}
 
-		if ( owner->GetInstance() == 0 ) {
-			// see ServerSendInstanceReliableMessageExcluding
-			networkSystem->ServerSendReliableMessage( MAX_CLIENTS, msg );
+		networkSystem->ServerRecordInstanceReliableMessage( owner->GetInstance(), -1, msg );
 // jmarshall - engine has no repeater reliable channel
-			//networkSystem->RepeaterSendReliableMessage( -1, msg );
+		//networkSystem->RepeaterSendReliableMessage( -1, msg );
 // jmarshall end
-		}
 	} else {
 		assert( false ); // not used in q4mp
 		if ( entities[ clientNum ] && entities[ clientNum ]->GetInstance() == owner->GetInstance() ) {
@@ -3553,20 +3749,23 @@ void idGameLocal::SendUnreliableMessagePVS( const idBitMsg &msg, const idEntity 
 		idBitMsg	dest;
 		byte		msgBuf[ 16 ];
 
-		// Tourney games: only record from instance 0
-		if ( !instanceEnt || instanceEnt->GetInstance() == 0 ) {
-		
-			dest.Init( msgBuf, sizeof( msgBuf ) );
+		dest.Init( msgBuf, sizeof( msgBuf ) );
+		if ( instanceEnt != NULL ) {
+			dest.WriteByte( GAME_UNRELIABLE_RECORD_AREAS_INSTANCE );
+		} else {
 			dest.WriteByte( GAME_UNRELIABLE_RECORD_AREAS );
-			dest.WriteLong( area1 );
-			dest.WriteLong( area2 );
-			
-			if ( demoState == DEMO_RECORDING ) {
-				unreliableMessages[ MAX_CLIENTS ].AddConcat( dest.GetData(), dest.GetSize(), msg.GetData(), msg.GetSize(), false );
-			}
-
-			RepeaterUnreliableMessagePVS( msg, areas, numEvAreas, &dest );
 		}
+		dest.WriteLong( area1 );
+		dest.WriteLong( area2 );
+		if ( instanceEnt != NULL ) {
+			dest.WriteChar( instanceEnt->GetInstance() );
+		}
+
+		if ( demoState == DEMO_RECORDING ) {
+			unreliableMessages[ MAX_CLIENTS ].AddConcat( dest.GetData(), dest.GetSize(), msg.GetData(), msg.GetSize(), false );
+		}
+
+		RepeaterUnreliableMessagePVS( msg, areas, numEvAreas, &dest );
 	}
 }
 
@@ -3630,10 +3829,22 @@ idGameLocal::ProcessUnreliableMessage
 */
 void idGameLocal::ProcessUnreliableMessage( const idBitMsg &msg ) {
 	if ( IsServerDemoPlaying() ) {
+		if ( msg.GetRemainingReadBits() < 8 ) {
+			common->Warning( "Ignoring truncated server-demo unreliable route" );
+			return;
+		}
 		int record_type = msg.ReadByte();
-		assert( record_type < GAME_UNRELIABLE_RECORD_COUNT );
+		if ( record_type < GAME_UNRELIABLE_RECORD_CLIENTNUM ||
+			 record_type >= GAME_UNRELIABLE_RECORD_COUNT ) {
+			common->Warning( "Ignoring invalid server-demo unreliable route %d", record_type );
+			return;
+		}
 		switch ( record_type ) {
 		case GAME_UNRELIABLE_RECORD_CLIENTNUM: {
+			if ( msg.GetRemainingReadBits() < 8 ) {
+				common->Warning( "Ignoring truncated targeted server-demo unreliable route" );
+				return;
+			}
 			int client = msg.ReadChar();
 
 			RepeaterUnreliableMessage( msg, client );
@@ -3647,7 +3858,12 @@ void idGameLocal::ProcessUnreliableMessage( const idBitMsg &msg ) {
 			}
 			break;
 			}
-		case GAME_UNRELIABLE_RECORD_AREAS: {
+		case GAME_UNRELIABLE_RECORD_AREAS:
+		case GAME_UNRELIABLE_RECORD_AREAS_INSTANCE: {
+			if ( msg.GetRemainingReadBits() < ( record_type == GAME_UNRELIABLE_RECORD_AREAS_INSTANCE ? 72 : 64 ) ) {
+				common->Warning( "Ignoring truncated server-demo unreliable area route" );
+				return;
+			}
 			int areas[ 2 ];
 			int numEvAreas = 0;
 
@@ -3655,6 +3871,24 @@ void idGameLocal::ProcessUnreliableMessage( const idBitMsg &msg ) {
 			if ( areas[ numEvAreas ] != -1 ) ++numEvAreas;
 			areas[ numEvAreas ] = msg.ReadLong();
 			if ( areas[ numEvAreas ] != -1 ) ++numEvAreas;
+
+			if ( record_type == GAME_UNRELIABLE_RECORD_AREAS_INSTANCE ) {
+				const int routeInstance = msg.ReadChar();
+				if ( routeInstance < 0 || routeInstance >= MAX_INSTANCES ) {
+					common->Warning( "Ignoring invalid server-demo unreliable instance %d", routeInstance );
+					return;
+				}
+				idEntity *viewEntity = NULL;
+				if ( followPlayer >= 0 && followPlayer < MAX_CLIENTS ) {
+					viewEntity = entities[ followPlayer ];
+				}
+				if ( viewEntity == NULL ) {
+					viewEntity = GetLocalPlayer();
+				}
+				if ( viewEntity == NULL || viewEntity->GetInstance() != routeInstance ) {
+					return;
+				}
+			}
 
 			RepeaterUnreliableMessagePVS( msg, areas, numEvAreas );
 
@@ -3666,7 +3900,16 @@ void idGameLocal::ProcessUnreliableMessage( const idBitMsg &msg ) {
 		}
 	}
 
+	if ( msg.GetRemainingReadBits() < 8 ) {
+		common->Warning( "Ignoring truncated server-demo unreliable message" );
+		return;
+	}
 	int type = msg.ReadByte();
+	if ( type < GAME_UNRELIABLE_MESSAGE_EVENT ||
+		 type > GAME_UNRELIABLE_MESSAGE_HITINFO ) {
+		common->Warning( "Ignoring invalid server-demo unreliable message %d", type );
+		return;
+	}
 	switch ( type ) {
 		case GAME_UNRELIABLE_MESSAGE_EVENT: {
 			idEntityPtr<idEntity> p;
@@ -3883,14 +4126,23 @@ void idGameLocal::ReadNetworkInfo( int gameTime, idFile* file, int clientNum ) {
 	}
 
 	// spawn player entities. ( numClients is not a count but the watermark of client indexes )
-	file->ReadInt( num );
+	if ( file->ReadInt( num ) != sizeof( num ) || num < 0 || num > MAX_CLIENTS ) {
+		common->Warning( "idGameLocal::ReadNetworkInfo: invalid player count %d", num );
+		return;
+	}
+	int previousClient = -1;
 	for ( i = 0; i < num; i++ ) {
 		int icl, spawnId;
-		file->ReadInt( icl );
-		file->ReadInt( spawnId );
+		if ( file->ReadInt( icl ) != sizeof( icl ) ||
+			 file->ReadInt( spawnId ) != sizeof( spawnId ) ||
+			 icl < 0 || icl >= MAX_CLIENTS || icl <= previousClient ) {
+			common->Warning( "idGameLocal::ReadNetworkInfo: invalid player index %d", icl );
+			return;
+		}
 		SpawnPlayer( icl );
 		spawnIds[ icl ] = spawnId;
 		numClients = icl + 1;
+		previousClient = icl;
 	}
 
 	if ( !IsServerDemoPlaying() || IsRepeaterDemoPlaying() ) {
@@ -4048,6 +4300,16 @@ idGameLocal::ValidateDemoProtocol
 ===============
 */
 bool idGameLocal::ValidateDemoProtocol( int minor_ref, int minor ) {
+	demo_protocol = minor;
+	return IsDemoProtocolCompatible( minor_ref, minor );
+}
+
+/*
+===============
+idGameLocal::IsDemoProtocolCompatible
+===============
+*/
+bool idGameLocal::IsDemoProtocolCompatible( int minor_ref, int minor ) const {
 #if 0
 	// 1.1 beta : 67
 	// 1.1 final: 68
@@ -4055,12 +4317,29 @@ bool idGameLocal::ValidateDemoProtocol( int minor_ref, int minor ) {
 	// 1.3		: 71
 
 	// let 1.3 play 1.2 demos - keep a careful eye on snapshotting changes
-	demo_protocol = minor;
 	return ( minor_ref == minor || ( minor_ref == 71 && minor == 69 ) );
 #else
-	demo_protocol = minor;
 	return ( minor_ref == minor );
 #endif
+}
+
+/*
+===============
+idGameLocal::GetMVDSchemaVersion
+===============
+*/
+void idGameLocal::GetMVDSchemaVersion( int &major, int &minor ) const {
+	major = 1;
+	minor = 0;
+}
+
+/*
+===============
+idGameLocal::IsMVDSchemaCompatible
+===============
+*/
+bool idGameLocal::IsMVDSchemaCompatible( int major, int minor ) const {
+	return major == 1 && minor >= 0 && minor <= 0;
 }
 
 /*

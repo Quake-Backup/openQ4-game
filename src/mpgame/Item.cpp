@@ -24,6 +24,170 @@ const idEventDef EV_GetPlayerPos( "<getplayerpos>" );
 const idEventDef EV_HideObjective( "<hideobjective>", "e" );
 const idEventDef EV_CamShot( "<camshot>" );
 
+typedef struct itemFlatColorFallback_s {
+	const char *	nameFragment;
+	float			red;
+	float			green;
+	float			blue;
+} itemFlatColorFallback_t;
+
+// Most stock multiplayer icons are guide-expanded materials with explicit
+// red/green/blue constants.  These entries cover the stock icons that are
+// direct images (notably powerups), plus semantic fallbacks for modified decls.
+static const itemFlatColorFallback_t itemFlatColorFallbacks[] = {
+	{ "ammoregen",			1.00f, 1.00f, 0.00f },
+	{ "healthshard",		0.50f, 1.00f, 0.50f },
+	{ "healthsmall",		1.00f, 1.00f, 0.20f },
+	{ "healthlarge",		1.00f, 0.50f, 0.00f },
+	{ "healthmega",			0.00f, 0.50f, 1.00f },
+	{ "armorshard",			0.00f, 0.50f, 1.00f },
+	{ "armorsmall",			1.00f, 1.00f, 0.00f },
+	{ "armorlarge",			1.00f, 0.00f, 0.00f },
+	{ "machinegun",			1.00f, 1.00f, 0.00f },
+	{ "nailgun",			0.60f, 0.80f, 0.80f },
+	{ "railgun",			0.00f, 1.00f, 0.00f },
+	{ "shotgun",			1.00f, 0.50f, 0.00f },
+	{ "hyperblaster",		0.00f, 0.45f, 1.00f },
+	{ "blaster",			0.85f, 0.85f, 0.85f },
+	{ "rocket",				1.00f, 0.20f, 0.00f },
+	{ "grenade",			0.20f, 0.56f, 0.07f },
+	{ "lightning",			1.00f, 1.00f, 0.73f },
+	{ "darkmatter",			0.77f, 0.00f, 1.00f },
+	{ "gauntlet",			0.00f, 0.85f, 1.00f },
+	{ "napalm",				1.00f, 0.75f, 0.25f },
+	{ "item_fire",			1.00f, 0.75f, 0.25f },
+	{ "quaddamage",			0.00f, 0.94f, 1.00f },
+	{ "quad_damage",		0.00f, 0.94f, 1.00f },
+	{ "haste",				0.80f, 1.00f, 0.00f },
+	{ "regen",				1.00f, 0.00f, 0.00f },
+	{ "invis",				0.00f, 0.00f, 1.00f },
+	{ "guard",				0.00f, 0.45f, 1.00f },
+	{ "doubler",			1.00f, 0.00f, 0.00f },
+	{ "scout",				0.00f, 1.00f, 0.00f },
+	{ "deadzone",			0.93f, 0.84f, 0.52f },
+	{ "moderator",			0.85f, 0.85f, 0.85f },
+	{ "sb_flag_marine",		0.42f, 0.64f, 0.17f },
+	{ "flag_marine",		0.42f, 0.64f, 0.17f },
+	{ "marine_flag",		0.42f, 0.64f, 0.17f },
+	{ "sb_flag_strogg",		1.00f, 0.48f, 0.02f },
+	{ "flag_strogg",		1.00f, 0.48f, 0.02f },
+	{ "strogg_flag",		1.00f, 0.48f, 0.02f },
+	{ "ctf_one_flag",		0.85f, 0.85f, 0.85f }
+};
+
+static bool Item_FlatColorIsFinite( const idVec3 &color ) {
+	return !FLOAT_IS_NAN( color.x ) && !FLOAT_IS_INF( color.x ) &&
+		!FLOAT_IS_NAN( color.y ) && !FLOAT_IS_INF( color.y ) &&
+		!FLOAT_IS_NAN( color.z ) && !FLOAT_IS_INF( color.z );
+}
+
+static void Item_SetClampedFlatColor( const idVec3 &source, idVec4 &color ) {
+	color.Set(
+		idMath::ClampFloat( 0.0f, 1.0f, source.x ),
+		idMath::ClampFloat( 0.0f, 1.0f, source.y ),
+		idMath::ClampFloat( 0.0f, 1.0f, source.z ),
+		1.0f );
+}
+
+static bool Item_TryFlatColorFromName( const char *name, idVec4 &color ) {
+	if ( name == NULL || name[0] == '\0' ) {
+		return false;
+	}
+
+	idStr normalizedName = name;
+	normalizedName.ToLower();
+	const int numFallbacks = (int)( sizeof( itemFlatColorFallbacks ) / sizeof( itemFlatColorFallbacks[0] ) );
+	for ( int i = 0; i < numFallbacks; i++ ) {
+		const itemFlatColorFallback_t &fallback = itemFlatColorFallbacks[i];
+		if ( normalizedName.Find( fallback.nameFragment ) >= 0 ) {
+			color.Set( fallback.red, fallback.green, fallback.blue, 1.0f );
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool Item_TryFlatColorFromMaterial( const char *materialName, idVec4 &color ) {
+	if ( materialName == NULL || materialName[0] == '\0' ) {
+		return false;
+	}
+
+	const idMaterial *material = declManager->FindMaterial( materialName, false );
+	if ( material == NULL ) {
+		return false;
+	}
+
+	const int textLength = material->GetTextLength();
+	if ( textLength <= 0 ) {
+		return false;
+	}
+
+	idStr materialText;
+	materialText.Fill( ' ', textLength );
+	material->GetText( &materialText[0] );
+
+	idLexer lexer( LEXFL_NOERRORS | LEXFL_NOSTRINGCONCAT );
+	if ( !lexer.LoadMemory( materialText.c_str(), materialText.Length(), material->GetName() ) ) {
+		return false;
+	}
+
+	idVec3 stageColor;
+	stageColor.Zero();
+	int componentMask = 0;
+	int braceDepth = 0;
+	int stageDepth = -1;
+	idToken token;
+
+	while ( lexer.ReadToken( &token ) ) {
+		if ( token.Icmp( "{" ) == 0 ) {
+			braceDepth++;
+			if ( braceDepth == 2 ) {
+				stageDepth = braceDepth;
+				componentMask = 0;
+			}
+			continue;
+		}
+		if ( token.Icmp( "}" ) == 0 ) {
+			if ( braceDepth == stageDepth ) {
+				stageDepth = -1;
+				componentMask = 0;
+			}
+			braceDepth--;
+			continue;
+		}
+		if ( stageDepth < 0 ) {
+			continue;
+		}
+
+		int component = -1;
+		if ( token.Icmp( "red" ) == 0 ) {
+			component = 0;
+		} else if ( token.Icmp( "green" ) == 0 ) {
+			component = 1;
+		} else if ( token.Icmp( "blue" ) == 0 ) {
+			component = 2;
+		}
+		if ( component < 0 ) {
+			continue;
+		}
+
+		idToken value;
+		if ( !lexer.ReadToken( &value ) || value.type != TT_NUMBER ) {
+			componentMask &= ~( 1 << component );
+			continue;
+		}
+
+		stageColor[component] = value.GetFloatValue();
+		componentMask |= 1 << component;
+		if ( componentMask == 0x7 && Item_FlatColorIsFinite( stageColor ) ) {
+			Item_SetClampedFlatColor( stageColor, color );
+			return true;
+		}
+	}
+
+	return false;
+}
+
 // RAVEN BEGIN
 // abahr:
 const idEventDef EV_SetGravity( "<setGravity>" );
@@ -41,6 +205,77 @@ CLASS_DECLARATION( idEntity, idItem )
 // RAVEN END
 
 END_CLASS
+
+/*
+================
+idItem::GetSimpleItemStyle
+================
+*/
+int idItem::GetSimpleItemStyle( void ) {
+	return idMath::ClampInt( 0, 3, g_simpleItems.GetInteger() );
+}
+
+/*
+================
+idItem::ResolveFlatDiffuseColor
+================
+*/
+void idItem::ResolveFlatDiffuseColor( const idDict &args, idVec4 &color ) {
+	idVec3 overrideColor;
+	if ( args.GetVector( "flatDiffuseColor", NULL, overrideColor ) && Item_FlatColorIsFinite( overrideColor ) ) {
+		Item_SetClampedFlatColor( overrideColor, color );
+		return;
+	}
+
+	const char *simpleIcon = args.GetString( "mtr_simple_icon" );
+	const char *inventoryIcon = args.GetString( "inv_icon" );
+	const char *weaponIcon = args.GetString( "mtr_icon" );
+	const char *className = args.GetString( "classname" );
+
+	// Guide-expanded simple/inventory icons carry their authored RGB as literal
+	// stage constants, which is the closest representation of the icon color.
+	if ( Item_TryFlatColorFromMaterial( simpleIcon, color ) ||
+		Item_TryFlatColorFromMaterial( inventoryIcon, color ) ) {
+		return;
+	}
+
+	if ( Item_TryFlatColorFromName( simpleIcon, color ) ||
+		Item_TryFlatColorFromName( inventoryIcon, color ) ||
+		Item_TryFlatColorFromName( weaponIcon, color ) ||
+		Item_TryFlatColorFromName( className, color ) ) {
+		return;
+	}
+
+	if ( Item_TryFlatColorFromMaterial( weaponIcon, color ) ) {
+		return;
+	}
+
+	// Mods with image-only icons can opt into an exact color through
+	// flatDiffuseColor.  Until then, a restrained neutral is more readable than
+	// guessing a hue from an unavailable texture.
+	color.Set( 0.85f, 0.85f, 0.85f, 1.0f );
+}
+
+/*
+================
+idItem::UpdateFlatDiffusePresentation
+================
+*/
+void idItem::UpdateFlatDiffusePresentation( void ) {
+	renderEntity.flatDiffuseColor.Zero();
+	renderEntity.flatDiffuseFlags = 0;
+
+	const int style = GetSimpleItemStyle();
+	if ( !gameLocal.isMultiplayer || simpleItem || style < 2 ) {
+		return;
+	}
+
+	ResolveFlatDiffuseColor( spawnArgs, renderEntity.flatDiffuseColor );
+	renderEntity.flatDiffuseFlags = REF_FLAT_DIFFUSE;
+	if ( style >= 3 ) {
+		renderEntity.flatDiffuseFlags |= REF_FLAT_DIFFUSE_SWEEP;
+	}
+}
 
 
 /*
@@ -70,6 +305,7 @@ idItem::idItem() {
 	effectIdle = NULL;
 	simpleItem = false;
 	pickedUp = false;
+	pickedUpByClientNum = -1;
 }
 
 /*
@@ -512,7 +748,7 @@ void idItem::Spawn( void ) {
 
 	simpleItemScale = spawnArgs.GetFloat( "simple_icon_scale", "20.0" );
 
-	simpleItem = g_simpleItems.GetBool() && gameLocal.isMultiplayer && !IsType( rvItemCTFFlag::GetClassType() );
+	simpleItem = GetSimpleItemStyle() == 1 && gameLocal.isMultiplayer && !IsType( rvItemCTFFlag::GetClassType() );
 	if( simpleItem ) {
 		memset( &renderEntity, 0, sizeof( renderEntity ) );
 		renderEntity.axis		= mat3_identity;
@@ -540,9 +776,12 @@ void idItem::Spawn( void ) {
 			effectIdle = PlayEffect( "fx_idle", renderEntity.origin, renderEntity.axis, true );
 		}
 	}
+
+	UpdateFlatDiffusePresentation();
 	
 	GetPhysics( )->SetClipMask( GetPhysics( )->GetClipMask( ) | CONTENTS_ITEMCLIP );
 	pickedUp = false;
+	pickedUpByClientNum = -1;
 }
 
 /*
@@ -707,6 +946,10 @@ bool idItem::Pickup( idPlayer *player ) {
 
 	pickedUp = true;
 
+	if ( player != NULL && player->entityNumber >= 0 && player->entityNumber < MAX_CLIENTS ) {
+		pickedUpByClientNum = player->entityNumber;
+	}
+
 	// allow SetSkin or Hide() to get called regardless of simpleitem mode
 	if( simpleItem ) {
 		FreeModelDef();
@@ -857,6 +1100,7 @@ void idItem::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 				UpdateVisuals();			
 			}
 			pickedUp = false;
+	pickedUpByClientNum = -1;
 
 			if ( effectIdle.GetEntity( ) ) {
 				UpdateModelTransform();
@@ -1016,6 +1260,7 @@ void idItem::Event_Respawn( void ) {
 	}
 
 	pickedUp = false;
+	pickedUpByClientNum = -1;
 
 	inViewTime = -1000;
 	lastCycle = -1;
