@@ -15,6 +15,7 @@
 #include "../MatchPhase.h"
 
 #include <stdint.h>
+#include <stddef.h>
 
 // Protocol/storage ceiling.  A platform may expose fewer live slots; the
 // integration layer uses its actual MAX_CLIENTS when binding connections.

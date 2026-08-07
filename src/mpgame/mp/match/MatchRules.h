@@ -10,6 +10,7 @@
 #define __MP_MATCH_RULES_H__
 
 #include <stdint.h>
+#include <stddef.h>
 
 #include "../GameTypeIds.h"
 

@@ -11,6 +11,7 @@
 #include "../MatchPhase.h"
 
 #include <stdint.h>
+#include <stddef.h>
 
 static const uint32_t MP_MATCH_EVIDENCE_SCHEMA_VERSION = 2;
 static const int MP_MATCH_EVIDENCE_MAX_EVENTS = 256;

@@ -12,6 +12,7 @@
 #define __MP_MATCH_SERIES_H__
 
 #include <stdint.h>
+#include <stddef.h>
 
 static const int MP_SERIES_SIDE_NONE = -1;
 static const int MP_SERIES_SIDE_COUNT = 2;

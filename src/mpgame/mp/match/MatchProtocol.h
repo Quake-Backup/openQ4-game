@@ -14,6 +14,7 @@
 #define __MP_MATCH_PROTOCOL_H__
 
 #include "../MatchPhase.h"
+#include <stddef.h>
 
 class idBitMsg;
 
