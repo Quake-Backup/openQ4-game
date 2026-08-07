@@ -51,8 +51,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py
+          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py tools/tests/string_allocation_contract.py
           python tools/tests/arm64_abi_contract.py
+          python tools/tests/cmdargs_append_contract.py
+          python tools/tests/competitive_match_contracts.py
+          python tools/tests/lexer_peek_contract.py
+          python tools/tests/string_allocation_contract.py
           python tools/tests/linux_portability_contract.py
           python tools/tests/macos_meson_contract.py
           python tools/tests/savegame_corruption_contract.py
@@ -74,6 +78,8 @@ jobs:
           .tmp/crc-checksum-probe
           "${CXX}" -std=c++17 -Wall -Wextra -Werror -funsigned-char -DOPENQ4_EXPECT_UNSIGNED_PLAIN_CHAR=1 tools/tests/binary_token_signed_char_probe.cpp -o .tmp/binary-token-signed-char-probe
           .tmp/binary-token-signed-char-probe
+          "${CXX}" -std=c++17 -Wall -Wextra -Werror tools/tests/string_allocation_probe.cpp -o .tmp/string-allocation-probe
+          .tmp/string-allocation-probe
           "${CXX}" -std=c++17 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=undefined tools/tests/lp64_semantics_probe.cpp -o .tmp/lp64-semantics-probe
           .tmp/lp64-semantics-probe
 
@@ -173,8 +179,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile tools/tests/arm64_abi_contract.py tools/tests/linux_portability_contract.py
+          python -m py_compile tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/string_allocation_contract.py
           python tools/tests/arm64_abi_contract.py
+          python tools/tests/cmdargs_append_contract.py
+          python tools/tests/competitive_match_contracts.py
+          python tools/tests/lexer_peek_contract.py
+          python tools/tests/string_allocation_contract.py
           python tools/tests/linux_portability_contract.py
 
       - name: Run native Linux ARM64 portability probe
@@ -192,6 +202,8 @@ jobs:
           .tmp/crc-checksum-probe
           "${CXX}" -std=c++17 -Wall -Wextra -Werror -funsigned-char -DOPENQ4_EXPECT_UNSIGNED_PLAIN_CHAR=1 tools/tests/binary_token_signed_char_probe.cpp -o .tmp/binary-token-signed-char-probe
           .tmp/binary-token-signed-char-probe
+          "${CXX}" -std=c++17 -Wall -Wextra -Werror tools/tests/string_allocation_probe.cpp -o .tmp/string-allocation-probe
+          .tmp/string-allocation-probe
           "${CXX}" -std=c++17 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=undefined tools/tests/lp64_semantics_probe.cpp -o .tmp/lp64-semantics-probe
           .tmp/lp64-semantics-probe
 
@@ -279,8 +291,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py
+          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py tools/tests/string_allocation_contract.py
           python tools/tests/arm64_abi_contract.py
+          python tools/tests/cmdargs_append_contract.py
+          python tools/tests/competitive_match_contracts.py
+          python tools/tests/lexer_peek_contract.py
+          python tools/tests/string_allocation_contract.py
           python tools/tests/linux_portability_contract.py
           python tools/tests/macos_meson_contract.py
           python tools/tests/savegame_corruption_contract.py
@@ -342,8 +358,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py
+          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py tools/tests/string_allocation_contract.py
           python tools/tests/arm64_abi_contract.py
+          python tools/tests/cmdargs_append_contract.py
+          python tools/tests/competitive_match_contracts.py
+          python tools/tests/lexer_peek_contract.py
+          python tools/tests/string_allocation_contract.py
           python tools/tests/linux_portability_contract.py
           python tools/tests/macos_meson_contract.py
           python tools/tests/savegame_corruption_contract.py

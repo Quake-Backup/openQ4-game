@@ -3,6 +3,7 @@
 #pragma hdrstop
 
 #include "Game_local.h"
+#include "mp/match/MatchDeadline.h"
 
 /*
 ===============================================================================
@@ -340,7 +341,7 @@ void idLight::Restore( idRestoreGame *savefile ) {
 	savefile->ReadBool( breakOnTrigger );
 	savefile->ReadInt( count );
 	savefile->ReadInt( triggercount );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( lightParent ) );
+	savefile->ReadObject( lightParent );
 
 	savefile->ReadVec4( fadeFrom );
 	savefile->ReadVec4( fadeTo );
@@ -929,6 +930,22 @@ void idLight::Think( void ) {
 
 	RunPhysics();
 	Present();
+}
+
+void idLight::ThinkMatchPaused( int deltaMsec ) {
+	idEntity::ThinkMatchPaused( deltaMsec );
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+	if ( fadeEnd > 0 ) {
+		mpMatchShiftTimeOrigin( fadeStart, deltaMsec );
+		mpMatchShiftOptionalDeadline( fadeEnd, deltaMsec );
+	}
+	renderLight.shaderParms[ SHADERPARM_TIMEOFFSET ] -= MS2SEC( deltaMsec );
+	if ( renderLight.shaderParms[ SHADERPARM_TIME_OF_DEATH ] > 0.0f ) {
+		renderLight.shaderParms[ SHADERPARM_TIME_OF_DEATH ] += MS2SEC( deltaMsec );
+	}
+	PresentLightDefChange();
 }
 
 /*

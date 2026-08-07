@@ -100,6 +100,26 @@ static bool NavDoorIsWalkActivated( idEntity *ent ) {
 		   !door->spawnArgs.GetString( "requires", "" )[0];
 }
 
+// openQ4 BEGIN
+/*
+================
+NavPointInLethalLiquid
+
+Lava and slime are not solid, so every generation trace passes straight through them and the graph
+would happily lay a walkable node on the bottom of a lava pool - then route bots across it. Refusing
+those cells keeps routing out of the hazard entirely, which is what Quake 3's AAS achieves by
+classifying liquid areas up front.
+
+Water is deliberately not excluded. It is crossable, so it stays in the graph and swimming is
+handled at run time by rvBot::UpdateLiquidMovement.
+================
+*/
+static bool NavPointInLethalLiquid( const idVec3 &point ) {
+	const idVec3 probe = point + idVec3( 0.0f, 0.0f, NAV_GROUND_OFFSET );
+	return ( gameLocal.LiquidContentsAtPoint( probe, NULL ) & ( CONTENTS_LAVA | CONTENTS_SLIME ) ) != 0;
+}
+// openQ4 END
+
 /*
 ================
 NavTranslationThroughDoors
@@ -629,6 +649,12 @@ void rvNavMesh::FloodFill( const idList<idVec3> &seeds ) {
 			continue;
 		}
 
+// openQ4 BEGIN
+		if ( NavPointInLethalLiquid( snapped ) ) {
+			continue;
+		}
+// openQ4 END
+
 		openList.Append( AddNode( gx, gy, snapped ) );
 	}
 
@@ -659,6 +685,11 @@ void rvNavMesh::FloodFill( const idList<idVec3> &seeds ) {
 
 			int neighbour = FindNode( gx, gy, toFloor.z );
 			if ( neighbour == -1 ) {
+// openQ4 BEGIN
+				if ( NavPointInLethalLiquid( toFloor ) ) {
+					continue;
+				}
+// openQ4 END
 				neighbour = AddNode( gx, gy, toFloor );
 				openList.Append( neighbour );
 			}

@@ -393,6 +393,38 @@ private:
 ===============================================================================
 */
 
+// openQ4 BEGIN
+/*
+===============================================================================
+
+	idLiquidVolume
+
+	A liquid volume that is not a brush. Quake 4 ships no liquid-textured geometry at all, so this
+	is the only way to put water, slime or lava into an existing map - and it gives mappers a way
+	to box off a pool without authoring a liquid material for it.
+
+	"liquid"  water (default), slime or lava
+	"size"    "x y z" box, sitting on the entity origin
+	"mins" / "maxs"  explicit bounds instead of "size"
+
+===============================================================================
+*/
+class idLiquidVolume : public idEntity {
+public:
+	CLASS_PROTOTYPE( idLiquidVolume );
+
+						idLiquidVolume( void );
+
+	void				Spawn( void );
+
+	void				Save( idSaveGame *savefile ) const;
+	void				Restore( idRestoreGame *savefile );
+
+private:
+	int					liquidContents;
+};
+// openQ4 END
+
 class idStaticEntity : public idEntity {
 public:
 	CLASS_PROTOTYPE( idStaticEntity );

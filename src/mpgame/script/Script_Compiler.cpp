@@ -2428,7 +2428,7 @@ void idCompiler::ParseEventDef( idTypeDef *returnType, const char *name ) {
 	ExpectToken( "(" );
 
 	format = ev->GetArgFormat();
-	num = strlen( format );
+	num = idLib::SizeToInt( strlen( format ), "idCompiler::ParseEventDef" );
 	for( i = 0; i < num; i++ ) {
 		expectedType = GetTypeForEventArg( format[ i ] );
 		if ( !expectedType || ( expectedType == &type_void ) ) {
@@ -2595,7 +2595,7 @@ void idCompiler::CompileFile( const char *text, const char *filename, bool toCon
 	memset( &immediate, 0, sizeof( immediate ) );
 
 	parser.SetFlags( LEXFL_ALLOWMULTICHARLITERALS );
-	parser.LoadMemory( text, strlen( text ), filename );
+	parser.LoadMemory( text, idLib::SizeToInt( strlen( text ), "idCompiler::CompileFile" ), filename );
 	parserPtr = &parser;
 
 	// unread tokens to include script defines

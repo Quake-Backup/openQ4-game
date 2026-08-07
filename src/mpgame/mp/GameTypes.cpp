@@ -33,56 +33,57 @@
 
 static const mpGameTypeInfo_t mpGameTypeInfoTable[] = {
 	{	GAME_SP,				"singleplayer",			"sp",		"#str_107679",	"",					"singleplayer",
-		GTF_SINGLEPLAYER },
+		GTF_SINGLEPLAYER, MP_GAMESTATE_NONE, false },
 
 	{	GAME_DM,				"DM",					"dm",		"#str_107679",	"DM",				"DM",
-		GTF_FRAGLIMIT | GTF_BUYING },
+		GTF_FRAGLIMIT | GTF_BUYING, MP_GAMESTATE_DM, true },
 
 	{	GAME_TOURNEY,			"Tourney",				"tourney",	"#str_107676",	"Tourney",			"Tourney",
-		GTF_FRAGLIMIT | GTF_BRACKET },
+		GTF_FRAGLIMIT | GTF_BRACKET, MP_GAMESTATE_TOURNEY, true },
 
 	{	GAME_TDM,				"Team DM",				"tdm",		"#str_107677",	"Team DM",			"Team DM",
-		GTF_TEAM | GTF_FRAGLIMIT | GTF_BUYING },
+		GTF_TEAM | GTF_FRAGLIMIT | GTF_BUYING, MP_GAMESTATE_TEAMDM, true },
 
 	{	GAME_CTF,				"CTF",					"ctf",		"#str_107678",	"CTF",				"CTF",
-		GTF_TEAM | GTF_FLAG | GTF_CAPTURELIMIT },
+		GTF_TEAM | GTF_FLAG | GTF_CAPTURELIMIT, MP_GAMESTATE_CTF, true },
 
 	{	GAME_1F_CTF,			"One Flag CTF",			"1fctf",	"#str_107680",	"CTF",				"CTF",
-		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_CAPTURELIMIT },
+		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_CAPTURELIMIT, MP_GAMESTATE_CTF, true },
 
 	{	GAME_ARENA_CTF,			"Arena CTF",			"actf",		"#str_107681",	"Arena CTF",		"Arena CTF",
-		GTF_TEAM | GTF_FLAG | GTF_ARENA | GTF_CAPTURELIMIT },
+		GTF_TEAM | GTF_FLAG | GTF_ARENA | GTF_CAPTURELIMIT, MP_GAMESTATE_CTF, true },
 
 	{	GAME_ARENA_1F_CTF,		"Arena One Flag CTF",	"a1fctf",	"#str_107682",	"Arena CTF",		"Arena CTF",
-		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_ARENA | GTF_CAPTURELIMIT },
+		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_ARENA | GTF_CAPTURELIMIT, MP_GAMESTATE_CTF, true },
 
 	{	GAME_DEADZONE,			"DeadZone",				"dz",		"#str_122001",	"DeadZone",			"DeadZone",
-		GTF_TEAM | GTF_DEADZONE | GTF_BUYING },
+		GTF_TEAM | GTF_DEADZONE | GTF_BUYING, MP_GAMESTATE_DEADZONE, true },
 
 	// openQ4: gametypes carried over from Quake Live
 	{	GAME_DUEL,				"Duel",					"duel",		"#str_41300",	"DM",				"DM",
-		GTF_DUEL | GTF_FRAGLIMIT },
+		GTF_DUEL | GTF_FRAGLIMIT, MP_GAMESTATE_DUEL, true },
 
 	{	GAME_CA,				"Clan Arena",			"ca",		"#str_41301",	"Team DM",			"Team DM",
-		GTF_TEAM | GTF_ROUND | GTF_ELIMINATION | GTF_ROUNDLIMIT | GTF_DAMAGESCORE },
+		GTF_TEAM | GTF_ROUND | GTF_ELIMINATION | GTF_ROUNDLIMIT | GTF_DAMAGESCORE, MP_GAMESTATE_CA, true },
 
 	{	GAME_FREEZETAG,			"Freeze Tag",			"ft",		"#str_41302",	"Team DM",			"Team DM",
-		GTF_TEAM | GTF_ROUND | GTF_ELIMINATION | GTF_FREEZE | GTF_ROUNDLIMIT },
+		GTF_TEAM | GTF_ROUND | GTF_ELIMINATION | GTF_FREEZE | GTF_ROUNDLIMIT, MP_GAMESTATE_FREEZETAG, true },
 
 	{	GAME_REDROVER,			"Red Rover",			"rr",		"#str_41303",	"Team DM",			"Team DM",
-		GTF_TEAM | GTF_ROUND | GTF_TEAMSWAP | GTF_ROUNDLIMIT },
+		GTF_TEAM | GTF_ROUND | GTF_TEAMSWAP | GTF_ROUNDLIMIT, MP_GAMESTATE_REDROVER, true },
 
 	{	GAME_OVERLOAD,			"Overload",				"ovl",		"#str_41304",	"CTF",				"CTF",
-		GTF_TEAM | GTF_OBELISK | GTF_CAPTURELIMIT },
+		GTF_TEAM | GTF_OBELISK | GTF_CAPTURELIMIT, MP_GAMESTATE_NONE, false },
 
 	{	GAME_HARVESTER,			"Harvester",			"har",		"#str_41305",	"CTF",				"CTF",
-		GTF_TEAM | GTF_OBELISK | GTF_CAPTURELIMIT },
+		GTF_TEAM | GTF_OBELISK | GTF_CAPTURELIMIT, MP_GAMESTATE_NONE, false },
 
 	{	GAME_DOMINATION,		"Domination",			"dom",		"#str_41306",	"Arena CTF",		"Arena CTF",
-		GTF_TEAM | GTF_CONTROLPOINT | GTF_SCORELIMIT },
+		GTF_TEAM | GTF_CONTROLPOINT | GTF_SCORELIMIT, MP_GAMESTATE_NONE, false },
 
 	{	GAME_ATTACK_DEFEND,		"Attack Defend",		"ad",		"#str_41307",	"CTF",				"CTF",
-		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_ROUND | GTF_ELIMINATION | GTF_TURNS | GTF_SCORELIMIT | GTF_DAMAGESCORE },
+		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_ROUND | GTF_ELIMINATION | GTF_TURNS | GTF_SCORELIMIT | GTF_DAMAGESCORE,
+		MP_GAMESTATE_NONE, false },
 };
 
 const int mpNumGameTypeInfo = sizeof( mpGameTypeInfoTable ) / sizeof( mpGameTypeInfoTable[ 0 ] );
@@ -111,10 +112,6 @@ const char *si_gameTypeArgs[] = {
 	"Clan Arena",
 	"Freeze Tag",
 	"Red Rover",
-	"Overload",
-	"Harvester",
-	"Domination",
-	"Attack Defend",
 	NULL
 };
 
@@ -179,6 +176,23 @@ MPGameTypeLocalizedName
 */
 const char *MPGameTypeLocalizedName( int type ) {
 	return common->GetLocalizedString( MPGameType( type )->localizedName );
+}
+
+/*
+================
+MPGameTypeIsSelectable
+
+The enum/table retain unavailable modes for wire stability, but only complete
+authoritative implementations may enter server configuration, menus or votes.
+================
+*/
+bool MPGameTypeIsSelectable( int type ) {
+	if ( type < 0 || type >= mpNumGameTypeInfo ) {
+		return false;
+	}
+
+	const mpGameTypeInfo_t *info = &mpGameTypeInfoTable[ type ];
+	return info->selectable && info->stateFactory != MP_GAMESTATE_NONE;
 }
 
 /*
@@ -256,7 +270,8 @@ mpVoteGameTypeOrder
 
 Order the gametype dropdowns and the vote packet use.  The first six entries
 must stay where they are: they are the shipped vote_gametype_t values and the
-stock .gui dropdowns index them positionally.
+stock .gui dropdowns index them positionally.  A table row may remain present
+for wire compatibility while absent here until its authoritative state exists.
 ================
 */
 static const int mpVoteGameTypeOrder[] = {
@@ -272,11 +287,7 @@ static const int mpVoteGameTypeOrder[] = {
 	GAME_FREEZETAG,
 	GAME_REDROVER,
 	GAME_1F_CTF,
-	GAME_ARENA_1F_CTF,
-	GAME_OVERLOAD,
-	GAME_HARVESTER,
-	GAME_DOMINATION,
-	GAME_ATTACK_DEFEND
+	GAME_ARENA_1F_CTF
 };
 
 static const int mpNumVoteGameTypes = sizeof( mpVoteGameTypeOrder ) / sizeof( mpVoteGameTypeOrder[ 0 ] );
@@ -324,41 +335,102 @@ int MPGameTypeToVoteGameType( int type ) {
 ================
 MPValidateGameTypeTable
 
-Catches the two ways this table can silently rot: a gametype added to the
-enum without a table row, and a name column that has drifted from the
-si_gameType completion list.
+Catches table, construction, completion and vote-order drift before a server
+can advertise a mode that SetGameType cannot construct.
 ================
 */
 void MPValidateGameTypeTable( void ) {
 	int i;
+	int j;
 
 	if ( mpNumGameTypeInfo != NUM_GAME_TYPES ) {
 		gameLocal.Error( "MPValidateGameTypeTable: gametype table has %d rows, gameType_t has %d values", mpNumGameTypeInfo, NUM_GAME_TYPES );
 		return;
 	}
 
-	if ( si_numGameTypeArgs != NUM_GAME_TYPES + 1 ) {
-		gameLocal.Error( "MPValidateGameTypeTable: si_gameTypeArgs has %d entries, expected %d", si_numGameTypeArgs, NUM_GAME_TYPES + 1 );
+	if ( si_numGameTypeArgs < 2 || si_gameTypeArgs[ si_numGameTypeArgs - 1 ] != NULL ) {
+		gameLocal.Error( "MPValidateGameTypeTable: si_gameTypeArgs is not NULL terminated" );
 		return;
 	}
 
 	for ( i = 0; i < mpNumGameTypeInfo; i++ ) {
-		if ( mpGameTypeInfoTable[ i ].type != i ) {
-			gameLocal.Error( "MPValidateGameTypeTable: row %d declares gametype %d; the table must be indexed by gameType_t", i, mpGameTypeInfoTable[ i ].type );
+		const mpGameTypeInfo_t &info = mpGameTypeInfoTable[ i ];
+		const bool singlePlayer = ( info.flags & GTF_SINGLEPLAYER ) != 0;
+		int completionCount = 0;
+		int voteCount = 0;
+
+		if ( info.type != i ) {
+			gameLocal.Error( "MPValidateGameTypeTable: row %d declares gametype %d; the table must be indexed by gameType_t", i, info.type );
 			return;
 		}
 
-		if ( idStr::Cmp( mpGameTypeInfoTable[ i ].name, si_gameTypeArgs[ i ] ) != 0 ) {
-			gameLocal.Error( "MPValidateGameTypeTable: row %d is '%s' but si_gameTypeArgs[%d] is '%s'", i, mpGameTypeInfoTable[ i ].name, i, si_gameTypeArgs[ i ] );
+		if ( info.name == NULL || info.name[ 0 ] == '\0' || info.localizedName == NULL || info.localizedName[ 0 ] == '\0' ) {
+			gameLocal.Error( "MPValidateGameTypeTable: row %d has incomplete identity metadata", i );
 			return;
 		}
 
-		// every playable mode must be reachable from the vote and menu lists
-		if ( ( mpGameTypeInfoTable[ i ].flags & GTF_SINGLEPLAYER ) == 0 ) {
-			if ( MPVoteGameTypeToGameType( MPGameTypeToVoteGameType( i ) ) != i ) {
-				gameLocal.Error( "MPValidateGameTypeTable: gametype '%s' is missing from mpVoteGameTypeOrder", mpGameTypeInfoTable[ i ].name );
+		if ( info.stateFactory < MP_GAMESTATE_NONE || info.stateFactory >= MP_GAMESTATE_FACTORY_COUNT ) {
+			gameLocal.Error( "MPValidateGameTypeTable: gametype '%s' has invalid state factory %d", info.name, info.stateFactory );
+			return;
+		}
+
+		if ( info.selectable != ( !singlePlayer && info.stateFactory != MP_GAMESTATE_NONE ) ) {
+			gameLocal.Error( "MPValidateGameTypeTable: gametype '%s' selectability and state factory disagree", info.name );
+			return;
+		}
+
+		for ( j = i + 1; j < mpNumGameTypeInfo; j++ ) {
+			if ( idStr::Icmp( info.name, mpGameTypeInfoTable[ j ].name ) == 0 ) {
+				gameLocal.Error( "MPValidateGameTypeTable: duplicate gametype token '%s'", info.name );
 				return;
 			}
+		}
+
+		for ( j = 0; j < si_numGameTypeArgs - 1; j++ ) {
+			if ( si_gameTypeArgs[ j ] == NULL ) {
+				gameLocal.Error( "MPValidateGameTypeTable: si_gameTypeArgs terminates early at %d", j );
+				return;
+			}
+			if ( idStr::Icmp( info.name, si_gameTypeArgs[ j ] ) == 0 ) {
+				completionCount++;
+			}
+		}
+
+		for ( j = 0; j < mpNumVoteGameTypes; j++ ) {
+			if ( mpVoteGameTypeOrder[ j ] == i ) {
+				voteCount++;
+			}
+		}
+
+		const int expectedCompletionCount = ( info.selectable || singlePlayer ) ? 1 : 0;
+		const int expectedVoteCount = info.selectable ? 1 : 0;
+		if ( completionCount != expectedCompletionCount ) {
+			gameLocal.Error( "MPValidateGameTypeTable: gametype '%s' appears %d times in si_gameTypeArgs, expected %d", info.name, completionCount, expectedCompletionCount );
+			return;
+		}
+		if ( voteCount != expectedVoteCount ) {
+			gameLocal.Error( "MPValidateGameTypeTable: gametype '%s' appears %d times in mpVoteGameTypeOrder, expected %d", info.name, voteCount, expectedVoteCount );
+			return;
+		}
+	}
+
+	for ( i = 0; i < si_numGameTypeArgs - 1; i++ ) {
+		if ( MPGameTypeByName( si_gameTypeArgs[ i ] ) == NULL ) {
+			gameLocal.Error( "MPValidateGameTypeTable: si_gameTypeArgs contains unknown token '%s'", si_gameTypeArgs[ i ] );
+			return;
+		}
+		for ( j = i + 1; j < si_numGameTypeArgs - 1; j++ ) {
+			if ( idStr::Icmp( si_gameTypeArgs[ i ], si_gameTypeArgs[ j ] ) == 0 ) {
+				gameLocal.Error( "MPValidateGameTypeTable: duplicate si_gameTypeArgs token '%s'", si_gameTypeArgs[ i ] );
+				return;
+			}
+		}
+	}
+
+	for ( i = 0; i < mpNumVoteGameTypes; i++ ) {
+		if ( !MPGameTypeIsSelectable( mpVoteGameTypeOrder[ i ] ) ) {
+			gameLocal.Error( "MPValidateGameTypeTable: vote row %d names unavailable gametype %d", i, mpVoteGameTypeOrder[ i ] );
+			return;
 		}
 	}
 }

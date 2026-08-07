@@ -341,7 +341,7 @@ void idLight::Restore( idRestoreGame *savefile ) {
 	savefile->ReadBool( breakOnTrigger );
 	savefile->ReadInt( count );
 	savefile->ReadInt( triggercount );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( lightParent ) );
+	savefile->ReadObject( lightParent );
 
 	savefile->ReadVec4( fadeFrom );
 	savefile->ReadVec4( fadeTo );
@@ -835,8 +835,6 @@ idLight::PresentLightDefChange
 ================
 */
 void idLight::PresentLightDefChange( void ) {
-	const bool wasMissingHandle = ( lightDefHandle == -1 );
-
 	// let the renderer apply it to the world
 	if ( ( lightDefHandle != -1 ) ) {
 		gameRenderWorld->UpdateLightDef( lightDefHandle, &renderLight );

@@ -616,9 +616,9 @@ void idClipModel::Restore( idRestoreGame *savefile ) {
 	bool linked;
 
 	savefile->ReadBool( enabled );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( entity ) );
+	savefile->ReadObject( entity );
 	savefile->ReadInt( id );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( owner ) );
+	savefile->ReadObject( owner );
 	savefile->ReadVec3( origin );
 	savefile->ReadMat3( axis );
 	savefile->ReadBounds( bounds );

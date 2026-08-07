@@ -55,7 +55,16 @@ def main() -> None:
     require(src_meson, "define_arg_prefix = is_msvc ? '/D' : '-D'", "compiler-specific define syntax")
     require(src_meson, "pic : not is_windows", "PIC idlib for dylib modules")
     require(src_meson, "idlib/math/Simd_AltiVec.cpp", "legacy PowerPC SIMD exclusion")
-    require(src_meson, "if host_cpu_family != 'x86'", "legacy x86 SIMD exclusion")
+    legacy_x86_simd_exclusion = """if host_cpu_family != 'x86'
+  idlib_excludes += [
+    'idlib/math/Simd_3DNow.cpp',
+    'idlib/math/Simd_MMX.cpp',
+    'idlib/math/Simd_SSE.cpp',
+    'idlib/math/Simd_SSE2.cpp',
+    'idlib/math/Simd_SSE3.cpp',
+  ]
+endif"""
+    require(src_meson, legacy_x86_simd_exclusion, "non-x86 legacy SIMD source exclusion")
     require(src_meson, "cpp.has_link_argument(link_arg)", "Darwin linker argument probing")
     require(src_meson, "name_suffix : 'dylib'", "macOS game module suffix")
     require(src_meson, "-Wl,-install_name,@loader_path/", "macOS game module install name")

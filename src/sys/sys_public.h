@@ -314,6 +314,11 @@ void			Sys_Sleep( int msec );
 // any game related timing information should come from event timestamps
 int				Sys_Milliseconds( void );
 
+// Fill a caller-owned buffer from the operating system CSPRNG. Gameplay
+// random generators and timing entropy are never substitutes for this API.
+// Implementations leave the buffer untouched when validation fails.
+bool			Sys_GetSecureRandomBytes( void *buffer, int bytes );
+
 // for accurate performance testing; a monotonic wall clock, not CPU cycles
 double			Sys_GetClockTicks( void );
 double			Sys_ClockTicksPerSecond( void );
@@ -692,6 +697,7 @@ public:
 	virtual void			StartProcess( const char *exePath, bool quit ) = 0;
 
 	virtual int				Milliseconds(void) = 0;
+	virtual bool			SecureRandomBytes( void *buffer, int bytes ) = 0;
 };
 
 extern idSys *				sys;

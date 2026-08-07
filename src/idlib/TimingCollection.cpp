@@ -76,7 +76,7 @@ void rvSingleTiming::OutputDataToFile( idFile *file, int framesRecorded )
 	sprintf(buffer, "%-36s %-9.3f %-9.3f %-9.3f %-9.3f %-9i %-9i %-9.3f\n", outputName.c_str(), 
 		(float)mTotalValue, (float)( mTotalValue / (float)framesRecorded), (float)mPeakValue,
 		(float)mLimit, mLimitExceeded, mLimitExceededTimesFive, (float)(mTotalUpdates / (float)framesRecorded) );
-	file->Write ( buffer, strlen( buffer ) );
+	file->Write ( buffer, idLib::SizeToInt( strlen( buffer ), "rvSingleTiming::OutputDataToFile" ) );
 }
 
 //-----------------------------------------------------------------------------
@@ -90,10 +90,10 @@ void rvSingleTiming::OutputInfoToFile( idFile *file )
 	char	buffer[1024];
 
 	sprintf(buffer, "Name: %s\nParent: %s\n", mName.c_str(), mParentName.c_str() );
-	file->Write ( buffer, strlen( buffer ) );
+	file->Write ( buffer, idLib::SizeToInt( strlen( buffer ), "rvSingleTiming::OutputInfoToFile" ) );
 
 	sprintf(buffer, "Starting at %s(%d)\nEnding at %s(%d)\n\n", mStartFile.c_str(), mStartLine, mEndFile.c_str(), mEndLine );
-	file->Write ( buffer, strlen( buffer ) );
+	file->Write ( buffer, idLib::SizeToInt( strlen( buffer ), "rvSingleTiming::OutputInfoToFile" ) );
 }
 
 
@@ -198,11 +198,11 @@ void rvTimingCollection::OutputToFile( void )
 	}
 
 	sprintf( buffer, "Total frames = %d\n\n", mFramesRecorded );
-	file->Write( buffer, strlen( buffer ) );
+	file->Write( buffer, idLib::SizeToInt( strlen( buffer ), "rvTimingCollection::OutputToFile" ) );
 
 	sprintf( buffer, "%-36s %-9s %-9s %-9s %-9s %-9s %-9s %-9s\n\n",
 		"Name", "Total", "Average", "Peak", "Limit", "Exceeded", "Exceed*5", "Calls" );
-	file->Write ( buffer, strlen( buffer ) );
+	file->Write ( buffer, idLib::SizeToInt( strlen( buffer ), "rvTimingCollection::OutputToFile" ) );
 
 	for( int i = 0; i < mTimings.Num(); i++ )
 	{
@@ -210,12 +210,12 @@ void rvTimingCollection::OutputToFile( void )
 		if( !( ( i + 1 )%3) )	// break up the prints into groups of 3 to make scanning visually easier.
 		{
 			sprintf( buffer, "\n" );
-			file->Write( buffer, strlen( buffer ) );
+			file->Write( buffer, idLib::SizeToInt( strlen( buffer ), "rvTimingCollection::OutputToFile" ) );
 		}
 	}
 
 	sprintf(buffer, "\n\nInformation about categories\n\n" );
-	file->Write ( buffer, strlen( buffer ) );
+	file->Write ( buffer, idLib::SizeToInt( strlen( buffer ), "rvTimingCollection::OutputToFile" ) );
 
 	for( int i = 0; i < mTimings.Num(); i++ )
 	{

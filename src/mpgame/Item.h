@@ -154,6 +154,7 @@ public:
 	void					Spawn();
 	virtual bool			GiveToPlayer( idPlayer *player, bool updateHud = true );
 	virtual void			Think( void );
+	virtual void			ThinkMatchPaused( int deltaMsec );
 	virtual bool			Pickup( idPlayer *player );
 
 protected:

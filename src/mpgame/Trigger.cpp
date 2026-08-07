@@ -4,6 +4,7 @@
 
 #include "Game_local.h"
 #include "ai/AI_Manager.h"
+#include "mp/match/MatchDeadline.h"
 
 /*
 ===============================================================================
@@ -645,6 +646,11 @@ void idTrigger_Multi::Think()
 		HandleControlZoneTrigger();
 }
 
+void idTrigger_Multi::ThinkMatchPaused( int deltaMsec ) {
+	idTrigger::ThinkMatchPaused( deltaMsec );
+	mpMatchShiftOptionalDeadline( nextTriggerTime, deltaMsec );
+}
+
 /*
 ================
 idTrigger_Multi::Event_Touch
@@ -904,6 +910,11 @@ void idTrigger_EntityName::Spawn( void ) {
 	if ( !spawnArgs.GetBool( "noTouch" ) ) {
 		GetPhysics()->SetContents( CONTENTS_TRIGGER );
 	}
+}
+
+void idTrigger_EntityName::ThinkMatchPaused( int deltaMsec ) {
+	idTrigger::ThinkMatchPaused( deltaMsec );
+	mpMatchShiftOptionalDeadline( nextTriggerTime, deltaMsec );
 }
 
 /*
@@ -1333,6 +1344,13 @@ void idTrigger_Hurt::Spawn( void ) {
 
 	nextTime = gameLocal.time;
 	Enable();
+}
+
+void idTrigger_Hurt::ThinkMatchPaused( int deltaMsec ) {
+	idTrigger::ThinkMatchPaused( deltaMsec );
+	if ( on ) {
+		mpMatchShiftTimeOrigin( nextTime, deltaMsec );
+	}
 }
 
 /*

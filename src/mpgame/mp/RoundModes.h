@@ -68,6 +68,7 @@ public:
 
 	virtual void	Clear( void );
 	virtual void	Run( void );
+	virtual void	ShiftMatchTime( int deltaMsec );
 	virtual void	PlayerDeath( idPlayer* dead, idPlayer* killer );
 	virtual void	ClientDisconnect( idPlayer* player );
 

@@ -1428,7 +1428,7 @@ bool idObstacleAvoidance::TestQuery( const char* fileName, const idAAS* aas )
 
 	obstaclePath_t path;
 
-	bool result = FindPathAroundObstacles( lastQuery.bounds, lastQuery.radius, aas, lastQuery.startPos, lastQuery.seekPos, path );
+	FindPathAroundObstacles( lastQuery.bounds, lastQuery.radius, aas, lastQuery.startPos, lastQuery.seekPos, path );
 
 	gameRenderWorld->DebugBounds( colorOrange, lastQuery.bounds, lastQuery.startPos );
 

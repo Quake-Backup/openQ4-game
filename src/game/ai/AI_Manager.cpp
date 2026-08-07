@@ -6,6 +6,12 @@
 #include "AI.h"
 #include "AI_Manager.h"
 
+// Keep serialized collection limits stable instead of coupling the save format
+// to container growth or a future entity-number expansion.
+static const int MAX_SAVEGAME_AI_TEAM_MEMBERS = 4096;
+static const int MAX_SAVEGAME_AI_AVOIDS = 4096;
+static_assert( MAX_GENTITIES <= MAX_SAVEGAME_AI_TEAM_MEMBERS, "AI team savegame limit must cover every entity slot" );
+
 idVec4 aiTeamColor[AITEAM_NUM] = { idVec4 ( 0.0f, 1.0f, 0.0f, 1.0f ),
 								   idVec4 ( 1.0f, 0.0f, 0.0f, 1.0f ) };
 
@@ -134,6 +140,9 @@ void rvAIManager::Clear( void ) {
 	helpers.Clear ( );
 	simpleThink.Clear ( );
 	avoids.Clear ( );
+	for ( int i = 0; i < AITEAM_NUM; i++ ) {
+		teams[i].Clear ( );
+	}
 	
 	memset ( &teamTimers, 0, sizeof(teamTimers) );
 }
@@ -230,7 +239,11 @@ void rvAIManager::Save( idSaveGame *savefile ) const {
 	// Write out team list
 	for ( i = 0; i < AITEAM_NUM; i ++ ) {
 		idActor* actor;
-		savefile->WriteInt( teams[i].Num() );
+		const int memberCount = teams[i].Num();
+		if ( memberCount > MAX_SAVEGAME_AI_TEAM_MEMBERS ) {
+			gameLocal.Error( "rvAIManager::Save: invalid member count %d for team %d", memberCount, i );
+		}
+		savefile->WriteInt( memberCount );
 		for( actor = teams[i].Next(); actor != NULL; actor = actor->teamNode.Next() ) {
 			savefile->WriteObject( actor );
 		}
@@ -243,7 +256,10 @@ void rvAIManager::Save( idSaveGame *savefile ) const {
 		}
 	}
 
-	// Write out team timers
+	// Write out avoidance volumes
+	if ( avoids.Num() > MAX_SAVEGAME_AI_AVOIDS ) {
+		gameLocal.Error( "rvAIManager::Save: invalid avoid count %d", avoids.Num() );
+	}
 	savefile->WriteInt ( avoids.Num ( ) );
 	for ( i = 0; i < avoids.Num ( ); i ++ ) {
 		savefile->WriteVec3 ( avoids[i].origin );
@@ -264,11 +280,14 @@ void rvAIManager::Restore( idRestoreGame *savefile ){
 	Clear ( );
 
 	// Write out team list
- 	for ( i = 0; i < AITEAM_NUM; i ++ ) {
+	for ( i = 0; i < AITEAM_NUM; i ++ ) {
 		idActor* actor;
 		savefile->ReadInt( j );
+		if ( j < 0 || j > MAX_SAVEGAME_AI_TEAM_MEMBERS ) {
+			savefile->Error( "rvAIManager::Restore: invalid member count %d for team %d", j, i );
+		}
 		for ( ; j > 0; j -- ) {
-			savefile->ReadObject ( reinterpret_cast<idClass *&>( actor ) );
+			savefile->ReadObject ( actor );
 			if ( actor ) {
 				actor->teamNode.AddToEnd ( teams[i] );
 			}
@@ -285,6 +304,9 @@ void rvAIManager::Restore( idRestoreGame *savefile ){
 
 	// Read in team timers
 	savefile->ReadInt ( j );
+	if ( j < 0 || j > MAX_SAVEGAME_AI_AVOIDS ) {
+		savefile->Error( "rvAIManager::Restore: invalid avoid count %d", j );
+	}
 	avoids.SetNum ( j );
 	for ( i = 0; i < j; i ++ ) {
 		savefile->ReadVec3 ( avoids[i].origin );

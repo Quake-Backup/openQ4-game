@@ -83,7 +83,7 @@ idPhysics_StaticMulti::Restore
 void idPhysics_StaticMulti::Restore( idRestoreGame *savefile ) {
 	int i, num;
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( self ) );
+	savefile->ReadObject( self );
 
 	savefile->ReadInt(num);
 	if ( num < 0 || num > MAX_SAVEGAME_STATIC_MULTI_STATES ) {

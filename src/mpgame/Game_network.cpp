@@ -46,6 +46,28 @@ idRepeaterReliableMessageSender repeaterReliableSender;
 
 /*
 ================
+HasBoundedReliableString
+
+Typed protocol fields must reject a missing terminator or truncation rather
+than letting idBitMsg::ReadString silently normalize an oversized value.
+================
+*/
+static bool HasBoundedReliableString( const idBitMsg &msg, int maxBytesIncludingTerminator ) {
+	if ( msg.GetReadBit() != 0 || maxBytesIncludingTerminator <= 0 ) {
+		return false;
+	}
+
+	const int remainingBytes = msg.GetRemainingData();
+	if ( remainingBytes <= 0 ) {
+		return false;
+	}
+
+	const int searchBytes = Min( remainingBytes, maxBytesIncludingTerminator );
+	return memchr( msg.GetReadData(), '\0', searchBytes ) != NULL;
+}
+
+/*
+================
 idGameLocal::InitAsyncNetwork
 ================
 */
@@ -1368,8 +1390,16 @@ void idGameLocal::ServerProcessReliableMessage( int clientNum, const idBitMsg &m
 			break;
 		}
 		case GAME_RELIABLE_MESSAGE_CASTVOTE: {
-			bool vote = ( msg.ReadByte() != 0 );
-			mpGame.CastVote( clientNum, vote );
+			if ( msg.GetRemainingReadBits() != 8 ) {
+				Warning( "Ignoring malformed cast-vote message from client %d", clientNum );
+				break;
+			}
+			const int voteValue = msg.ReadByte();
+			if ( voteValue != 0 && voteValue != 1 ) {
+				Warning( "Ignoring invalid cast-vote value %d from client %d", voteValue, clientNum );
+				break;
+			}
+			mpGame.CastVote( clientNum, voteValue != 0 );
 			break;
 		}
 		case GAME_RELIABLE_MESSAGE_CALLPACKEDVOTE: {
@@ -1431,14 +1461,22 @@ void idGameLocal::ServerProcessReliableMessage( int clientNum, const idBitMsg &m
 		}
 // shouchard:  server admin
 		case GAME_RELIABLE_MESSAGE_SERVER_ADMIN: {
+			// This message has no authentication material.  Only the in-process
+			// listen-server player is intrinsically trusted; remote clients must
+			// use the engine's authenticated rcon path instead.
+			if ( !isListenServer || clientNum != localClientNum ) {
+				Warning( "Rejected unauthenticated server admin message from client %d", clientNum );
+				break;
+			}
+
 			int commandType = msg.ReadByte();
-			int clientNum = msg.ReadByte();
+			int targetClientNum = msg.ReadByte();
 			if ( SERVER_ADMIN_REMOVE_BAN == commandType ) {
 				mpGame.HandleServerAdminRemoveBan( "" );
 			} else if ( SERVER_ADMIN_KICK == commandType ) {
-				mpGame.HandleServerAdminKickPlayer( clientNum );
+				mpGame.HandleServerAdminKickPlayer( targetClientNum );
 			} else if ( SERVER_ADMIN_FORCE_SWITCH == commandType ) {
-				mpGame.HandleServerAdminForceTeamSwitch( clientNum );
+				mpGame.HandleServerAdminForceTeamSwitch( targetClientNum );
 			} else {
 				Warning( "Server admin packet with bad type %d", commandType );
 			}
@@ -1446,6 +1484,10 @@ void idGameLocal::ServerProcessReliableMessage( int clientNum, const idBitMsg &m
 		}
 // mekberg: get ban list for server
 		case GAME_RELIABLE_MESSAGE_GETADMINBANLIST: {
+			if ( !isListenServer || clientNum != localClientNum ) {
+				Warning( "Rejected unauthenticated admin ban-list request from client %d", clientNum );
+				break;
+			}
 			ServerSendBanList( clientNum );
 			break;
 		}
@@ -1458,9 +1500,21 @@ void idGameLocal::ServerProcessReliableMessage( int clientNum, const idBitMsg &m
 
 		// openQ4 BEGIN
 		case GAME_RELIABLE_MESSAGE_READY: {
-			mpGame.ServerSetPlayerReady( clientNum, msg.ReadBits( 1 ) != 0 );
+			if ( msg.GetRemainingReadBits() != 8 ) {
+				Warning( "Ignoring malformed ready message from client %d", clientNum );
+				break;
+			}
+			const int readyValue = msg.ReadByte();
+			if ( readyValue != 0 && readyValue != 1 ) {
+				Warning( "Ignoring invalid ready value %d from client %d", readyValue, clientNum );
+				break;
+			}
+			mpGame.ServerSetPlayerReady( clientNum, readyValue != 0 );
 			break;
 		}
+		case GAME_RELIABLE_MESSAGE_MATCH_REQUEST:
+			mpGame.ServerReceiveMatchOperation( clientNum, msg );
+			break;
 		// openQ4 END
 
 		default: {
@@ -2307,7 +2361,7 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 	}
 	id = msg.ReadByte();
 	if ( id < GAME_RELIABLE_MESSAGE_SPAWN_PLAYER ||
-		 id > GAME_RELIABLE_MESSAGE_READY ) {
+		 id > GAME_RELIABLE_MESSAGE_MATCH_AUTH_CHALLENGE ) {
 		common->Warning( "Ignoring invalid server-demo reliable message %d", id );
 		return;
 	}
@@ -2364,6 +2418,14 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 				}
 				break;
 			}
+
+			case GAME_RELIABLE_MESSAGE_MATCH_RESULT:
+			case GAME_RELIABLE_MESSAGE_MATCH_VIEW:
+			case GAME_RELIABLE_MESSAGE_MATCH_AUTH_CHALLENGE:
+				// Both payloads are recipient-specific and must never be copied to
+				// an observer/repeater channel.
+				inhibitRepeater = true;
+				break;
 
 			default:
 				break;
@@ -2487,11 +2549,19 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			memset( &voteData, 0, sizeof( voteData ) );
 			int clientNum = msg.ReadByte();
 			voteData.m_fieldFlags = msg.ReadShort();
+			if ( voteData.m_fieldFlags <= 0 || ( voteData.m_fieldFlags & ~VOTEFLAG_ALL ) != 0 ) {
+				Warning( "Ignoring packed vote state with invalid field flags 0x%x", voteData.m_fieldFlags );
+				break;
+			}
 			char mapName[256];
 			if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_KICK ) ) {
 				voteData.m_kick = msg.ReadByte();
 			}
 			if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_MAP ) ) {
+				if ( !HasBoundedReliableString( msg, sizeof( mapName ) ) ) {
+					Warning( "Ignoring packed vote state with a missing or oversized map token" );
+					break;
+				}
 				msg.ReadString( mapName, sizeof( mapName ) );
 				voteData.m_map = mapName;
 			}
@@ -2519,6 +2589,10 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_CONTROLTIME ) ) {
 				voteData.m_controlTime = msg.ReadShort();
 			}
+			if ( msg.GetRemainingReadBits() != 0 ) {
+				Warning( "Ignoring packed vote state with %d trailing bits", msg.GetRemainingReadBits() );
+				break;
+			}
 			mpGame.ClientStartPackedVote( clientNum, voteData );
 			break;
 		}
@@ -2527,12 +2601,26 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			int yesCount = msg.ReadByte( );
 			int noCount = msg.ReadByte( );
 			int multiVote = msg.ReadByte( );
+			if ( result < idMultiplayerGame::VOTE_UPDATE || result > idMultiplayerGame::VOTE_RESET ||
+				yesCount < 0 || yesCount > MAX_CLIENTS || noCount < 0 || noCount > MAX_CLIENTS ||
+				( multiVote != 0 && multiVote != 1 ) ) {
+				Warning( "Ignoring malformed vote update header" );
+				break;
+			}
 			voteStruct_t voteData;
-			char mapNameBuffer[256];
+			char mapNameBuffer[256] = { '\0' };
 			memset( &voteData, 0, sizeof( voteData ) );
 			if ( multiVote ) {
 				voteData.m_fieldFlags = msg.ReadShort();
+				if ( voteData.m_fieldFlags <= 0 || ( voteData.m_fieldFlags & ~VOTEFLAG_ALL ) != 0 ) {
+					Warning( "Ignoring vote update with invalid field flags 0x%x", voteData.m_fieldFlags );
+					break;
+				}
 				voteData.m_kick = msg.ReadByte();
+				if ( !HasBoundedReliableString( msg, sizeof( mapNameBuffer ) ) ) {
+					Warning( "Ignoring vote update with a missing or oversized map token" );
+					break;
+				}
 				msg.ReadString( mapNameBuffer, sizeof( mapNameBuffer ) );
 				voteData.m_map = mapNameBuffer;
 				voteData.m_gameType = msg.ReadByte();
@@ -2543,6 +2631,17 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 				voteData.m_buying = msg.ReadByte();
 				voteData.m_teamBalance = msg.ReadByte();
 				voteData.m_controlTime = msg.ReadShort();
+				if ( ( ( voteData.m_fieldFlags & VOTEFLAG_KICK ) != 0 && ( voteData.m_kick < 0 || voteData.m_kick >= MAX_CLIENTS ) ) ||
+					( ( voteData.m_fieldFlags & VOTEFLAG_GAMETYPE ) != 0 && ( voteData.m_gameType < 0 || voteData.m_gameType >= MPVoteGameTypeCount() ) ) ||
+					( voteData.m_buying != 0 && voteData.m_buying != 1 ) ||
+					( voteData.m_teamBalance != 0 && voteData.m_teamBalance != 1 ) ) {
+					Warning( "Ignoring vote update with invalid typed values" );
+					break;
+				}
+			}
+			if ( msg.GetRemainingReadBits() != 0 ) {
+				Warning( "Ignoring vote update with %d trailing bits", msg.GetRemainingReadBits() );
+				break;
 			}
 			mpGame.ClientUpdateVote( (idMultiplayerGame::vote_result_t)result, yesCount, noCount, voteData );
 			break;
@@ -2652,6 +2751,15 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			mpGame.ReceiveCenterPrint( msg );
 			break;
 		}
+		case GAME_RELIABLE_MESSAGE_MATCH_RESULT:
+			mpGame.ClientReceiveMatchOperationResult( msg );
+			break;
+		case GAME_RELIABLE_MESSAGE_MATCH_VIEW:
+			mpGame.ClientReceiveMatchView( msg );
+			break;
+		case GAME_RELIABLE_MESSAGE_MATCH_AUTH_CHALLENGE:
+			mpGame.ClientReceiveRefereeAuthChallenge( msg );
+			break;
 		// openQ4 END
 		default: {
 			Error( "Unknown server->client reliable message: %d", id );
@@ -2777,42 +2885,101 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
 	// set the user commands for this frame
 	usercmds = clientCmds;
 
-	// run prediction on all entities from the last snapshot
-	for ( ent = snapshotEntities.Next(); ent != NULL; ent = ent->snapshotNode.Next() ) {
-		// don't force TH_PHYSICS on, only call ClientPredictionThink if thinkFlags != 0
-		// it's better to synchronize TH_PHYSICS on specific entities when needed ( movers may be trouble )
-		if ( ent->thinkFlags != 0 ) {
-			ent->ClientPredictionThink();
+	const bool competitiveGameplayFrozen = mpGame.IsGameplayFrozen();
+	if ( competitiveGameplayFrozen ) {
+		if ( isNewFrame ) {
+			const int frameMsec = GetMSec();
+			// Prediction can replay the same snapshot more than once.  Rebase the
+			// complete set of gameplay deadline owners only on the first pass for
+			// a real client frame, matching the authoritative server traversal.
+			// Suppress per-player command presentation during this pass; the view
+			// owner is presented once below after the original command array is
+			// restored.
+			const usercmd_t *savedUsercmds = usercmds;
+			usercmds = NULL;
+			for ( ent = spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next() ) {
+				currentThinkingEntity = ent;
+				ent->ThinkMatchPaused( frameMsec );
+				currentThinkingEntity = NULL;
+			}
+			usercmds = savedUsercmds;
+
+			// Posted gameplay events use absolute game time.  Move them with the
+			// frozen simulation instead of servicing them while client time runs.
+			if ( !idEvent::ShiftEvents( frameMsec ) ) {
+				Warning( "competitive client pause could not rebase the posted-event queue" );
+			}
 		}
-	}
 
-	// run client entities
-	if ( isNewFrame ) {
-		// rjohnson: only run the entire logic when it is a new frame
-		rvClientEntity* cent;
-		for ( cent = clientSpawnedEntities.Next(); cent != NULL; cent = cent->spawnNode.Next() ) {
-			cent->Think();
+		// Keep camera angles, HUD and render-view state responsive on every
+		// prediction pass without advancing movement, weapons, effects or other
+		// gameplay.  Repeaters render through their followed player; normal
+		// server demos render through the fake free-view player.
+		idPlayer *pauseViewPlayer = player;
+		if ( clientNum == MAX_CLIENTS && isRepeater ) {
+			pauseViewPlayer = NULL;
+			const int demoFollowClient = GetDemoFollowClient();
+			if ( demoFollowClient >= 0 && demoFollowClient < MAX_CLIENTS &&
+				 entities[ demoFollowClient ] != NULL &&
+				 entities[ demoFollowClient ]->IsType( idPlayer::GetClassType() ) ) {
+				pauseViewPlayer = static_cast< idPlayer * >( entities[ demoFollowClient ] );
+			}
 		}
-	}
-
-	// freeView
-	if ( clientNum == MAX_CLIENTS && player && isNewFrame && !isRepeater) {
-		assert( player->IsFakeClient() );
-
-		player->ClientPredictionThink();
-		player->UpdateVisuals();
-
-		assert( player->spectating );
-
-		if ( player->spectator != player->entityNumber ) {
-			followPlayer = player->spectator;
-		} else {
-			followPlayer = -1;
+		if ( pauseViewPlayer != NULL ) {
+			pauseViewPlayer->ThinkMatchPaused( 0 );
 		}
-	}
 
-	// service any pending events
-	idEvent::ServiceEvents();
+		// Preserve the free-view routing state without invoking the normal
+		// prediction path, which would move the spectator and service gameplay.
+		if ( clientNum == MAX_CLIENTS && player && isNewFrame && !isRepeater ) {
+			assert( player->IsFakeClient() );
+			player->UpdateVisuals();
+			assert( player->spectating );
+
+			if ( player->spectator != player->entityNumber ) {
+				followPlayer = player->spectator;
+			} else {
+				followPlayer = -1;
+			}
+		}
+	} else {
+		// run prediction on all entities from the last snapshot
+		for ( ent = snapshotEntities.Next(); ent != NULL; ent = ent->snapshotNode.Next() ) {
+			// don't force TH_PHYSICS on, only call ClientPredictionThink if thinkFlags != 0
+			// it's better to synchronize TH_PHYSICS on specific entities when needed ( movers may be trouble )
+			if ( ent->thinkFlags != 0 ) {
+				ent->ClientPredictionThink();
+			}
+		}
+
+		// run client entities
+		if ( isNewFrame ) {
+			// rjohnson: only run the entire logic when it is a new frame
+			rvClientEntity* cent;
+			for ( cent = clientSpawnedEntities.Next(); cent != NULL; cent = cent->spawnNode.Next() ) {
+				cent->Think();
+			}
+		}
+
+		// freeView
+		if ( clientNum == MAX_CLIENTS && player && isNewFrame && !isRepeater) {
+			assert( player->IsFakeClient() );
+
+			player->ClientPredictionThink();
+			player->UpdateVisuals();
+
+			assert( player->spectating );
+
+			if ( player->spectator != player->entityNumber ) {
+				followPlayer = player->spectator;
+			} else {
+				followPlayer = -1;
+			}
+		}
+
+		// service any pending events
+		idEvent::ServiceEvents();
+	}
 
 	// show any debug info for this frame
 	if ( isNewFrame ) {

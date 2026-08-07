@@ -11,6 +11,14 @@
 
 static const int ARENA_CAMPAIGN_ENTRANCE_MIN_MSEC = 3000;
 
+static void ShiftGameStateDeadline( int &deadline, int deltaMsec ) {
+	if ( deadline <= 0 || deltaMsec <= 0 ) {
+		return;
+	}
+	const int maxInt = 0x7fffffff;
+	deadline = deadline > maxInt - deltaMsec ? maxInt : deadline + deltaMsec;
+}
+
 /*
 ===============================================================================
 
@@ -64,6 +72,12 @@ void rvGameState::Clear( void ) {
 	overtimeStartTime = 0;
 }
 
+void rvGameState::ShiftMatchTime( int deltaMsec ) {
+	ShiftGameStateDeadline( nextStateTime, deltaMsec );
+	ShiftGameStateDeadline( fragLimitTimeout, deltaMsec );
+	ShiftGameStateDeadline( overtimeStartTime, deltaMsec );
+}
+
 /*
 ================
 rvGameState::StartOvertime
@@ -87,6 +101,9 @@ bool rvGameState::StartOvertime( void ) {
 
 	overtimeSeconds = gameLocal.serverInfo.GetInt( "si_overtime" );
 	if ( overtimeSeconds <= 0 ) {
+		return false;
+	}
+	if ( !gameLocal.mpGame.BeginMatchOvertimePeriod() ) {
 		return false;
 	}
 
@@ -390,8 +407,9 @@ void rvGameState::Run( void ) {
 	}
 
 	if ( nextState != INACTIVE && gameLocal.time > nextStateTime ) {
-		NewState( nextState );
-		nextState = INACTIVE;
+		if ( NewState( nextState ) ) {
+			nextState = INACTIVE;
+		}
 	}
 
 	switch( currentState ) {
@@ -468,17 +486,21 @@ void rvGameState::Run( void ) {
 #endif
 //RAVEN END
 			if ( gameLocal.mpGame.IsArenaCampaignMatch() ) {
-				if ( gameLocal.mpGame.AllPlayersReady() ) {
-					NewState( COUNTDOWN );
+				if ( gameLocal.mpGame.AllPlayersReady() && NewState( COUNTDOWN ) ) {
 					nextState = GAMEON;
 					nextStateTime = gameLocal.time + Max( ARENA_CAMPAIGN_ENTRANCE_MIN_MSEC,
 						1000 * gameLocal.serverInfo.GetInt( "si_countDown" ) );
 				}
 			} else if( !gameLocal.serverInfo.GetBool( "si_warmup" ) && gameLocal.gameType != GAME_TOURNEY ) {
 				// tourney always needs a warmup, to ensure that at least 2 players get seeded for the tournament.
-				NewState( GAMEON );
-			} else if ( gameLocal.mpGame.AllPlayersReady() ) {			
-				NewState( COUNTDOWN );
+				// Keep the legal lifecycle edge even when the presentation countdown
+				// is disabled. The next frame consumes this zero-length countdown.
+				if ( NewState( COUNTDOWN ) ) {
+					nextState = GAMEON;
+					nextStateTime = gameLocal.time;
+				}
+			} else if ( gameLocal.mpGame.CanCommitMatchPhaseTransition( COUNTDOWN ) &&
+					NewState( COUNTDOWN ) ) {
 				nextState = GAMEON;
 				nextStateTime = gameLocal.time + 1000 * gameLocal.serverInfo.GetInt( "si_countDown" );
 			}
@@ -495,12 +517,15 @@ void rvGameState::Run( void ) {
 rvGameState::NewState
 ================
 */
-void rvGameState::NewState( mpGameState_t newState ) {
+bool rvGameState::NewState( mpGameState_t newState ) {
 	idBitMsg	outMsg;
 	byte		msgBuf[MAX_GAME_MESSAGE_SIZE];
 	int			i;
 
 	assert( (newState != currentState) && gameLocal.isServer );
+	if ( !gameLocal.mpGame.CommitMatchPhaseTransition( newState ) ) {
+		return false;
+	}
 	
 	switch( newState ) {
 		case WARMUP: {
@@ -786,6 +811,7 @@ void rvGameState::NewState( mpGameState_t newState ) {
 	}
 
 	currentState = newState;
+	return true;
 }
 
 /*
@@ -1687,6 +1713,14 @@ void rvTourneyGameState::Clear( void ) {
 	roundTimeout = 0;
 }
 
+void rvTourneyGameState::ShiftMatchTime( int deltaMsec ) {
+	rvGameState::ShiftMatchTime( deltaMsec );
+	ShiftGameStateDeadline( roundTimeout, deltaMsec );
+	for ( int index = 0; index <= MAX_ARENAS; ++index ) {
+		arenas[ index ].ShiftMatchTime( deltaMsec );
+	}
+}
+
 /*
 ================
 rvTourneyGameState::Reset
@@ -1914,8 +1948,15 @@ void rvTourneyGameState::Run( void ) {
 rvTourneyGameState::NewState
 ================
 */
-void rvTourneyGameState::NewState( mpGameState_t newState ) {
+bool rvTourneyGameState::NewState( mpGameState_t newState ) {
 	assert( (newState != currentState) && gameLocal.isServer );
+	// Tourney prepares brackets before the base adapter applies the transition.
+	// Preflight first so a rejected authoritative edge has no bracket/spectate
+	// side effects; rvGameState::NewState performs the actual atomic commit.
+	if ( gameLocal.mpGame.GetMatchSession().GetPhase() != newState &&
+		!gameLocal.mpGame.CanCommitMatchPhaseTransition( newState ) ) {
+		return false;
+	}
 
 	switch( newState ) {
 		case WARMUP: {
@@ -1935,7 +1976,7 @@ void rvTourneyGameState::NewState( mpGameState_t newState ) {
 		}
 	}
 
-	rvGameState::NewState( newState );
+	return rvGameState::NewState( newState );
 }
 
 /*
@@ -2705,35 +2746,80 @@ int rvTourneyGameState::GetPrevActiveArena( int arena ) {
 	return arena;
 }
 
+/*
+================
+rvTourneyGameState::CycleSpectatorTarget
+
+Walk the fixed arena/seat space in display order, skipping inactive brackets
+and every camera target rejected by the same fresh disclosure gate used by the
+normal spectator path.  The bounded scan cannot loop forever when all targets
+are private or stale.
+================
+*/
+bool rvTourneyGameState::CycleSpectatorTarget( idPlayer* player,
+		int direction ) {
+	if ( player == NULL || ( direction != 1 && direction != -1 ) ) {
+		return false;
+	}
+
+	int currentArena = player->GetArena();
+	if ( currentArena < 0 || currentArena >= MAX_ARENAS ) {
+		currentArena = 0;
+	}
+	int currentSeat = -1;
+	idPlayer **currentPlayers = arenas[ currentArena ].GetPlayers();
+	for ( int seat = 0; seat < 2; ++seat ) {
+		if ( currentPlayers[ seat ] != NULL &&
+			player->spectator == currentPlayers[ seat ]->entityNumber ) {
+			currentSeat = seat;
+			break;
+		}
+	}
+
+	const int targetCount = MAX_ARENAS * 2;
+	const int baseTarget = currentSeat >= 0 ?
+		currentArena * 2 + currentSeat :
+		( direction > 0 ? currentArena * 2 - 1 : currentArena * 2 );
+	const bool mayChangeArena = player->GetArena() < 0 ||
+		player->GetArena() >= MAX_ARENAS ||
+		gameLocal.time > player->lastArenaChange;
+
+	for ( int step = 1; step <= targetCount; ++step ) {
+		int flatTarget = ( baseTarget + direction * step ) % targetCount;
+		if ( flatTarget < 0 ) {
+			flatTarget += targetCount;
+		}
+		const int targetArena = flatTarget / 2;
+		const int targetSeat = flatTarget % 2;
+		if ( arenas[ targetArena ].GetState() == AS_INACTIVE ||
+			arenas[ targetArena ].GetState() == AS_DONE ||
+			( targetArena != player->GetArena() && !mayChangeArena ) ) {
+			continue;
+		}
+		idPlayer *target = arenas[ targetArena ].GetPlayers()[ targetSeat ];
+		if ( target == NULL || target->spectating ||
+			!gameLocal.mpGame.CanSpectatorFollow( player->entityNumber,
+				target->entityNumber ) ) {
+			continue;
+		}
+
+		if ( targetArena != player->GetArena() ) {
+			player->JoinInstance( targetArena );
+			player->lastArenaChange = gameLocal.time + 2000;
+		}
+		player->spectator = target->entityNumber;
+		return true;
+	}
+
+	// A private, disconnected or empty bracket must never leave a stale POV.
+	player->spectator = player->entityNumber;
+	return false;
+}
+
 void rvTourneyGameState::SpectateCycleNext( idPlayer* player ) {
 	assert( IsType( rvTourneyGameState::GetClassType() ) );
 	assert( gameLocal.isServer || player->IsFakeClient() );
-
-	rvTourneyArena& spectatingArena = arenas[ player->GetArena() ];
-	
-	idPlayer** players = spectatingArena.GetPlayers();
-
-	if( !players[ 0 ] || !players[ 1 ] || players[ 0 ]->spectating || players[ 1 ]->spectating ) {
-		// setting the spectated client to ourselves will unlock us
-		player->spectator = player->entityNumber;
-		return;
-	}
-
-	if( player->spectator != players[ 0 ]->entityNumber && player->spectator != players[ 1 ]->entityNumber ) {
-		player->spectator = players[ 0 ]->entityNumber;
-	} else if( player->spectator == players[ 0 ]->entityNumber ) {
-		player->spectator = players[ 1 ]->entityNumber;
-	} else if( player->spectator == players[ 1 ]->entityNumber ) {
-		if( gameLocal.time > player->lastArenaChange ) {
-			if ( GetNumArenas() <= 0 ) {
-				player->JoinInstance( 0 );
-			} else {
-				player->JoinInstance( GetNextActiveArena( player->GetArena() ) );
-			}
-			player->lastArenaChange = gameLocal.time + 2000;
-			player->spectator = player->entityNumber;
-		}
-	}
+	CycleSpectatorTarget( player, 1 );
 
 	// this is where the listen server updates it's gui spectating elements
 	if ( gameLocal.GetLocalPlayer() == player ) {
@@ -2754,43 +2840,7 @@ void rvTourneyGameState::SpectateCycleNext( idPlayer* player ) {
 void rvTourneyGameState::SpectateCyclePrev( idPlayer* player ) {
 	assert( IsType( rvTourneyGameState::GetClassType() ) );
 	assert( gameLocal.isServer || player->IsFakeClient() );
-
-	rvTourneyArena& spectatingArena = arenas[ player->GetArena() ];
-
-	idPlayer** players = spectatingArena.GetPlayers();
-
-	if( !players[ 0 ] || !players[ 1 ] || players[ 0 ]->spectating || players[ 1 ]->spectating ) {
-		// setting the spectated client to ourselves will unlock us
-		player->spectator = player->entityNumber;
-		return;
-	}
-
-	if( player->spectator != players[ 0 ]->entityNumber && player->spectator != players[ 1 ]->entityNumber ) {
-		if( gameLocal.time > player->lastArenaChange ) {
-			if ( GetNumArenas() <= 0 ) {
-				player->JoinInstance( 0 );
-			} else {
-				player->JoinInstance( GetPrevActiveArena( player->GetArena() ) );
-			}
-			player->lastArenaChange = gameLocal.time + 2000;
-			
-			rvTourneyArena& newSpectatingArena = arenas[ player->GetArena() ];
-		
-			idPlayer** newPlayers = newSpectatingArena.GetPlayers();
-
-			if( !newPlayers[ 0 ] || !newPlayers[ 1 ] || newPlayers[ 0 ]->spectating || newPlayers[ 1 ]->spectating ) {
-				// setting the spectated client to ourselves will unlock us
-				player->spectator = player->entityNumber;
-				return;
-			}
-
-			player->spectator = newPlayers[ 1 ]->entityNumber;
-		} 
-	} else if( player->spectator == players[ 0 ]->entityNumber ) {
-		player->spectator = player->entityNumber;
-	} else if( player->spectator == players[ 1 ]->entityNumber ) {
-		player->spectator = players[ 0 ]->entityNumber;
-	}
+	CycleSpectatorTarget( player, -1 );
 
 	// this is where the listen server updates it gui spectating elements
 	if( gameLocal.GetLocalPlayer() == player ) {

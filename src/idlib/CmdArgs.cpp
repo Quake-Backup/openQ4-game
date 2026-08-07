@@ -23,47 +23,48 @@ idCmdArgs::Args
 ============
 */
 const char *idCmdArgs::Args(  int start, int end, bool escapeArgs ) const {
-	static char cmd_args[MAX_COMMAND_STRING];
+	static idStr cmd_args;
 	int		i;
 
+	if ( start < 0 ) {
+		start = 0;
+	}
 	if ( end < 0 ) {
 		end = argc - 1;
 	} else if ( end >= argc ) {
 		end = argc - 1;
 	}
-	cmd_args[0] = '\0';
+	cmd_args.Clear();
 	if ( escapeArgs ) {
-		strcat( cmd_args, "\"" );
+		cmd_args += "\"";
 	}
 	for ( i = start; i <= end; i++ ) {
 		if ( i > start ) {
 			if ( escapeArgs ) {
-				strcat( cmd_args, "\" \"" );
+				cmd_args += "\" \"";
 			} else {
-				strcat( cmd_args, " " );
+				cmd_args += " ";
 			}
 		}
 		if ( escapeArgs && strchr( argv[i], '\\' ) ) {
 			char *p = argv[i];
 			while ( *p != '\0' ) {
 				if ( *p == '\\' ) {
-					strcat( cmd_args, "\\\\" );
+					cmd_args += "\\\\";
 				} else {
-					int l = strlen( cmd_args );
-					cmd_args[ l ] = *p;
-					cmd_args[ l+1 ] = '\0';
+					cmd_args += *p;
 				}
 				p++;
 			}
 		} else {
-			strcat( cmd_args, argv[i] );
+			cmd_args += argv[i];
 		}
 	}
 	if ( escapeArgs ) {
-		strcat( cmd_args, "\"" );
+		cmd_args += "\"";
 	}
 
-	return cmd_args;
+	return cmd_args.c_str();
 }
 
 /*
@@ -88,7 +89,7 @@ void idCmdArgs::TokenizeString( const char *text, bool keepAsStrings ) {
 		return;
 	}
 
-	lex.LoadMemory( text, strlen( text ), "idCmdSystemLocal::TokenizeString" );
+	lex.LoadMemory( text, idLib::SizeToInt( strlen( text ), "idCmdArgs::TokenizeString" ), "idCmdSystemLocal::TokenizeString" );
 	lex.SetFlags( LEXFL_NOERRORS
 				| LEXFL_NOWARNINGS
 				| LEXFL_NOSTRINGCONCAT
@@ -147,15 +148,37 @@ idCmdArgs::AppendArg
 ============
 */
 void idCmdArgs::AppendArg( const char *text ) {
-	if ( !argc ) {
-		argc = 1;
+	if ( !text ) {
+		text = "";
+	}
+
+	// Harden against malformed command-line input paths that might feed
+	// pathological token counts into a single command.
+	if ( argc < 0 || argc > MAX_COMMAND_ARGS ) {
+		argc = 0;
+	}
+
+	if ( argc == 0 ) {
 		argv[ 0 ] = tokenized;
 		idStr::Copynz( tokenized, text, sizeof( tokenized ) );
-	} else {
-		argv[ argc ] = argv[ argc-1 ] + strlen( argv[ argc-1 ] ) + 1;
-		idStr::Copynz( argv[ argc ], text, sizeof( tokenized ) - ( argv[ argc ] - tokenized ) );
-		argc++;
+		argc = 1;
+		return;
 	}
+
+	if ( argc >= MAX_COMMAND_ARGS ) {
+		return;
+	}
+
+	char *next = argv[ argc - 1 ] + strlen( argv[ argc - 1 ] ) + 1;
+	if ( next < tokenized || next >= tokenized + sizeof( tokenized ) ) {
+		return;
+	}
+
+	const size_t used = static_cast<size_t>( next - tokenized );
+	const int remaining = idLib::SizeToInt( sizeof( tokenized ) - used, "idCmdArgs::AppendArg" );
+	argv[ argc ] = next;
+	idStr::Copynz( argv[ argc ], text, remaining );
+	argc++;
 }
 
 /*

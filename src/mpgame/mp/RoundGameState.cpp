@@ -64,6 +64,21 @@ void rvRoundGameState::Clear( void ) {
 	}
 }
 
+void rvRoundGameState::ShiftMatchTime( int deltaMsec ) {
+	rvGameState::ShiftMatchTime( deltaMsec );
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+	const int maxInt = 0x7fffffff;
+	int *deadlines[] = { &roundStartTime, &roundStateTime };
+	for ( int index = 0; index < 2; ++index ) {
+		int &deadline = *deadlines[ index ];
+		if ( deadline > 0 ) {
+			deadline = deadline > maxInt - deltaMsec ? maxInt : deadline + deltaMsec;
+		}
+	}
+}
+
 /*
 ================
 rvRoundGameState::IsEliminated
@@ -438,8 +453,14 @@ void rvRoundGameState::ResetRound( void ) {
 rvRoundGameState::ScheduleNextRound
 ================
 */
-void rvRoundGameState::ScheduleNextRound( void ) {
+bool rvRoundGameState::ScheduleNextRound( void ) {
 	int warmupDelay = gameLocal.serverInfo.GetInt( "si_roundWarmupDelay" );
+	// Commit the authoritative edge before resetting players, counters, scores,
+	// or deadlines.  A rejected transition must leave the active/completed round
+	// entirely untouched so the next frame can retry or report the invariant.
+	if ( !SetRoundState( RS_COUNTDOWN ) ) {
+		return false;
+	}
 
 	// NewState( GAMEON ) has just restarted the map for the first round, so
 	// resetting again here would respawn everyone twice in two frames
@@ -457,9 +478,9 @@ void rvRoundGameState::ScheduleNextRound( void ) {
 	roundNumber++;
 	roundWinner = TEAM_NONE;
 
-	SetRoundState( RS_COUNTDOWN );
 	roundStateTime = gameLocal.time + Max( 0, warmupDelay ) * 1000;
 	roundStartTime = roundStateTime;
+	return true;
 }
 
 /*
@@ -467,8 +488,12 @@ void rvRoundGameState::ScheduleNextRound( void ) {
 rvRoundGameState::SetRoundState
 ================
 */
-void rvRoundGameState::SetRoundState( roundState_t newState ) {
+bool rvRoundGameState::SetRoundState( roundState_t newState ) {
+	if ( !gameLocal.mpGame.CommitMatchRoundTransition( newState ) ) {
+		return false;
+	}
 	roundState = newState;
+	return true;
 }
 
 /*
@@ -488,11 +513,12 @@ void rvRoundGameState::Run( void ) {
 	// rounds only turn over while the match itself is running
 	if ( currentState != GAMEON ) {
 		if ( roundState != RS_INACTIVE ) {
-			SetRoundState( RS_INACTIVE );
-			roundNumber = 0;
-			roundStartTime = 0;
-			roundStateTime = 0;
-			roundWinner = TEAM_NONE;
+			if ( SetRoundState( RS_INACTIVE ) ) {
+				roundNumber = 0;
+				roundStartTime = 0;
+				roundStateTime = 0;
+				roundWinner = TEAM_NONE;
+			}
 		}
 		return;
 	}
@@ -514,10 +540,11 @@ void rvRoundGameState::Run( void ) {
 
 		case RS_COUNTDOWN: {
 			if ( gameLocal.time >= roundStateTime ) {
-				SetRoundState( RS_ACTIVE );
-				roundStartTime = gameLocal.time;
-				roundStateTime = 0;
-				RoundBegin();
+				if ( SetRoundState( RS_ACTIVE ) ) {
+					roundStartTime = gameLocal.time;
+					roundStateTime = 0;
+					RoundBegin();
+				}
 			}
 			break;
 		}
@@ -526,27 +553,39 @@ void rvRoundGameState::Run( void ) {
 			int roundTimeLimit = gameLocal.serverInfo.GetInt( "si_roundTimeLimit" );
 
 			if ( CheckRoundEnd( winningTeam ) ) {
-				AwardRound( winningTeam );
-				RoundEnd( winningTeam );
-				SetRoundState( RS_COMPLETE );
-				roundStateTime = gameLocal.time + Max( 1, gameLocal.serverInfo.GetInt( "si_roundEndDelay" ) ) * 1000;
+				if ( SetRoundState( RS_COMPLETE ) ) {
+					AwardRound( winningTeam );
+					RoundEnd( winningTeam );
+					roundStateTime = gameLocal.time + Max( 1, gameLocal.serverInfo.GetInt( "si_roundEndDelay" ) ) * 1000;
+				}
 				break;
 			}
 
 			if ( roundTimeLimit > 0 && gameLocal.time >= roundStartTime + roundTimeLimit * 1000 ) {
 				winningTeam = ResolveRoundTimeout();
-				AwardRound( winningTeam );
-				RoundEnd( winningTeam );
-				SetRoundState( RS_COMPLETE );
-				roundStateTime = gameLocal.time + Max( 1, gameLocal.serverInfo.GetInt( "si_roundEndDelay" ) ) * 1000;
+				if ( SetRoundState( RS_COMPLETE ) ) {
+					AwardRound( winningTeam );
+					RoundEnd( winningTeam );
+					roundStateTime = gameLocal.time + Max( 1, gameLocal.serverInfo.GetInt( "si_roundEndDelay" ) ) * 1000;
+				}
 			}
 			break;
 		}
 
 		case RS_COMPLETE: {
 			if ( gameLocal.time >= roundStateTime ) {
-				SetRoundState( RS_INACTIVE );
-				roundStateTime = 0;
+				if ( CheckMatchEnd( winningTeam ) ) {
+					if ( winningTeam != TEAM_NONE ) {
+						gameLocal.mpGame.CenterPrint( -1, "#str_41314",
+							idMultiplayerGame::CPARM_TEAM, winningTeam );
+					}
+					NewState( GAMEREVIEW );
+				} else {
+					// A completed round commits its result before moving directly to
+					// the next round countdown. RS_ACTIVE -> RS_COUNTDOWN shortcuts
+					// and a synthetic live RS_INACTIVE interstitial are both illegal.
+					ScheduleNextRound();
+				}
 			}
 			break;
 		}
@@ -558,10 +597,12 @@ void rvRoundGameState::Run( void ) {
 rvRoundGameState::NewState
 ================
 */
-void rvRoundGameState::NewState( mpGameState_t newState ) {
+bool rvRoundGameState::NewState( mpGameState_t newState ) {
 	int i;
 
-	rvGameState::NewState( newState );
+	if ( !rvGameState::NewState( newState ) ) {
+		return false;
+	}
 
 	if ( newState == GAMEON ) {
 		// the first round is scheduled by Run() on the next frame, so the
@@ -576,6 +617,7 @@ void rvRoundGameState::NewState( mpGameState_t newState ) {
 			eliminated[ i ] = false;
 		}
 	}
+	return true;
 }
 
 /*

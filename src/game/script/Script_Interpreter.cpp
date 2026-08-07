@@ -163,8 +163,8 @@ void idInterpreter::Restore( idRestoreGame *savefile ) {
 		multiFrameEvent = NULL;
 	}
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( eventEntity ) );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( thread ) );
+	savefile->ReadObject( eventEntity );
+	savefile->ReadObject( thread );
 
 	savefile->ReadBool( doneProcessing );
 	savefile->ReadBool( threadDying );

@@ -571,6 +571,19 @@ public:
 		bool		meleeSuperhero			:1;
 		bool		killerGuard				:1;			// Do 100 points of damage with each hit
 	} aifl;
+
+// openQ4 BEGIN
+	// Liquid state. Monsters have no idPhysics_Player to keep this for them, so idAI tracks its own
+	// 0-3 water level from idGameLocal::LiquidLevelForEntity.
+	int						liquidLevel;			// 0 none, 1 feet, 2 waist, 3 head
+	int						liquidType;				// the CONTENTS_ bits of whatever they are standing in
+	int						liquidAirTics;			// breath left while submerged
+	int						nextLiquidDamageTime;	// pain debounce for lava and slime
+	bool					liquidCanBreathe;		// "canBreatheLiquid" on the def: never drowns
+	bool					liquidImmune;			// "liquidImmune" on the def: lava and slime do nothing
+
+	void					UpdateLiquid					( void );
+// openQ4 END
 	
 	//
 	// ai/ai.cpp

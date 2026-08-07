@@ -68,7 +68,7 @@ void idPhysics_Actor::Restore( idRestoreGame *savefile ) {
 	savefile->ReadFloat( mass );
 	savefile->ReadFloat( invMass );
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( masterEntity ) );
+	savefile->ReadObject( masterEntity );
 	savefile->ReadFloat( masterYaw );
 	savefile->ReadFloat( masterDeltaYaw );
 

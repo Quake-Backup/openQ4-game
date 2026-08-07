@@ -535,7 +535,10 @@ void idPhysics_Player::WaterJumpMove( void ) {
 	idPhysics_Player::SlideMove( true, true, false, false );
 
 	// add gravity
-	current.velocity += gravityNormal * frametime;
+	// openQ4: this used gravityNormal, which is a unit vector, so the water jump barely fell at
+	// all and the 2000ms timer had to expire before control came back. Quake 3 applies full
+	// gravity here, which is what gravityVector is.
+	current.velocity += gravityVector * frametime;
 	// if falling down
 	if ( current.velocity * gravityNormal > 0.0f ) {
 		// cancel as soon as we are falling down again
@@ -1385,7 +1388,9 @@ void idPhysics_Player::SetWaterLevel( void ) {
 // RAVEN END
 	if ( contents & MASK_WATER ) {
 
-		waterType = contents;
+		// openQ4: the probe asks for every content flag, so raw contents also carries trigger and
+		// AAS bits from whatever else overlaps the point. Only the liquid bits mean anything here.
+		waterType = contents & MASK_WATER;
 		waterLevel = WATERLEVEL_FEET;
 
 		// check at waist level
@@ -1518,12 +1523,11 @@ void idPhysics_Player::MovePlayer( int msec ) {
 	}
 
 	// set watertype and waterlevel
-// RAVEN BEGIN
-// ddynerman: water disabled in MP
-	if ( !gameLocal.isMultiplayer ) {
-		idPhysics_Player::SetWaterLevel();
-	}
-// RAVEN END
+// openQ4 BEGIN
+	// Raven disabled water in multiplayer entirely; Quake 3 has always had it, so it runs
+	// everywhere now. waterLevel is derived from the origin each frame, so it predicts cleanly.
+	idPhysics_Player::SetWaterLevel();
+// openQ4 END
 
 	// check for ground
 	idPhysics_Player::CheckGround( true );
@@ -1551,15 +1555,14 @@ void idPhysics_Player::MovePlayer( int msec ) {
 		// going up or down a ladder
 		idPhysics_Player::LadderMove();
 	}
-// RAVEN BEGIN
-// ddynerman: water disabled in MP
-	else if ( !gameLocal.isMultiplayer && current.movementFlags & PMF_TIME_WATERJUMP ) {
+// openQ4 BEGIN
+	else if ( current.movementFlags & PMF_TIME_WATERJUMP ) {
 
 		// jumping out of water
 		idPhysics_Player::WaterJumpMove();
 	}
-	else if ( !gameLocal.isMultiplayer && waterLevel > 1 ) {
-// RAVEN END
+	else if ( waterLevel > WATERLEVEL_FEET ) {
+// openQ4 END
 		// swimming
 		idPhysics_Player::WaterMove();
 	}
@@ -1572,12 +1575,7 @@ void idPhysics_Player::MovePlayer( int msec ) {
 		idPhysics_Player::AirMove();
 	}
 
-// RAVEN BEGIN
-// ddynerman: water disabled in MP
-	if( !gameLocal.isMultiplayer ) {
-		idPhysics_Player::SetWaterLevel();
-	}
-// RAVEN END
+	idPhysics_Player::SetWaterLevel();
 
 	idPhysics_Player::CheckGround( false );
 
@@ -1907,6 +1905,14 @@ bool idPhysics_Player::Evaluate( int timeStepMSec, int endTimeMSec ) {
 		masterDeltaYaw = masterYaw;
 		masterYaw = masterAxis[0].ToYaw();
 		masterDeltaYaw = masterYaw - masterDeltaYaw;
+
+// openQ4 BEGIN
+		// Riding a mover skips MovePlayer, and with it SetWaterLevel. Without this the player
+		// reports bone dry while being carried under the surface on a lift, so they never drown
+		// and never get the underwater treatment.
+		idPhysics_Player::SetWaterLevel();
+// openQ4 END
+
 		return true;
 	}
 

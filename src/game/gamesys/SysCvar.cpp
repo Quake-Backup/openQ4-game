@@ -406,7 +406,17 @@ idCVar pm_thirdPersonClip(			"pm_thirdPersonClip",		"1",			CVAR_GAME | CVAR_BOOL
 idCVar pm_thirdPerson(				"pm_thirdPerson",			"0",			CVAR_GAME | CVAR_BOOL, "enables third person view" );
 idCVar pm_thirdPersonDeath(			"pm_thirdPersonDeath",		"0",			CVAR_GAME | CVAR_BOOL, "enables third person view when player dies" );
 idCVar pm_modelView(				"pm_modelView",				"0",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "draws camera from POV of player model (1 = always, 2 = when dead)", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
-idCVar pm_airTics(					"pm_air",					"1800",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how long in milliseconds the player can go without air before he starts taking damage" );
+idCVar pm_airTics(					"pm_air",					"1800",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how many 60Hz frames the player can spend in a vacuum before taking damage" );
+
+// openQ4 BEGIN
+idCVar pm_waterAirTics(				"pm_waterAir",				"720",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how many 60Hz frames the player can stay submerged before drowning, 720 is Quake 3's twelve seconds" );
+idCVar g_liquidDamageInterval(		"g_liquidDamageInterval",	"500",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "milliseconds between lava and slime damage ticks" );
+idCVar g_drownDamageMax(			"g_drownDamageMax",			"15",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "maximum damage per drowning tick, the ramp starts at the damage def's value and climbs to this" );
+idCVar g_liquidScreenTint(			"g_liquidScreenTint",		"1",			CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "strength of the full screen tint while the camera is under a liquid surface, 0 disables it", 0.0f, 1.0f );
+idCVar g_debugLiquid(				"g_debugLiquid",			"0",			CVAR_GAME | CVAR_BOOL, "print player liquid state changes and liquid damage to the console" );
+idCVar g_liquidTestVolume(          "g_liquidTestVolume",       "",             CVAR_GAME, "dev aid: spawn a liquid volume around the player on spawn - water, slime or lava, empty to disable" );
+idCVar g_liquidTestVolumeSize(      "g_liquidTestVolumeSize",   "640",          CVAR_GAME | CVAR_FLOAT, "cube size of the g_liquidTestVolume box" );
+// openQ4 END
 
 // RAVEN BEGIN
 // asalmon: parameters for aim assistance on Xenon - or a non-final pc build so Caryn can edit the guis

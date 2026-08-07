@@ -53,7 +53,13 @@ def main() -> None:
 
     # Arena always gets a real, readable entrance countdown and presentation.
     require(game_state, "ARENA_CAMPAIGN_ENTRANCE_MIN_MSEC = 3000", "entrance minimum")
-    require(game_state, "NewState( COUNTDOWN );", "Arena countdown transition")
+    # NewState is a guarded transition now, so pin the arena branch itself
+    # rather than a bare statement that any gametype could satisfy.
+    require(
+        game_state,
+        "gameLocal.mpGame.AllPlayersReady() && NewState( COUNTDOWN )",
+        "Arena countdown transition",
+    )
     require(game_state, "BeginArenaCampaignEntrancePresentation();", "entrance GUI event")
     require(game_state, "ClearArenaCampaignPresentation();", "presentation cleanup")
     require(
@@ -123,7 +129,11 @@ def main() -> None:
     require(round_modes_h, "class rvRedRoverGameState : public rvRoundGameState", "Red Rover base state")
     require(round_state, "void rvRoundGameState::Run( void ) {\n\tint winningTeam;\n\n\trvGameState::Run();", "round-mode global entrance path")
     require(round_state, "NewState( GAMEREVIEW );", "round-mode terminal review path")
-    require(round_state, "rvGameState::NewState( newState );", "round-mode shared state transitions")
+    require(
+        round_state,
+        "if ( !rvGameState::NewState( newState ) ) {",
+        "round-mode shared state transitions",
+    )
 
     # The local camera is collision clipped, keeps the focused body visible and
     # cleanly falls through to stock cameras outside Arena presentation states.

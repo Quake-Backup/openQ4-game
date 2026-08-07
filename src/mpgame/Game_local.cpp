@@ -1876,6 +1876,9 @@ idGameLocal::VerifyServerSettings_f
 ===================
 */
 void idGameLocal::VerifyServerSettings_f( const idCmdArgs &args ) {
+	if ( gameLocal.mpGame.RejectManagedLegacyMutation( "verify server settings" ) ) {
+		return;
+	}
 	gameLocal.mpGame.PickMap( si_gameType.GetString() );
 }
 
@@ -1885,6 +1888,9 @@ idGameLocal::MapRestart_f
 ===================
 */
 void idGameLocal::MapRestart_f( const idCmdArgs &args ) {
+	if ( gameLocal.mpGame.RejectManagedLegacyMutation( "server map restart" ) ) {
+		return;
+	}
 	if ( !gameLocal.isMultiplayer || gameLocal.isClient ) {
 		common->Printf( "server is not running - use spawnServer\n" );
 		cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "spawnServer\n" );
@@ -1938,7 +1944,7 @@ bool idGameLocal::NextMap( void ) {
 
 		src.FreeSource();
 		src.SetFlags( LEXFL_NOFATALERRORS | LEXFL_ALLOWPATHNAMES | LEXFL_ALLOWMULTICHARLITERALS | LEXFL_ALLOWBACKSLASHSTRINGCONCAT );
-		src.LoadMemory( mapCycleList, strlen( mapCycleList ), "idGameLocal::NextMap" );
+		src.LoadMemory( mapCycleList, idLib::SizeToInt( strlen( mapCycleList ), "idGameLocal::NextMap" ), "idGameLocal::NextMap" );
 		if ( src.IsLoaded() ) {
 
 			currentMap = si_map.GetString();
@@ -2016,6 +2022,9 @@ idGameLocal::NextMap_f
 ===================
 */
 void idGameLocal::NextMap_f( const idCmdArgs &args ) {
+	if ( gameLocal.mpGame.RejectManagedLegacyMutation( "server next map" ) ) {
+		return;
+	}
 	if ( !gameLocal.isMultiplayer || gameLocal.isClient ) {
 		common->Printf( "server is not running\n" );
 		return;
@@ -2388,7 +2397,7 @@ bool idGameLocal::InitFromSaveGame( const char *mapName, idRenderWorld *renderWo
 	}
 
 	for( i = 0; i < MAX_GENTITIES; i++ ) {
-		savegame.ReadObject( reinterpret_cast<idClass *&>( entities[ i ] ) );
+		savegame.ReadObject( entities[ i ] );
 		savegame.ReadInt( spawnIds[ i ] );
 
 		// restore the entityNumber
@@ -2404,7 +2413,7 @@ bool idGameLocal::InitFromSaveGame( const char *mapName, idRenderWorld *renderWo
 
 // abahr: saving clientEntities
 	for( i = 0; i < MAX_CENTITIES; i++ ) {
-		savegame.ReadObject( reinterpret_cast<idClass *&>( clientEntities[ i ] ) );
+		savegame.ReadObject( clientEntities[ i ] );
 		savegame.ReadInt( clientSpawnIds[ i ] );
 
 		// restore the entityNumber
@@ -2423,12 +2432,12 @@ bool idGameLocal::InitFromSaveGame( const char *mapName, idRenderWorld *renderWo
 
 	// enityHash is restored by idEntity::Restore setting the entity name.
 
-	savegame.ReadObject( reinterpret_cast<idClass *&>( world ) );
+	savegame.ReadObject( world );
 
 	savegame.ReadInt( num );
 	GameLocal_ValidateSaveGameCount( savegame, num, MAX_GENTITIES, "spawned entity count" );
 	for( i = 0; i < num; i++ ) {
-		savegame.ReadObject( reinterpret_cast<idClass *&>( ent ) );
+		savegame.ReadObject( ent );
 		assert( ent );
 		if ( ent ) {
 			ent->spawnNode.AddToEnd( spawnedEntities );
@@ -2448,7 +2457,7 @@ bool idGameLocal::InitFromSaveGame( const char *mapName, idRenderWorld *renderWo
 	savegame.ReadInt( num );
 	GameLocal_ValidateSaveGameCount( savegame, num, MAX_CENTITIES, "client spawned entity count" );
 	for( i = 0; i < num; ++i ) {
-		savegame.ReadObject( reinterpret_cast<idClass *&>( clientEnt ) );
+		savegame.ReadObject( clientEnt );
 		assert( clientEnt );
 		if ( clientEnt  ) {
 			clientEnt->spawnNode.AddToEnd( clientSpawnedEntities );
@@ -2459,7 +2468,7 @@ bool idGameLocal::InitFromSaveGame( const char *mapName, idRenderWorld *renderWo
 	savegame.ReadInt( num );
 	GameLocal_ValidateSaveGameCount( savegame, num, MAX_GENTITIES, "active entity count" );
 	for( i = 0; i < num; i++ ) {
-		savegame.ReadObject( reinterpret_cast<idClass *&>( ent ) );
+		savegame.ReadObject( ent );
 		assert( ent );
 		if ( ent ) {
 			ent->activeNode.AddToEnd( activeEntities );
@@ -2479,7 +2488,7 @@ bool idGameLocal::InitFromSaveGame( const char *mapName, idRenderWorld *renderWo
 	savegame.ReadInt( i );
 	random.SetSeed( i );
 
-	savegame.ReadObject( reinterpret_cast<idClass *&>( frameCommandThread ) );
+	savegame.ReadObject( frameCommandThread );
 
 	// clip
 	// push
@@ -2539,19 +2548,19 @@ bool idGameLocal::InitFromSaveGame( const char *mapName, idRenderWorld *renderWo
 
 		locationEntities = new idLocationEntity *[ num ];
 		for( i = 0; i < num; i++ ) {
-			savegame.ReadObject( reinterpret_cast<idClass *&>( locationEntities[ i ] ) );
+			savegame.ReadObject( locationEntities[ i ] );
 		}
 	}
 
-	savegame.ReadObject( reinterpret_cast<idClass *&>( camera ) );
+	savegame.ReadObject( camera );
 
 	savegame.ReadMaterial( globalMaterial );
 
 // RAVEN BEGIN
 // bdube: added
+	lastAIAlertActor.Restore( &savegame );
 	lastAIAlertEntity.Restore( &savegame );
 	savegame.ReadInt( lastAIAlertEntityTime );
-	lastAIAlertActor.Restore( &savegame );
 	savegame.ReadInt( lastAIAlertActorTime );
 // RAVEN END
 
@@ -3197,7 +3206,7 @@ void idGameLocal::CacheDictionaryMedia( const idDict *dict ) {
 		const idKeyValue *kv = dict->GetKeyVal( i );
 		
 		#define MATCH(s) \
-			(!kv->GetKey().Icmpn( s, strlen(s) ))
+			(!kv->GetKey().Icmpn( s, sizeof( s ) - 1 ))
 		/**/
 		
 		if ( !kv || !kv->GetValue().Length() ) {
@@ -4073,6 +4082,7 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds, int activeEdito
 	gameReturn_t ret;
 	idPlayer	*player;
 	const renderView_t *view;
+	bool		competitiveGameplayFrozen = false;
 
 	editors = activeEditors;
 	isLastPredictFrame = lastCatchupFrame;
@@ -4108,6 +4118,10 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds, int activeEdito
 		msec = time - previousTime;
 
 		realClientTime = time;
+		if ( isMultiplayer ) {
+			mpGame.BeginCompetitiveFrame();
+			competitiveGameplayFrozen = mpGame.IsGameplayFrozen();
+		}
 		{
 TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 		// bdube: added advanced debug support
@@ -4124,7 +4138,9 @@ TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 
 		// make sure the random number counter is used each frame so random events
 		// are influenced by the player's actions
-		random.RandomInt();
+		if ( !competitiveGameplayFrozen ) {
+			random.RandomInt();
+		}
 
 		if ( player && !( inCinematic && skipCinematic ) ) {
 			// update the renderview so that any gui videos play from the right frame
@@ -4153,19 +4169,23 @@ TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 		usercmds = clientCmds;
 
 		// bots fill in their own slots of that array before anything reads it
-		botManager.Think();
+		if ( !competitiveGameplayFrozen ) {
+			botManager.Think();
+		}
 
 		// create a merged pvs for all players
 		// do this before we process events, which may rely on PVS info
 		SetupPlayerPVS();
 
 		// process events on the server
-		ServerProcessEntityNetworkEventQueue();
+		if ( !competitiveGameplayFrozen ) {
+			ServerProcessEntityNetworkEventQueue();
+		}
 
 		// update our gravity vector if needed.
 		UpdateGravity();
 
-		if ( isLastPredictFrame ) {
+		if ( isLastPredictFrame && !competitiveGameplayFrozen ) {
 			// jscott: effect system uses gravity and the player PVS
 			bse->StartFrame();
 		}
@@ -4181,7 +4201,18 @@ TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 		timer_misc.Stop();
 
 		// let entities think
-		if ( g_timeentities.GetFloat() ) {
+		if ( competitiveGameplayFrozen ) {
+			num = 0;
+			// Resting/dormant entities may still own absolute gameplay deadlines
+			// (dropped items, trigger cooldowns, mover trajectories).  Visit the
+			// complete spawned set exactly once rather than only active thinkers.
+			for ( ent = spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next() ) {
+				currentThinkingEntity = ent;
+				ent->ThinkMatchPaused( msec );
+				currentThinkingEntity = NULL;
+				num++;
+			}
+		} else if ( g_timeentities.GetFloat() ) {
 			// rjohnson: will now draw entity info for long thinkers
 			idPlayer *player;
 			idVec3 origin;
@@ -4278,7 +4309,7 @@ TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 		timer_events.Clear();
 		timer_events.Start();
 
-		if ( isLastPredictFrame ) {
+		if ( isLastPredictFrame && !competitiveGameplayFrozen ) {
 			// bdube: client entities
 			rvClientEntity* cent;
 			for( cent = clientSpawnedEntities.Next(); cent != NULL; cent = cent->spawnNode.Next() ) {
@@ -4287,14 +4318,20 @@ TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 		}
 
 		// service any pending events
-		idEvent::ServiceEvents();
+		if ( competitiveGameplayFrozen ) {
+			if ( !idEvent::ShiftEvents( msec ) ) {
+				Warning( "competitive pause could not rebase the posted-event queue" );
+			}
+		} else {
+			idEvent::ServiceEvents();
+		}
 
 		// nrausch: player could have been deleted in an event
 		player = GetLocalPlayer();
 
 		timer_events.Stop();
 
-		if ( isLastPredictFrame ) {
+		if ( isLastPredictFrame && !competitiveGameplayFrozen ) {
 			// jscott: effect system uses gravity and the player PVS
 			bse->EndFrame();
 		}
@@ -6071,7 +6108,7 @@ int idGameLocal::GetTargets( const idDict &args, idList< idEntityPtr<idEntity> >
 
 	list.Clear();
 
-	refLength = strlen( ref );
+	refLength = idLib::SizeToInt( strlen( ref ), "idGameLocal::GetTargets" );
 	num = args.GetNumKeyVals();
 	for( i = 0; i < num; i++ ) {
 
@@ -6429,6 +6466,9 @@ Returns the number of actors damaged
 */
 // abahr: changed to work with deathPush
 void idGameLocal::RadiusDamage( const idVec3 &origin, idEntity *inflictor, idEntity *attacker, idEntity *ignoreDamage, idEntity *ignorePush, const char *damageDefName, float dmgPower, int* hitCount ) {
+	if ( isMultiplayer && mpGame.IsGameplayFrozen() ) {
+		return;
+	}
 	float		dist, damageScale, attackerDamageScale, attackerPushScale;
 	idEntity*	ent = NULL;
 	idEntity*	lastEnt = NULL;
@@ -8186,6 +8226,201 @@ const idDecl *idGameLocal::GetEffect ( const idDict& args, const char* effectNam
 	return( ( const idDecl * )declManager->FindEffect( effectFile ) );
 }
 
+// openQ4 BEGIN
+/*
+================
+idGameLocal::LiquidContentsAtCollision
+
+Returns the liquid content bits crossed by a collision, or zero if it was not a liquid surface.
+
+The stock water test looked only at the hit entity's physics contents, which is true for a water
+brush bound to an entity and never true for a world brush - so water built into the map, the normal
+case, never registered. Testing the collision material as well fixes that, and covers lava and
+slime at the same time.
+================
+*/
+int idGameLocal::LiquidContentsAtCollision( const idEntity *hitEnt, const trace_t &collision ) const {
+	int contents = 0;
+
+	if ( hitEnt && hitEnt->GetPhysics() ) {
+		contents |= hitEnt->GetPhysics()->GetContents();
+	}
+	if ( collision.c.material ) {
+		contents |= collision.c.material->GetContentFlags();
+	}
+
+	return contents & MASK_WATER;
+}
+
+/*
+================
+idGameLocal::LiquidContentsAtPoint
+
+Which liquid, if any, a world point is inside.
+================
+*/
+int idGameLocal::LiquidContentsAtPoint( const idVec3 &point, const idEntity *passEntity ) {
+	return Contents( passEntity, point, NULL, mat3_identity, MASK_WATER, passEntity ) & MASK_WATER;
+}
+
+/*
+================
+idGameLocal::LiquidTypeName
+
+The name used to build presentation keys, e.g. "fx_impact_lava". Lava wins over slime if a mapper
+somehow sets both, because it is the more dangerous of the two.
+================
+*/
+const char *idGameLocal::LiquidTypeName( int liquidContents ) const {
+	if ( liquidContents & CONTENTS_LAVA ) {
+		return "lava";
+	}
+	if ( liquidContents & CONTENTS_SLIME ) {
+		return "slime";
+	}
+	return "water";
+}
+
+/*
+================
+idGameLocal::PlayLiquidImpact
+
+Splash and sound for anything that breaks a liquid surface. The caller's own def is asked first, so
+a weapon keeps whatever fx_impact_water it already ships, and the shared liquid_openq4 def fills in
+for everything that specifies nothing.
+================
+*/
+void idGameLocal::PlayLiquidImpact( int liquidContents, const idVec3 &point, const idVec3 &normal, idEntity *ent, const idDict *callerArgs ) {
+	if ( !liquidContents ) {
+		return;
+	}
+
+	const char *liquid = LiquidTypeName( liquidContents );
+	const idDict *liquidDict = FindEntityDefDict( "liquid_openq4", false );
+	const idDecl *effect = NULL;
+
+	if ( callerArgs ) {
+		effect = GetEffect( *callerArgs, va( "fx_impact_%s", liquid ) );
+	}
+	if ( !effect && liquidDict ) {
+		effect = GetEffect( *liquidDict, va( "fx_impact_%s", liquid ) );
+	}
+	if ( effect ) {
+		PlayEffect( effect, point, normal.ToMat3(), false, vec3_origin, true );
+	}
+
+	if ( ent && liquidDict ) {
+		const char *shaderName = liquidDict->GetString( va( "snd_impact_%s", liquid ), "" );
+		if ( shaderName && shaderName[0] ) {
+			const idSoundShader *shader = declManager->FindSound( shaderName, false );
+			if ( shader ) {
+				ent->StartSoundShader( shader, SND_CHANNEL_ANY, 0, true, NULL );
+			}
+		}
+	}
+}
+// openQ4 END
+
+/*
+================
+idGameLocal::LiquidLevelForEntity
+
+Quake 3's PM_SetWaterLevel for anything that is not the player. idPhysics_Player keeps its own
+water level because it needs it inside the move; monsters, corpses and everything else have no such
+state, so this derives the same 0-3 ladder from the entity's own bounds.
+================
+*/
+int idGameLocal::LiquidLevelForEntity( idEntity *ent, int &liquidType ) {
+	liquidType = 0;
+
+	if ( !ent || !ent->GetPhysics() ) {
+		return 0;
+	}
+
+	const idBounds &bounds = ent->GetPhysics()->GetBounds();
+	const idVec3 origin = ent->GetPhysics()->GetOrigin();
+	const float height = bounds[1].z - bounds[0].z;
+	if ( height <= 0.0f ) {
+		return 0;
+	}
+
+	idVec3 point = origin;
+
+	// feet
+	point.z = origin.z + bounds[0].z + 1.0f;
+	const int feetContents = Contents( ent, point, NULL, mat3_identity, MASK_WATER, ent ) & MASK_WATER;
+	if ( !feetContents ) {
+		return 0;
+	}
+	liquidType = feetContents;
+
+	// waist
+	point.z = origin.z + bounds[0].z + height * 0.5f;
+	if ( !( Contents( ent, point, NULL, mat3_identity, MASK_WATER, ent ) & MASK_WATER ) ) {
+		return 1;
+	}
+
+	// head
+	point.z = origin.z + bounds[1].z - 1.0f;
+	if ( !( Contents( ent, point, NULL, mat3_identity, MASK_WATER, ent ) & MASK_WATER ) ) {
+		return 2;
+	}
+
+	return 3;
+}
+
+/*
+================
+idGameLocal::PlayLiquidSoundOn
+
+Plays one of the shared liquid_openq4 sounds on an entity. A missing def or key is silence, not an
+error, so a partial asset set still works.
+================
+*/
+void idGameLocal::PlayLiquidSoundOn( idEntity *ent, const char *key, const s_channelType channel ) {
+	if ( !ent ) {
+		return;
+	}
+
+	const idDict *liquidDict = FindEntityDefDict( "liquid_openq4", false );
+	if ( !liquidDict ) {
+		return;
+	}
+
+	const char *shaderName = liquidDict->GetString( key, "" );
+	if ( !shaderName || !shaderName[0] ) {
+		return;
+	}
+
+	const idSoundShader *shader = declManager->FindSound( shaderName, false );
+	if ( !shader ) {
+		return;
+	}
+
+	// broadcast: liquid events are decided on the server, because a client only runs full movement
+	// for the player it predicts and would never see anything else break the surface
+	ent->StartSoundShader( shader, channel, 0, true, NULL );
+}
+
+/*
+================
+idGameLocal::PlayLiquidEffectAt
+================
+*/
+void idGameLocal::PlayLiquidEffectAt( const char *key, const idVec3 &origin ) {
+	const idDict *liquidDict = FindEntityDefDict( "liquid_openq4", false );
+	if ( !liquidDict ) {
+		return;
+	}
+
+	const idDecl *effect = GetEffect( *liquidDict, key );
+	if ( !effect ) {
+		return;
+	}
+
+	PlayEffect( effect, origin, idVec3( 0.0f, 0.0f, 1.0f ).ToMat3(), false, vec3_origin, true );
+}
+
 /*
 ================
 idGameLocal::PlayEffect
@@ -8411,7 +8646,7 @@ idEntity* idGameLocal::HitScan(
 		if ( g_perfTest_hitscanBBox.GetBool() ) {
 			contents = MASK_SHOT_BOUNDINGBOX|CONTENTS_PROJECTILE;
 		} else {
-			contents = MASK_SHOT_RENDERMODEL|CONTENTS_WATER|CONTENTS_PROJECTILE;
+			contents = MASK_SHOT_RENDERMODEL|MASK_WATER|CONTENTS_PROJECTILE;
 		}
 		
 		// Loop the traces to handle cases where something can be shot through
@@ -8477,12 +8712,21 @@ idEntity* idGameLocal::HitScan(
 			actualHitEnt   = NULL;
 			start		   = collisionPoint;
 
-			// Keep tracing if we hit water
-			if ( (ent->GetPhysics()->GetContents() & CONTENTS_WATER) || (tr.c.material && (tr.c.material->GetContentFlags() & CONTENTS_WATER)) ) {
-				// Apply force to the water entity that was hit
+			// Keep tracing if we hit a liquid
+// openQ4 BEGIN
+			const int hitLiquidContents = LiquidContentsAtCollision( ent, tr );
+			if ( hitLiquidContents ) {
+				// Apply force to the liquid entity that was hit
 				ent->ApplyImpulse( owner, tr.c.id, tr.c.point, -(hitscanDict.GetFloat( "push", "5000" )) * tr.c.normal );
-				// Continue on excluding water
-				contents &= (~CONTENTS_WATER);
+				// Continue on excluding liquids
+				contents &= (~MASK_WATER);
+
+				if ( !g_perfTest_weaponNoFX.GetBool() && !GetEffect( hitscanDict, "fx_impact", tr.c.materialType ) ) {
+					// the shooter's def says nothing about hitting this liquid, so fall back to the
+					// shared liquid presentation rather than splashing nothing at all
+					PlayLiquidImpact( hitLiquidContents, collisionPoint, tr.c.normal, ent, &hitscanDict );
+				}
+// openQ4 END
 
 				if ( !g_perfTest_weaponNoFX.GetBool() ) {
 					if ( ent->CanPlayImpactEffect( owner, ent ) ) {

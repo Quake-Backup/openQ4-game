@@ -1227,6 +1227,7 @@ void idClass::RegisterClasses( void )
 	REGISTER(idItemRemover); // ..\..\code\game\Item.cpp
 	REGISTER(idLight); // ..\..\code\game\Light.cpp
 	REGISTER(idLiquid); // ..\..\code\game\Misc.cpp
+	REGISTER(idLiquidVolume); // openQ4: liquid volume entity, Misc.cpp
 	REGISTER(idLocationEntity); // ..\..\code\game\Misc.cpp
 	REGISTER(idLocationSeparatorEntity); // ..\..\code\game\Misc.cpp
 	REGISTER(idMoveable); // ..\..\code\game\Moveable.cpp

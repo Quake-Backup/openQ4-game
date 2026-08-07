@@ -163,8 +163,33 @@ idMoveState::Save
 */
 void idMoveState::Save( idSaveGame *savefile ) const {
 	int i;
+	int packedFlags;
 
-	savefile->Write ( &fl, sizeof(fl) );
+	packedFlags = 0;
+	packedFlags |= fl.done ? BIT( 0 ) : 0;
+	packedFlags |= fl.moving ? BIT( 1 ) : 0;
+	packedFlags |= fl.crouching ? BIT( 2 ) : 0;
+	packedFlags |= fl.running ? BIT( 3 ) : 0;
+	packedFlags |= fl.blocked ? BIT( 4 ) : 0;
+	packedFlags |= fl.obstacleInPath ? BIT( 5 ) : 0;
+	packedFlags |= fl.goalUnreachable ? BIT( 6 ) : 0;
+	packedFlags |= fl.onGround ? BIT( 7 ) : 0;
+	packedFlags |= fl.flyTurning ? BIT( 8 ) : 0;
+	packedFlags |= fl.idealRunning ? BIT( 9 ) : 0;
+	packedFlags |= fl.disabled ? BIT( 10 ) : 0;
+	packedFlags |= fl.ignoreObstacles ? BIT( 11 ) : 0;
+	packedFlags |= fl.allowDirectional ? BIT( 12 ) : 0;
+	packedFlags |= fl.allowAnimMove ? BIT( 13 ) : 0;
+	packedFlags |= fl.allowPrevAnimMove ? BIT( 14 ) : 0;
+	packedFlags |= fl.allowHiddenMove ? BIT( 15 ) : 0;
+	packedFlags |= fl.allowPushMovables ? BIT( 16 ) : 0;
+	packedFlags |= fl.allowSlideToGoal ? BIT( 17 ) : 0;
+	packedFlags |= fl.noRun ? BIT( 18 ) : 0;
+	packedFlags |= fl.noWalk ? BIT( 19 ) : 0;
+	packedFlags |= fl.noTurn ? BIT( 20 ) : 0;
+	packedFlags |= fl.noGravity ? BIT( 21 ) : 0;
+	packedFlags |= fl.noRangedInterrupt ? BIT( 22 ) : 0;
+	savefile->WriteInt( packedFlags );
 
 	savefile->WriteInt( (int)moveType );
 	savefile->WriteInt( (int)moveCommand );
@@ -254,8 +279,36 @@ idMoveState::Restore
 */
 void idMoveState::Restore( idRestoreGame *savefile ) {
 	int i, num;
+	int packedFlags;
 
-	savefile->Read ( &fl, sizeof(fl) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedFlags );
+		fl.done = ( packedFlags & BIT( 0 ) ) != 0;
+		fl.moving = ( packedFlags & BIT( 1 ) ) != 0;
+		fl.crouching = ( packedFlags & BIT( 2 ) ) != 0;
+		fl.running = ( packedFlags & BIT( 3 ) ) != 0;
+		fl.blocked = ( packedFlags & BIT( 4 ) ) != 0;
+		fl.obstacleInPath = ( packedFlags & BIT( 5 ) ) != 0;
+		fl.goalUnreachable = ( packedFlags & BIT( 6 ) ) != 0;
+		fl.onGround = ( packedFlags & BIT( 7 ) ) != 0;
+		fl.flyTurning = ( packedFlags & BIT( 8 ) ) != 0;
+		fl.idealRunning = ( packedFlags & BIT( 9 ) ) != 0;
+		fl.disabled = ( packedFlags & BIT( 10 ) ) != 0;
+		fl.ignoreObstacles = ( packedFlags & BIT( 11 ) ) != 0;
+		fl.allowDirectional = ( packedFlags & BIT( 12 ) ) != 0;
+		fl.allowAnimMove = ( packedFlags & BIT( 13 ) ) != 0;
+		fl.allowPrevAnimMove = ( packedFlags & BIT( 14 ) ) != 0;
+		fl.allowHiddenMove = ( packedFlags & BIT( 15 ) ) != 0;
+		fl.allowPushMovables = ( packedFlags & BIT( 16 ) ) != 0;
+		fl.allowSlideToGoal = ( packedFlags & BIT( 17 ) ) != 0;
+		fl.noRun = ( packedFlags & BIT( 18 ) ) != 0;
+		fl.noWalk = ( packedFlags & BIT( 19 ) ) != 0;
+		fl.noTurn = ( packedFlags & BIT( 20 ) ) != 0;
+		fl.noGravity = ( packedFlags & BIT( 21 ) ) != 0;
+		fl.noRangedInterrupt = ( packedFlags & BIT( 22 ) ) != 0;
+	} else {
+		savefile->Read( &fl, sizeof( fl ) );
+	}
 
 	savefile->ReadInt( (int&)moveType );
 	savefile->ReadInt( (int&)moveCommand );

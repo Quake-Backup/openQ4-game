@@ -66,6 +66,7 @@ public:
 	void				Save( idSaveGame *savefile ) const;
 	void				Restore( idRestoreGame *savefile );
 	virtual void		Think( void );
+	virtual void		ThinkMatchPaused( int deltaMsec );
 
 private:
 	float				wait;
@@ -124,6 +125,7 @@ public:
 	void				Restore( idRestoreGame *savefile );
 
 	void				Spawn( void );
+	virtual void		ThinkMatchPaused( int deltaMsec );
 
 private:
 	float				wait;
@@ -222,6 +224,7 @@ public:
 	void				Restore( idRestoreGame *savefile );
 
 	void				Spawn( void );
+	virtual void		ThinkMatchPaused( int deltaMsec );
 
 private:
 	bool				on;

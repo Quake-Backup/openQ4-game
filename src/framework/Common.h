@@ -336,6 +336,7 @@ public:
 
 	// Returns key bound to the command
 	virtual const char* KeysFromBinding(const char* bind) = 0;
+	virtual const char* KeysFromBindingForPrompt(const char* bind) = 0;
 
 	// Returns the binding bound to the key
 	virtual const char* BindingFromKey(const char* key) = 0;

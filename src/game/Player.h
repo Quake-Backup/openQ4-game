@@ -897,6 +897,13 @@ private:
 	int						airTics;				// set to pm_airTics at start, drops in vacuum
 	int						lastAirDamage;
 
+// openQ4 BEGIN
+	waterLevel_t			previousWaterLevel;		// water level last think, for entry and exit events
+	int						previousWaterType;		// so leaving lava sounds like lava, not water
+	int						nextLiquidDamageTime;	// pain debounce for lava and slime
+	int						drownDamage;			// climbs the longer the player stays under
+// openQ4 END
+
 	bool					gibDeath;
 	bool					gibsLaunched;
 	idVec3					gibDir;
@@ -1084,6 +1091,13 @@ private:
 	void					UpdateWeapon				( void );
 	void					UpdateSpectating			( void );
 	void					UpdateAir					( void );
+// openQ4 BEGIN
+	void					UpdateLiquid				( void );
+	void					PlayLiquidSound				( const char *key, const s_channelType channel );
+	void					PlayLiquidEffect			( const char *key, const idVec3 &origin );
+	void					SetLiquidBubbles			( bool active, const char *liquid );
+	void					SpawnLiquidTestVolume		( void );
+// openQ4 END
 // RAVEN BEGIN
 // abahr
 	void					UpdateGravity				( void );

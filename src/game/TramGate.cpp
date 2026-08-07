@@ -54,7 +54,7 @@ void rvTramGate::SpawnDoors() {
 	args.SetMatrix( "rotation", dir.ToMat3() );
 	args.SetVector( "origin", GetPhysics()->GetOrigin() );
 
-	int len = strlen("door_");
+	const int len = sizeof( "door_" ) - 1;
 	for( const idKeyValue* kv = spawnArgs.MatchPrefix("door"); kv; kv = spawnArgs.MatchPrefix("door", kv) ) {
 		args.Set( kv->GetKey().Right(kv->GetKey().Length() - len), kv->GetValue() );
 	}

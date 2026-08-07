@@ -2354,15 +2354,15 @@ bool idMultiplayerGame::AllPlayersReady( idStr* reason ) {
 			if( gameLocal.GetLocalPlayer() && gameLocal.GetLocalPlayer()->IsReady() ) {
 				// Tourney has a different hud layout, so needs a different "you are (not)ready" string
 				if( gameLocal.gameType == GAME_TOURNEY ) {
-					*reason = va( common->GetLocalizedString( "#str_110018" ), common->KeysFromBinding( "_impulse17" ) );
+					*reason = va( common->GetLocalizedString( "#str_110018" ), common->KeysFromBindingForPrompt( "_impulse17" ) );
 				} else {
-					*reason = va( common->GetLocalizedString( "#str_107711" ), common->KeysFromBinding( "_impulse17" ) );
+					*reason = va( common->GetLocalizedString( "#str_107711" ), common->KeysFromBindingForPrompt( "_impulse17" ) );
 				}
 			} else if( gameLocal.GetLocalPlayer() ) {
 				if( gameLocal.gameType == GAME_TOURNEY ) {
-					*reason = va( common->GetLocalizedString( "#str_110017" ), common->KeysFromBinding( "_impulse17" ) );				
+					*reason = va( common->GetLocalizedString( "#str_110017" ), common->KeysFromBindingForPrompt( "_impulse17" ) );
 				} else {
-					*reason = va( common->GetLocalizedString( "#str_107710" ), common->KeysFromBinding( "_impulse17" ) );
+					*reason = va( common->GetLocalizedString( "#str_107710" ), common->KeysFromBindingForPrompt( "_impulse17" ) );
 				}
 			}
 		}
@@ -3043,12 +3043,12 @@ void idMultiplayerGame::ClientStartPackedVote( int clientNum, const voteStruct_t
 		int menuVoteLineCount = 0;
 		bool kickActive = false;
 		bool maxWindows = false;
-		idStr yesKey = common->KeysFromBinding("_impulse28");
+		idStr yesKey = common->KeysFromBindingForPrompt("_impulse28");
 
 		mainGui->SetStateInt( "vote_going", 1 );
 
 		//dynamic vote yes/no box
-		mpHud->SetStateString( "voteNoticeText", va( common->GetLocalizedString( "#str_107242" ), yesKey.c_str(), common->KeysFromBinding("_impulse29") ));
+		mpHud->SetStateString( "voteNoticeText", va( common->GetLocalizedString( "#str_107242" ), yesKey.c_str(), common->KeysFromBindingForPrompt("_impulse29") ));
 
 		// kick should always be the highest one
 		if ( 0 != ( currentVoteData.m_fieldFlags & VOTEFLAG_KICK ) ) {
@@ -3752,7 +3752,7 @@ void idMultiplayerGame::ReportZoneController(int team, int pCount, int situation
 			// Set the shaders and lights back to neutral.  
 			if ( zTrigger->spawnArgs.MatchPrefix( "colorTarget" ) ) {
 				const idKeyValue *arg;
-				int refLength = strlen( "colorTarget" );
+				const int refLength = sizeof( "colorTarget" ) - 1;
 				int num = zTrigger->spawnArgs.GetNumKeyVals();
 				for( int i = 0; i < num; i++ ) {
 					arg = zTrigger->spawnArgs.GetKeyVal( i );
@@ -3864,7 +3864,7 @@ void idMultiplayerGame::ReportZoneController(int team, int pCount, int situation
 
 	if ( zTrigger->spawnArgs.MatchPrefix( "colorTarget" ) ) {
 		const idKeyValue *arg;
-		int refLength = strlen( "colorTarget" );
+		const int refLength = sizeof( "colorTarget" ) - 1;
 		int num = zTrigger->spawnArgs.GetNumKeyVals();
 		for( int i = 0; i < num; i++ ) {
 			arg = zTrigger->spawnArgs.GetKeyVal( i );
@@ -5801,7 +5801,7 @@ void idMultiplayerGame::UpdateHud( idUserInterface* _mphud ) {
 			if( localPlayer->GetArena() == MAX_ARENAS ) {
 				spectateText1 = common->GetLocalizedString( "#str_107686" );
 			} else {
-				spectateText1 = va( common->GetLocalizedString( "#str_107670" ), common->KeysFromBinding( "_impulse14" ), common->KeysFromBinding( "_impulse15" ) );
+				spectateText1 = va( common->GetLocalizedString( "#str_107670" ), common->KeysFromBindingForPrompt( "_impulse14" ), common->KeysFromBindingForPrompt( "_impulse15" ) );
 			}
 		}
 	} else {
@@ -5816,10 +5816,10 @@ void idMultiplayerGame::UpdateHud( idUserInterface* _mphud ) {
 			// spectating instructions
 			if( localPlayer->spectator != localPlayer->entityNumber ) {
 				//cycle & exit follow
-				spectateText1 = va( common->GetLocalizedString( "#str_107698" ), common->KeysFromBinding( "_attack" ), common->KeysFromBinding( "_moveup" )  );
+				spectateText1 = va( common->GetLocalizedString( "#str_107698" ), common->KeysFromBindingForPrompt( "_attack" ), common->KeysFromBindingForPrompt( "_moveup" )  );
 			} else {
 				//start follow
-				spectateText1 = va( common->GetLocalizedString( "#str_108024" ), common->KeysFromBinding( "_attack" )  );
+				spectateText1 = va( common->GetLocalizedString( "#str_108024" ), common->KeysFromBindingForPrompt( "_attack" )  );
 			}
 			
 		}

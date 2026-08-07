@@ -14,54 +14,36 @@
 ===============================================================================
 */
 
+#include "mp/GameTypeIds.h"
 #include "mp/Buying.h"
 #include "mp/HitFeedback.h"
+#include "mp/match/MatchRules.h"
+#include "mp/match/MatchSeries.h"
+#include "mp/match/MatchSeriesRecovery.h"
+#include "mp/match/MatchSeriesReport.h"
+#include "mp/match/MatchSeriesReportStorage.h"
+#include "mp/match/MatchSession.h"
+#include "mp/match/MatchTeamCommunication.h"
+#include "mp/match/MatchTerminationPolicy.h"
+#include "mp/match/MatchTeams.h"
+#include "mp/match/MatchAuthentication.h"
+#include "mp/match/MatchEvidence.h"
+#include "mp/match/MatchEvidenceObserver.h"
+#include "mp/match/MatchEvidenceStorage.h"
+#include "mp/match/MatchDisclosurePolicy.h"
+#include "mp/match/MatchItemTiming.h"
+#include "mp/match/MatchOperations.h"
+#include "mp/match/MatchProposal.h"
+#include "mp/match/MatchView.h"
+#include "mp/match/MatchControlModel.h"
 class idPlayer;
+class idItem;
 class rvCTF_AssaultPoint;
 class rvItemCTFFlag;
 
 // jmarshall - the engine file system interface only exposes map decls by
 // index; this resolves a map path the way the old GetMapDecl( name ) did.
 const idDict *MultiplayerResolveMapDecl( const char *mapPath );
-typedef enum {
-	GAME_SP,
-	GAME_DM,
-	GAME_TOURNEY,
-	GAME_TDM,
-	// bdube: added ctf
-	GAME_CTF,
-	// ddynerman: new gametypes
-	GAME_1F_CTF,
-	GAME_ARENA_CTF,
-	GAME_ARENA_1F_CTF,	// is not used, but leaving it in the list so I don't offset GAME_DEADZONE
-
-// RITUAL BEGIN
-// squirrel: added DeadZone multiplayer mode
-	GAME_DEADZONE,
-// RITUAL END
-// openQ4: gametypes carried over from Quake Live.  gameType_t is the first
-// byte of every gamestate packet and is compared literally by the .gui files,
-// so this enum is APPEND ONLY - never insert or renumber.
-	GAME_DUEL,
-	GAME_CA,
-	GAME_FREEZETAG,
-	GAME_REDROVER,
-	GAME_OVERLOAD,
-	GAME_HARVESTER,
-	GAME_DOMINATION,
-	GAME_ATTACK_DEFEND,
-	NUM_GAME_TYPES,
-} gameType_t;
-
-
-// ddynerman: teams
-typedef enum {
-	TEAM_NONE = -1,
-	TEAM_MARINE,
-	TEAM_STROGG,
-	TEAM_MAX,
-} team_t;
-
 // shouchard:  server admin command types
 typedef enum {
 	SERVER_ADMIN_KICK,
@@ -106,7 +88,8 @@ typedef enum {
 	VOTEFLAG_CONTROLTIME	= 0x0800,
 } voteFlag_t;
 
-#define NUM_VOTES			11
+#define NUM_VOTES			12	// VOTEFLAG_CONTROLTIME is bit 11 and must participate in vote masking
+#define VOTEFLAG_ALL			( ( 1 << NUM_VOTES ) - 1 )
 #define MAX_PRINT_LEN 128
 
 // more compact than a chat line
@@ -400,6 +383,45 @@ public:
 
 	rvGameState*	GetGameState( void );
 
+	// One authoritative competitive aggregate owns phase, round, clocks and
+	// frozen rules.  rvGameState remains the gameplay adapter, but may mutate
+	// its legacy state only after these methods accept the same transition.
+	const mpMatchSession &GetMatchSession( void ) const { return matchSession; }
+	const mpCompetitiveRules &GetCompetitiveRules( void ) const { return matchRules; }
+	const mpCompetitionSeries &GetCompetitionSeries( void ) const { return matchSeries; }
+	const mpSessionView *GetClientMatchView( void ) const {
+		return clientMatchViewValid ? &clientMatchView : NULL;
+	}
+	// Resolve both current slot-generation bindings on every attempt.  This is
+	// the authoritative camera gate; recipient views are discovery data only.
+	bool			CanSpectatorFollow( int observerSlot, int targetSlot ) const;
+	// Placed, respawning major items report only authoritative lifecycle
+	// transitions.  The registry derives identity and recipient disclosure;
+	// item code never writes client UI or network state directly.
+	void			ObserveCompetitiveItemPickup( const idItem *item,
+						float respawnSeconds );
+	void			ObserveCompetitiveItemAvailable( const idItem *item );
+	// Called once at the authoritative frame boundary, before any gameplay
+	// input, events or entity thinking.  A pending pause therefore takes effect
+	// atomically for the whole simulation frame.
+	void			BeginCompetitiveFrame( void );
+	bool			IsGameplayFrozen( void ) const;
+	bool			CanCommitMatchPhaseTransition( mpGameState_t newState ) const;
+	bool			CommitMatchPhaseTransition( mpGameState_t newState );
+	bool			CommitMatchPhaseTransition( mpGameState_t newState,
+						mpMatchTransitionReason_t reason, mpParticipantId authorizer );
+	bool			CommitMatchPhaseTransition( mpGameState_t newState,
+						mpMatchTransitionReason_t reason, mpParticipantId authorizer,
+						int forfeitingSide );
+	bool			CommitMatchRoundTransition( roundState_t newState );
+	bool			BeginMatchOvertimePeriod( void );
+	void			ServerReceiveMatchOperation( int clientNum, const idBitMsg &msg );
+	void			ClientReceiveMatchOperationResult( const idBitMsg &msg );
+	void			ClientReceiveMatchView( const idBitMsg &msg );
+	void			ClientReceiveRefereeAuthChallenge( const idBitMsg &msg );
+	bool			SubmitMatchOperation( mpMatchOperationRequest_t &request );
+	bool			RequestRefereeAuthentication( const char *password );
+
 
 	void			PrintMessageEvent( int to, msg_evt_t evt, int parm1 = -1, int parm2 = -1 );
 	void			PrintMessage( int to, const char* message );
@@ -426,6 +448,12 @@ public:
 
 	// authoritative ready state, set from the client's reliable ready message
 	void			ServerSetPlayerReady( int clientNum, bool ready );
+	bool			IsManagedMatch( void ) const;
+	// Legacy server administration is intentionally unavailable while the
+	// revisioned Match Control authority owns the session.  Command and GUI
+	// adapters call this before touching cvars, maps, teams, or clients.
+	bool			RejectManagedLegacyMutation( const char *action );
+	bool			ServerReconcileManagedUserInfo( int clientNum, idDict &userInfo );
 	static void		Ready_f( const idCmdArgs &args );
 	static void		NotReady_f( const idCmdArgs &args );
 	static void		ReadyUp_f( const idCmdArgs &args );
@@ -433,6 +461,8 @@ public:
 
 	void			DisconnectClient( int clientNum );
 	static void		ForceReady_f( const idCmdArgs &args );
+	static void		SeriesBind_f( const idCmdArgs &args );
+	static void		Broadcaster_f( const idCmdArgs &args );
 	static void		DropWeapon_f( const idCmdArgs &args );
 	static void		MessageMode_f( const idCmdArgs &args );
 	static void		VoiceChat_f( const idCmdArgs &args );
@@ -568,7 +598,6 @@ public:
 		int			fragLimit;
 		int			tourneyLimit;
 		int			timeLimit;
-		int			minPlayers;
 		int			controlTime;
 		bool		buying;
 		bool		autoBalance;
@@ -802,6 +831,223 @@ private:
 
 	// game state
 	rvGameState*	gameState;
+	mpCompetitiveRules matchRules;
+	mpMatchSession	matchSession;
+	mpCompetitionSeries matchSeries;
+	mpCompetitionSeriesReport matchSeriesReport;
+	uint64_t		matchSeriesId;
+	uint64_t		matchSeriesLinkedSessionId;
+	mpSeriesRecoveryWorkspace matchSeriesRecoveryWorkspace;
+	mpSeriesReportStorageWorkspace matchSeriesReportWorkspace;
+	int			matchSeriesContestantSlot[ MP_SERIES_SIDE_COUNT ];
+	uint64_t		matchSeriesContestantConnection[ MP_SERIES_SIDE_COUNT ];
+	int			matchSeriesCompetitionSide[ MAX_CLIENTS ];
+	uint64_t		matchSeriesCompetitionConnection[ MAX_CLIENTS ];
+	int			matchSeriesGameSideForCompetition[ MP_SERIES_SIDE_COUNT ];
+	bool			matchSeriesNeedsBindingRecovery;
+	bool			matchSeriesAwaitingMapSession;
+	bool			matchSessionOperational;
+	uint64_t		nextMatchConnectionId;
+	uint64_t		matchConnectionId[ MAX_CLIENTS ];
+	mpMatchTeams	matchTeams;
+	mpProposalService matchProposals;
+	mpMatchOperationExecutor matchOperationExecutor;
+	mpRefereeAuthenticationService matchRefereeAuthentication;
+	mpMatchEvidence	matchEvidence;
+	mpMatchEvidenceObserver matchEvidenceObserver;
+	mpEvidenceStorageWorkspace matchEvidenceWorkspace;
+	mpMatchItemTimingRegistry matchItemTiming;
+	mpSessionView	clientMatchView;
+	bool			clientMatchViewValid;
+	mpMatchControlModel clientMatchControlModel;
+	mpMatchControlError_t clientMatchControlError;
+	bool			clientMatchControlErrorValid;
+	uint64_t		clientMatchControlChoiceSessionId;
+	uint64_t		clientMatchMenuProjectedViewRevision;
+	uint64_t		clientMatchHudProjectedViewRevision;
+	uint64_t		clientMatchScoreboardProjectedViewRevision;
+	mpMatchOperationResult_t clientMatchOperationResult;
+	bool			clientMatchOperationResultValid;
+	mpMatchOperationRequest_t clientPendingMatchConfirmation;
+	bool			clientPendingMatchConfirmationValid;
+	uint64_t		matchViewRevision;
+	uint64_t		matchControlRevision;
+	uint64_t		matchViewObservedSessionRevision;
+	uint32_t		matchViewObservedRulesRevision;
+	uint64_t		matchViewObservedRulesDigest;
+	mpProposalRevision_t matchViewObservedProposalRevision;
+	uint64_t		matchViewObservedSeriesRevision;
+	uint64_t		matchViewObservedTeamsRevision;
+	uint64_t		matchViewObservedEvidenceRevision;
+	uint64_t		matchViewObservedItemTimingRevision;
+	bool			matchViewObservedEvidenceFinalized;
+	bool			matchViewObservedEvidencePersisted;
+	bool			matchViewObservedMVDRecording;
+	bool			matchItemTimingNeedsInitialScan;
+	int			matchViewNextClockUpdateTime;
+	uint64_t		matchViewSentRevision[ MAX_CLIENTS ];
+	uint32_t		lastMatchRequestId[ MAX_CLIENTS ];
+	mpMatchOperationResult_t lastMatchRequestResult[ MAX_CLIENTS ];
+	bool			lastMatchRequestResultValid[ MAX_CLIENTS ];
+	int			matchOperationNextAllowedTime[ MAX_CLIENTS ][ MP_MATCH_COOLDOWN_COUNT ];
+	uint32_t		nextClientMatchRequestId;
+	uint32_t		nextTrustedLocalMatchRequestId;
+	mpProposalId_t	nextMatchProposalId;
+	uint64_t		nextMatchSessionId;
+	bool			matchRefereeCredentialInitialized;
+	bool			matchRefereeCredentialIsReal;
+	char			pendingRefereePassword[ MP_REFEREE_AUTH_MAX_PASSWORD_BYTES + 1 ];
+	int			pendingRefereePasswordLength;
+	int			pendingRefereePasswordDeadline;
+	mpRefereeAuthChallenge pendingRefereeChallenge;
+	bool			pendingRefereeChallengeValid;
+	bool			competitiveRulesValidForSession;
+	bool			competitiveRulesInitialized;
+	mpRuleValidationReason_t competitiveRulesFailure;
+	bool			matchEvidenceFinalized;
+	bool			matchEvidencePersisted;
+	bool			matchEvidenceFinalizationPending;
+	int				matchEvidenceMode;
+	bool			matchMVDStartedBySession;
+	bool			matchMVDAttemptedBySession;
+	bool			matchMVDOperatorOwnedBySession;
+	char			matchMVDQPath[ MP_MATCH_EVIDENCE_STORAGE_QPATH_BYTES + 1 ];
+	uint64_t		matchPhaseEffectsSessionId;
+	uint64_t		matchPhaseEffectsRevision;
+
+	bool			InitializeCompetitiveRules( void );
+	bool			CanEnterMatchCountdown( void ) const;
+	bool			IsManagedTeamCommunicationActive( void ) const;
+	bool			BuildManagedTeamCommunicationBinding( int clientNum,
+						mpMatchTeamCommunicationBinding_t &binding ) const;
+	mpMatchRulesValidationContext_t BuildCompetitiveRuleValidationContext( void ) const;
+	bool			ConfigureMatchSessionFromCompetitiveRules( void );
+	mpMatchTeamsPolicy_t BuildMatchTeamsPolicy( void ) const;
+	bool			ApplyMatchTeamsTransaction(
+						const mpMatchTeamsJoinDecision_t &decision,
+						mpOperationExecutionResult_t &execution );
+	bool			ApplyMatchSpectatorTransition( mpParticipantId participant,
+						mpOperationExecutionResult_t &execution );
+	void			ReconcileGameplayPhaseAfterMatchMutation( void );
+	void			ApplyMatchTeamsPlanToLegacy(
+						const mpMatchTeamsTransactionPlan_t &plan );
+	void			ProcessMatchTeamQueue( void );
+	bool			ConfigureMatchSessionForRules( mpMatchSession &session,
+						const mpMatchRulesSnapshot &rules, bool rulesValid ) const;
+	bool			BeginMatchSession( void );
+	bool			BeginMatchEvidence( void );
+	void			ReconcileMatchEvidenceForCommittedRules( void );
+	bool			IsCompetitionSeriesModeSupported( void ) const;
+	bool			CollectCompetitionSeriesContestants(
+						int slots[ MP_SERIES_SIDE_COUNT ],
+						uint64_t connections[ MP_SERIES_SIDE_COUNT ] ) const;
+	int			ResolveCompetitionSide( mpParticipantId participant ) const;
+	bool			BuildCompetitionSeriesMapPool(
+						const mpSeriesProfileDescriptor &profile,
+						char storage[ MP_SERIES_MAX_MAP_POOL ][ MP_SERIES_MAP_TOKEN_BYTES ],
+						const char *tokens[ MP_SERIES_MAX_MAP_POOL ], int &count,
+						mpSeriesReason_t &reason ) const;
+	bool			PersistCompetitionSeries( void );
+	bool			PersistCompetitionSeriesCandidate(
+						const mpCompetitionSeries &series,
+						const mpCompetitionSeriesReport &report,
+						uint64_t seriesId, uint64_t linkedSessionId );
+	bool			InitializeCompetitionSeriesReport(
+						const mpCompetitionSeries &series, uint64_t seriesId,
+						const int contestantSlots[ MP_SERIES_SIDE_COUNT ],
+						mpCompetitionSeriesReport &report ) const;
+	bool			FinalizeCompetitionSeriesReport(
+						mpCompetitionSeries &series,
+						mpCompetitionSeriesReport &report,
+						mpParticipantId authorizer );
+	bool			CommitCompetitionSeriesMapEvidence(
+						const mpEvidenceStorageResult &evidenceStorage );
+	bool			RestoreCompetitionSeriesIfRequested( void );
+	bool			BindCompetitionSeriesContestant( int competitionSide,
+						int clientNum );
+	bool			ScheduleCompetitionSeriesMap( mpCompetitionSeries &candidate,
+						const char *mapToken, mpOperationExecutionResult_t &execution );
+	void			LinkCurrentSeriesEvidence( void );
+	mpEvidenceCommittedStamp BuildMatchEvidenceStamp( void ) const;
+	mpEvidenceActorRef MatchEvidenceActor( mpParticipantId participant,
+						bool serverOperator = false ) const;
+	void			ObserveMatchEvidence( mpParticipantId actor,
+						bool serverOperator = false );
+	void			RecordMatchEvidenceFinalStats( void );
+	void			RecordMatchEvidenceParticipantStats( int clientNum,
+						mpParticipantId participant );
+	void			RecordMatchEvidenceResult( mpMatchTransitionReason_t reason,
+						mpParticipantId authorizer, int forfeitingSide = MP_MATCH_SIDE_NONE );
+	bool			PersistMatchEvidence(
+						mpEvidenceStorageResult *storageResult = NULL );
+	bool			FinalizeMatchEvidence( bool abortedIfUndecided );
+	void			ProjectMatchMVDReportArtifact(
+						mpSeriesReportArtifactInput &artifact ) const;
+	bool			ReconcileCompetitionSeriesMVDResults(
+						mpCompetitionSeriesReport &report, bool sealing );
+	void			StartMatchMVDIfRequired( void );
+	void			StopMatchMVD( const char *reason );
+	bool			ApplyCommittedMatchPhaseEffects( int forfeitingSide );
+	void			PublishCompetitiveRulesIdentity( void );
+	void			MirrorCompetitiveRulesToLegacy( void );
+	void			SynchronizeMatchParticipant( int clientNum );
+	void			SynchronizeAllMatchParticipants( void );
+	void			RebaseCompetitivePauseFrame( int deltaMsec );
+	void			AdvanceMatchViewRevision( bool forceClockSample = false );
+	void			InitializeMatchItemTimingObservations( void );
+	bool			BuildMatchItemTimingIdentity( const idItem *item,
+						mpMatchItemTimingKind_t &kind, char *adapterToken,
+						int adapterTokenBytes ) const;
+	void			ObserveCompetitiveItemState( const idItem *item,
+						bool available, int respawnMsec );
+	void			SendChangedMatchViews( bool force = false );
+	mpMatchDisclosurePolicy_t BuildMatchDisclosurePolicy( void ) const;
+	bool			BuildMatchDisclosureRecipient( int clientNum,
+						mpParticipantId &participant,
+						mpMatchDisclosureRecipient_t &recipient ) const;
+	int				ResolveMatchDisclosureTargetSide(
+						const mpMatchParticipantState &target ) const;
+	bool			BuildMatchView( int clientNum, mpSessionView &view ) const;
+	bool			AcceptClientMatchView( const mpSessionView &incoming );
+	bool			RefreshLocalClientMatchView( void );
+	void			ProjectClientMatchControlMenu( bool notifyGui );
+	void			ProjectClientManagedMatchContext( idUserInterface *gui );
+	bool			HandleMatchControlCommand( const char *token );
+	void			ClearClientPendingMatchConfirmation( bool closeModal );
+	void			ClearClientMatchControlConnectionState( bool clearGuiCredential );
+	bool			WriteMatchViewMessage( int clientNum, idBitMsg &msg ) const;
+	mpMatchViewAllowedOperationMask_t AllowedMatchOperationsFor( mpParticipantId participant ) const;
+	mpMatchOperationResult_t MakeMatchOperationResult( const mpMatchOperationRequest_t &request,
+						const mpOperationExecutionResult_t &execution ) const;
+	bool			StoreClientMatchOperationResult(
+						const mpMatchOperationResult_t &result );
+	void			ClearMatchOperationTransportSlot( int clientNum );
+	void			SendMatchOperationResult( int clientNum,
+						const mpMatchOperationResult_t &result );
+	bool			MatchOperationRateLimitAccepted( int clientNum,
+						const mpMatchOperationDescriptor_t &descriptor );
+	void			BuildMatchOperationContext( int clientNum,
+						mpMatchOperationOpcode_t opcode, bool enforceTransportCooldown,
+						mpOperationAdapterContext_t &context );
+	void			ProcessPassedMatchProposals( void );
+	bool			ApplyMatchOperationContinuation( int clientNum,
+						const mpMatchOperationRequest_t &request,
+						mpOperationExecutionResult_t &execution );
+	bool			ExecuteTrustedLocalMatchOperation(
+						mpMatchOperationRequest_t &request,
+						mpOperationExecutionResult_t &execution );
+	bool			InitializeRefereeAuthentication( void );
+	bool			SendRefereeAuthChallenge( int clientNum,
+						const mpRefereeAuthChallenge &challenge );
+	bool			CompleteRefereeAuthChallenge( const mpRefereeAuthChallenge &challenge );
+	void			ClearPendingRefereePassword( void );
+	void			ApplyMatchOperationLegacyMirror( int clientNum,
+						const mpMatchOperationRequest_t &request,
+						const mpOperationExecutionResult_t &execution );
+	mpMatchTransitionReason_t InferMatchTransitionReason( mpGameState_t from,
+						mpGameState_t to ) const;
+	mpMatchRoundTransitionReason_t InferRoundTransitionReason( roundState_t from,
+						roundState_t to ) const;
 	void			BeginArenaCampaignResult( void );
 	void			UpdateArenaCampaignResult( void );
 
@@ -833,6 +1079,7 @@ private:
 	int				voteExecTime;			// delay between vote passed msg and execute
 	int				yesVotes;				// counter for yes votes
 	int				noVotes;				// and for no votes
+	int				voteEligibleCount;		// frozen electorate size for the active inherited vote
 	idStr			voteValue;				// the data voted upon ( server )
 	idStr			voteString;				// the vote string ( client )
 	bool			voted;					// hide vote box ( client )
@@ -915,7 +1162,7 @@ private:
 	void			SetupBuyMenuItems();
 
 	idList<int>		privateClientIds;
-	int				privatePlayers;
+	uint32_t		privatePlayers;
 
 	// player who's rank info we're displaying
 	idEntityPtr<idPlayer>		rankTextPlayer;
@@ -974,6 +1221,7 @@ private:
 	void			ClearGuis( void );
 	void			DrawScoreBoard( idPlayer *player );
 	void			CheckVote( void );
+	bool			AbortInheritedVoteForManagedMatch( void );
 	bool			AllPlayersReady( idStr* reason = NULL );
 	
 	const char *	GameTime( void );
@@ -991,6 +1239,8 @@ private:
 	void			ForceReady();
 	// when clients disconnect or join spectate during game, check if we need to end the game
 	void			CheckAbortGame( void );
+	void			CheckAbortGame( mpParticipantId departedParticipant,
+						int departedGameSide, int departedCompetitionSide );
 	void			MessageMode( const idCmdArgs &args );
 	void			DisableMenu( void );
 	void			SetMapShot( void );

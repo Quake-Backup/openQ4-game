@@ -97,6 +97,7 @@ typedef enum {
 typedef struct urlDownload_s {
 	idStr				url;
 	char				dlerror[ MAX_STRING_CHARS ];
+	int					expectedSize;	// immutable transfer limit; zero permits an unrestricted download
 	int					dltotal;
 	int					dlnow;
 	int					dlstatus;
@@ -240,9 +241,21 @@ public:
 	virtual int				ReadFile( const char *relativePath, void **buffer, ID_TIME_T *timestamp = NULL ) = 0;
 							// Frees the memory allocated by ReadFile.
 	virtual void			FreeFile( void *buffer ) = 0;
+							// Relative mutation paths must be non-empty portable qpaths using '/' separators.
+							// Rooted paths, dot/empty segments, OS volume syntax, and platform filename aliases are rejected.
+							// Use the Explicit/OSPath APIs only when a fully qualified OS path is intentionally required.
 							// Writes a complete file, will create any needed subdirectories.
 							// Returns the length of the file, or -1 on failure.
 	virtual int				WriteFile( const char *relativePath, const void *buffer, int size, const char *basePath = "fs_savepath" ) = 0;
+							// Atomically replaces finalRelativePath with a fully written staged file.
+							// Both names are validated qpaths under the same writable root.  On failure
+							// the previous final file is left unchanged whenever the host OS permits.
+	virtual bool			PromoteFile( const char *stagedRelativePath, const char *finalRelativePath,
+								const char *basePath = "fs_savepath" ) = 0;
+							// Removes one validated qpath from exactly the selected writable root.
+							// Returns true when the file was removed or was already absent.
+	virtual bool			RemoveFileChecked( const char *relativePath,
+								const char *basePath = "fs_savepath" ) = 0;
 
 							// Removes the given file.
 	virtual void			RemoveFile( const char *relativePath, const char *basePath = "fs_savepath" ) = 0;

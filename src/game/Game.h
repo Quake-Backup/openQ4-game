@@ -680,7 +680,9 @@ extern rvGameLog *				gameLog;
 // 37: 1.4.2
 // 39: renderEntity_t flat diffuse presentation fields
 // 40: versioned MVD schema, routed instance messages, and fallible snapshot decoding
-const int GAME_API_VERSION		= 40;
+// 41: operating-system secure-random service for game-module authentication
+// 42: durable server MVD publication results for competitive match evidence
+const int GAME_API_VERSION		= 42;
 
 struct gameImport_t {
 

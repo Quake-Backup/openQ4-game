@@ -62,7 +62,7 @@ idPhysics_Static::Restore
 ================
 */
 void idPhysics_Static::Restore( idRestoreGame *savefile ) {
-	savefile->ReadObject( reinterpret_cast<idClass *&>( self ) );
+	savefile->ReadObject( self );
 
 	savefile->ReadVec3( current.origin );
 	savefile->ReadMat3( current.axis );

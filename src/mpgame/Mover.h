@@ -48,6 +48,7 @@ public:
 // RAVEN BEGIN
 // mekberg: added
 	void					Think( void );
+	virtual void			ThinkMatchPaused( int deltaMsec );
 // RAVEN END
 
 	void					Save( idSaveGame *savefile ) const;
@@ -347,6 +348,7 @@ private:
 
 	class idDoor *			GetDoor( const char *name );
 	void					Think( void );
+	virtual void			ThinkMatchPaused( int deltaMsec );
 	void					OpenInnerDoor( void );
 	void					OpenFloorDoor( int floor );
 	void					CloseAllDoors( void );
@@ -409,6 +411,7 @@ public:
 
 	virtual void			WriteToSnapshot( idBitMsgDelta &msg ) const;
 	virtual void			ReadFromSnapshot( const idBitMsgDelta &msg );
+	virtual void			ThinkMatchPaused( int deltaMsec );
 
 	void					SetPortalState( bool open );
 
@@ -478,6 +481,7 @@ public:
 	void					Restore( idRestoreGame *savefile );
 
 	virtual void			Think( void );
+	virtual void			ThinkMatchPaused( int deltaMsec );
 	virtual void			PreBind( void );
 	virtual void			PostBind( void );
 	virtual void			Hide( void );

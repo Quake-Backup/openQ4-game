@@ -11,12 +11,14 @@
 rvmBot::BotInputToUserCommand
 ==============
 */
+// openQ4: how far ahead a bot checks for lava and slime, and the small lift used on every probe so
+// it samples just inside the volume rather than exactly on the floor plane.
+const float BOT_LIQUID_LOOKAHEAD	= 56.0f;
+const float BOT_LIQUID_PROBE_LIFT	= 2.0f;
+
 void rvmBot::BotInputToUserCommand(bot_input_t* bi, usercmd_t* ucmd, int time)
 {
 	idVec3 forward, right;
-
-	short temp;
-	int j;
 
 	//clear the whole structure
 //	memset(ucmd, 0, sizeof(usercmd_t));
@@ -121,6 +123,42 @@ void rvmBot::BotInputToUserCommand(bot_input_t* bi, usercmd_t* ucmd, int time)
 	//
 	//Com_Printf("forward = %d right = %d up = %d\n", ucmd.forwardmove, ucmd.rightmove, ucmd.upmove);
 	//Com_Printf("ucmd->serverTime = %d\n", ucmd->serverTime);
+
+// openQ4 BEGIN
+	// Liquid. The AAS files that ship with Quake 4 carry no swim reachabilities - Quake 4 has no
+	// liquids for them to describe - so routing cannot help here, and this works off point queries
+	// against the collision world instead. It only adds the vertical axis and vetoes suicidal
+	// steps; the bot's own goal following still does the rest.
+	{
+		const idVec3 lift( 0.0f, 0.0f, BOT_LIQUID_PROBE_LIFT );
+		const int hazardMask = CONTENTS_LAVA | CONTENTS_SLIME;
+		const idVec3 origin = GetPhysics()->GetOrigin();
+		const int feetLiquid = gameLocal.LiquidContentsAtPoint( origin + lift, this );
+
+		if ( feetLiquid & hazardMask ) {
+			// while it is burning, climbing out is the whole plan
+			ucmd->upmove = 127;
+			ucmd->buttons |= BUTTON_RUN;
+		} else {
+			if ( feetLiquid && gameLocal.LiquidContentsAtPoint( GetEyePosition(), this ) ) {
+				// surface before the air runs out
+				ucmd->upmove = 127;
+			}
+
+			if ( ucmd->forwardmove || ucmd->rightmove ) {
+				idVec3 moveDir = forward * ucmd->forwardmove + right * ucmd->rightmove;
+				moveDir.z = 0.0f;
+				if ( moveDir.Normalize() > VECTOR_EPSILON ) {
+					const idVec3 ahead = origin + moveDir * BOT_LIQUID_LOOKAHEAD + lift;
+					if ( gameLocal.LiquidContentsAtPoint( ahead, this ) & hazardMask ) {
+						ucmd->forwardmove = 0;
+						ucmd->rightmove = 0;
+					}
+				}
+			}
+		}
+	}
+// openQ4 END
 
 	if( bi->respawn )
 	{

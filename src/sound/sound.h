@@ -341,6 +341,10 @@ public:
 
 	virtual void			SetSlowmoSpeed( float speed ) = 0;
 	virtual void			SetEnviroSuit( bool active ) = 0;
+
+	// openQ4: muffles everything while the listener's head is under a liquid surface. Derived from
+	// the eye position every frame, so it is deliberately not part of the savegame.
+	virtual void			SetUnderwater( bool active ) = 0;
 };
 
 

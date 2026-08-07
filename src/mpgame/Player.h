@@ -234,6 +234,7 @@ public:
 	void					Clear( void );
 	void					GivePowerUp( idPlayer* player, int powerup, int msec );
 	void					ClearPowerUps( void );
+	void					ShiftMatchTime( int deltaMsec );
 	void					GetPersistantData( idDict &dict );
 	void					RestoreInventory( idPlayer *owner, const idDict &dict );
 	bool					Give( idPlayer *owner, const idDict &spawnArgs, const char *statname, const char *value, int *idealWeapon, bool updateHud, bool dropped = false, bool checkOnly = false );
@@ -424,6 +425,7 @@ public:
 
 	void					Spawn( void );
 	void					Think( void );
+	virtual void			ThinkMatchPaused( int deltaMsec );
 
 	// save games
 	void					Save( idSaveGame *savefile ) const;					// archives object for save game file
@@ -863,6 +865,13 @@ private:
 	int						airTics;				// set to pm_airTics at start, drops in vacuum
 	int						lastAirDamage;
 
+// openQ4 BEGIN
+	waterLevel_t			previousWaterLevel;		// water level last think, for entry and exit events
+	int						previousWaterType;		// so leaving lava sounds like lava, not water
+	int						nextLiquidDamageTime;	// pain debounce for lava and slime
+	int						drownDamage;			// climbs the longer the player stays under
+// openQ4 END
+
 	bool					gibDeath;
 	bool					gibsLaunched;
 	idVec3					gibDir;
@@ -1049,6 +1058,13 @@ private:
 	void					UpdateWeapon				( void );
 	void					UpdateSpectating			( void );
 	void					UpdateAir					( void );
+// openQ4 BEGIN
+	void					UpdateLiquid				( void );
+	void					PlayLiquidSound				( const char *key, const s_channelType channel );
+	void					PlayLiquidEffect			( const char *key, const idVec3 &origin );
+	void					SetLiquidBubbles			( bool active, const char *liquid );
+	void					SpawnLiquidTestVolume		( void );
+// openQ4 END
 	void					UpdateGravity				( void );
 	void					HandleObjectiveInput		( void );
 	void					HandleCheats				( void );

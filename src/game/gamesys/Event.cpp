@@ -983,8 +983,10 @@ void idEvent::Restore( idRestoreGame *savefile ) {
 			savefile->Error( "idEvent::Restore: unknown class '%s' on event '%s'", name.c_str(), event->eventdef->GetName() );
 		}
 
-		savefile->ReadObject( event->object );
-		assert( event->object );
+		savefile->ReadObject( event->object, *event->typeinfo, event->eventdef->GetName() );
+		if ( event->object == NULL ) {
+			savefile->Error( "idEvent::Restore: event '%s' has a NULL target object", event->eventdef->GetName() );
+		}
 
 		// read the args
 		savefile->ReadInt( argsize );

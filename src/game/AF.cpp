@@ -65,7 +65,7 @@ idAF::Restore
 ================
 */
 void idAF::Restore( idRestoreGame *savefile ) {
-	savefile->ReadObject( reinterpret_cast<idClass *&>( self ) );
+	savefile->ReadObject( self );
 	savefile->ReadString( name );
 	savefile->ReadBool( hasBindConstraints );
 	savefile->ReadVec3( baseOrigin );

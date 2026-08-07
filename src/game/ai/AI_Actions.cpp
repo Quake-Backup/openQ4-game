@@ -154,8 +154,17 @@ rvAIAction::Save
 */
 void rvAIAction::Save ( idSaveGame *savefile ) const {
 	int i;
+	int packedFlags;
 
-	savefile->Write( &fl, sizeof( fl ) );
+	packedFlags = 0;
+	packedFlags |= fl.disabled ? BIT( 0 ) : 0;
+	packedFlags |= fl.noPain ? BIT( 1 ) : 0;
+	packedFlags |= fl.noTurn ? BIT( 2 ) : 0;
+	packedFlags |= fl.isAttack ? BIT( 3 ) : 0;
+	packedFlags |= fl.isMelee ? BIT( 4 ) : 0;
+	packedFlags |= fl.overrideLegs ? BIT( 5 ) : 0;
+	packedFlags |= fl.noSimpleThink ? BIT( 6 ) : 0;
+	savefile->WriteInt( packedFlags );
 
 	savefile->WriteInt ( anims.Num ( ) );
 	for ( i = 0; i < anims.Num(); i ++ ) {
@@ -186,8 +195,20 @@ rvAIAction::Restore
 */
 void rvAIAction::Restore ( idRestoreGame *savefile ) {
 	int num;
+	int packedFlags;
 
-	savefile->Read( &fl, sizeof( fl ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedFlags );
+		fl.disabled = ( packedFlags & BIT( 0 ) ) != 0;
+		fl.noPain = ( packedFlags & BIT( 1 ) ) != 0;
+		fl.noTurn = ( packedFlags & BIT( 2 ) ) != 0;
+		fl.isAttack = ( packedFlags & BIT( 3 ) ) != 0;
+		fl.isMelee = ( packedFlags & BIT( 4 ) ) != 0;
+		fl.overrideLegs = ( packedFlags & BIT( 5 ) ) != 0;
+		fl.noSimpleThink = ( packedFlags & BIT( 6 ) ) != 0;
+	} else {
+		savefile->Read( &fl, sizeof( fl ) );
+	}
 
 	savefile->ReadInt ( num );
 	if ( num < 0 || num > MAX_SAVEGAME_AI_ACTION_ANIMS ) {

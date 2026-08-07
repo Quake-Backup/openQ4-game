@@ -3278,6 +3278,22 @@ int Lexer::CheckTokenType(int type, int subtype, idToken *token)
 	}
 }
 
+/*
+================
+idLexer::PeekTokenString
+================
+*/
+int idLexer::PeekTokenString( const char *string ) {
+	idToken tok;
+
+	if ( !ReadToken( &tok ) ) {
+		return 0;
+	}
+
+	UnreadToken( &tok );
+	return tok == string;
+}
+
 int Lexer::CheckTokenString(char const *string)
 {
 	if(mDelegate)
@@ -3299,6 +3315,25 @@ int Lexer::CheckTokenString(char const *string)
 
 		UnreadToken( &tok );
 		return 0;
+	}
+}
+
+int Lexer::PeekTokenString( const char *string )
+{
+	if ( mDelegate )
+	{
+		return mDelegate->PeekTokenString( string );
+	}
+	else
+	{
+		idToken tok;
+
+		if ( !ReadToken( &tok ) ) {
+			return 0;
+		}
+
+		UnreadToken( &tok );
+		return tok == string;
 	}
 }
 

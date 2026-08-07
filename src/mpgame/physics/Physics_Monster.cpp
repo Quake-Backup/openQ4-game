@@ -336,7 +336,7 @@ void idPhysics_Monster::Restore( idRestoreGame *savefile ) {
 	savefile->ReadBool( noImpact );
 
 	savefile->ReadInt( (int &)moveResult );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( blockingEntity ) );
+	savefile->ReadObject( blockingEntity );
 }
 
 /*

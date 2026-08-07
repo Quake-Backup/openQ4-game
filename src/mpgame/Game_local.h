@@ -111,6 +111,7 @@ const int MAX_SAVEGAME_TRAM_WEAPONS						= 32;
 const int MAX_SAVEGAME_TRAM_VISIBLE_ENEMIES				= 256;
 const int MAX_SAVEGAME_TRAM_GATE_DOORS					= 32;
 const int MAX_SAVEGAME_TRIGGER_FUNCTIONS				= 256;
+const int MAX_SAVEGAME_MOVER_BUDDIES					= 128;
 const int MAX_SAVEGAME_MOVER_GUI_TARGETS				= 128;
 const int MAX_SAVEGAME_ELEVATOR_FLOORS					= 256;
 const int MAX_SAVEGAME_SHAKING_TARGET_HISTORY			= 256;
@@ -339,6 +340,12 @@ enum {
 	GAME_RELIABLE_MESSAGE_CENTERPRINT,
 	// openQ4: authoritative ready state, client to server
 	GAME_RELIABLE_MESSAGE_READY,
+	// openQ4: bounded typed competitive match-management transport.  Append
+	// only: demos and mixed client/server builds carry these numeric values.
+	GAME_RELIABLE_MESSAGE_MATCH_REQUEST,
+	GAME_RELIABLE_MESSAGE_MATCH_RESULT,
+	GAME_RELIABLE_MESSAGE_MATCH_VIEW,
+	GAME_RELIABLE_MESSAGE_MATCH_AUTH_CHALLENGE,
 };
 
 enum {
@@ -966,6 +973,17 @@ public:
 	rvClientEffect*			PlayEffect			( const idDict& args, const char* effectName, const idVec3& origin, const idMat3& axis, bool loop = false, const idVec3& endOrigin = vec3_origin, bool broadcast = false, bool predictedBit = false, effectCategory_t category = EC_IGNORE, const idVec4& effectTint = vec4_one );
 	const idDecl			*GetEffect			( const idDict& args, const char* effectName, const rvDeclMatType* materialType = NULL );
 
+// openQ4 BEGIN
+	// Liquid volumes. Shared by projectiles, moveables and anything else that can break a surface.
+	int						LiquidContentsAtCollision( const idEntity *hitEnt, const trace_t &collision ) const;
+	int						LiquidContentsAtPoint	( const idVec3 &point, const idEntity *passEntity );
+	const char *			LiquidTypeName			( int liquidContents ) const;
+	void					PlayLiquidImpact		( int liquidContents, const idVec3 &point, const idVec3 &normal, idEntity *ent, const idDict *callerArgs );
+	int						LiquidLevelForEntity	( idEntity *ent, int &liquidType );
+	void					PlayLiquidSoundOn		( idEntity *ent, const char *key, const s_channelType channel );
+	void					PlayLiquidEffectAt		( const char *key, const idVec3 &origin );
+// openQ4 END
+
 	void					UpdateRepeaterInfo( bool transmit = false );
 
 	idList<idEntity*>		ambientLights; // lights that cast ambient
@@ -1365,7 +1383,7 @@ public:
 #define	MASK_MONSTERSOLID			(CONTENTS_SOLID|CONTENTS_MONSTERCLIP|CONTENTS_BODY)
 #define	MASK_PLAYERSOLID			(CONTENTS_SOLID|CONTENTS_PLAYERCLIP|CONTENTS_BODY)
 #define	MASK_DEADSOLID				(CONTENTS_SOLID|CONTENTS_PLAYERCLIP)
-#define	MASK_WATER					(CONTENTS_WATER)
+#define	MASK_WATER					(CONTENTS_WATER|CONTENTS_LAVA|CONTENTS_SLIME)
 #define	MASK_OPAQUE					(CONTENTS_OPAQUE|CONTENTS_SIGHTCLIP)
 #define	MASK_SHOT_RENDERMODEL		(CONTENTS_SOLID|CONTENTS_RENDERMODEL)
 #define	MASK_SHOT_BOUNDINGBOX		(CONTENTS_SOLID|CONTENTS_BODY)

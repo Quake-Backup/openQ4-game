@@ -12,12 +12,10 @@ rvmBot::state_BattleNBG
 */
 stateResult_t rvmBot::state_BattleNBG(const stateParms_t& parms)
 {
-	int areanum;
 	bot_goal_t goal;
 	//aas_entityinfo_t entinfo;
 	idEntity* entinfo;
 	//bot_moveresult_t moveresult;
-	float attack_skill;
 	idVec3 target, dir;
 
 	//if (BotIsObserver(bs)) {

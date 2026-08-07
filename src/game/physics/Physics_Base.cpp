@@ -64,7 +64,7 @@ idPhysics_Base::Restore
 void idPhysics_Base::Restore( idRestoreGame *savefile ) {
 	int i, num;
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( self ) );
+	savefile->ReadObject( self );
 	savefile->ReadInt( clipMask );
 	savefile->ReadVec3( gravityVector );
 	savefile->ReadVec3( gravityNormal );
@@ -304,10 +304,18 @@ bool idPhysics_Base::IsPushable( void ) const {
 
 // RAVEN BEGIN
 // bdube: water interraction
+// openQ4: this returned false unconditionally, so every physics type that did not override it -
+// articulated figures, monsters, actors, parametric movers - was blind to liquid. Answer it from
+// the collision world instead, which costs one point query and makes ragdolls and AI able to tell
+// they are submerged.
 bool idPhysics_Base::IsInWater ( void ) const {
-	return false;
+	if ( !self ) {
+		return false;
+	}
+
+	return gameLocal.LiquidContentsAtPoint( GetOrigin(), self ) != 0;
 }
-// RAVEN END	
+// RAVEN END
 
 /*
 ================

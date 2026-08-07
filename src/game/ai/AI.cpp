@@ -139,6 +139,15 @@ idAI::idAI ( void ) {
 	actionAnimNum	= 0;
 	actionSkipTime	= 0;
 	actionTime		= 0;
+
+// openQ4 BEGIN
+	liquidLevel				= 0;
+	liquidType				= 0;
+	liquidAirTics			= 0;
+	nextLiquidDamageTime	= 0;
+	liquidCanBreathe		= false;
+	liquidImmune			= false;
+// openQ4 END
 }
 
 /*
@@ -165,7 +174,17 @@ idAI::Save
 =====================
 */
 void idAI::Save( idSaveGame *savefile ) const {
+// openQ4 BEGIN
+	savefile->WriteInt( liquidLevel );
+	savefile->WriteInt( liquidType );
+	savefile->WriteInt( liquidAirTics );
+	savefile->WriteInt( nextLiquidDamageTime );
+	savefile->WriteBool( liquidCanBreathe );
+	savefile->WriteBool( liquidImmune );
+// openQ4 END
+
 	int i;
+	int packedFlags;
 
 // cnicholson: These 3 vars are intentionally not saved, as noted in the restore
 	// NOSAVE: idLinkList<idAI>		simpleThinkNode;
@@ -242,7 +261,29 @@ void idAI::Save( idSaveGame *savefile ) const {
 	pusher.Save( savefile );			// cnicholson: Added unsaved var
 	scriptedActionEnt.Save( savefile ); // cnicholson: Added unsaved var
     
-	savefile->Write( &aifl, sizeof( aifl ) );
+	packedFlags = 0;
+	packedFlags |= aifl.awake ? BIT( 0 ) : 0;
+	packedFlags |= aifl.damage ? BIT( 1 ) : 0;
+	packedFlags |= aifl.pain ? BIT( 2 ) : 0;
+	packedFlags |= aifl.dead ? BIT( 3 ) : 0;
+	packedFlags |= aifl.activated ? BIT( 4 ) : 0;
+	packedFlags |= aifl.jump ? BIT( 5 ) : 0;
+	packedFlags |= aifl.hitEnemy ? BIT( 6 ) : 0;
+	packedFlags |= aifl.pushed ? BIT( 7 ) : 0;
+	packedFlags |= aifl.disableAttacks ? BIT( 8 ) : 0;
+	packedFlags |= aifl.scriptedEndWithIdle ? BIT( 9 ) : 0;
+	packedFlags |= aifl.scriptedNeverDormant ? BIT( 10 ) : 0;
+	packedFlags |= aifl.scripted ? BIT( 11 ) : 0;
+	packedFlags |= aifl.simpleThink ? BIT( 12 ) : 0;
+	packedFlags |= aifl.ignoreFlashlight ? BIT( 13 ) : 0;
+	packedFlags |= aifl.action ? BIT( 14 ) : 0;
+	packedFlags |= aifl.lookAtPlayer ? BIT( 15 ) : 0;
+	packedFlags |= aifl.disableLook ? BIT( 16 ) : 0;
+	packedFlags |= aifl.undying ? BIT( 17 ) : 0;
+	packedFlags |= aifl.tetherMover ? BIT( 18 ) : 0;
+	packedFlags |= aifl.meleeSuperhero ? BIT( 19 ) : 0;
+	packedFlags |= aifl.killerGuard ? BIT( 20 ) : 0;
+	savefile->WriteInt( packedFlags );
 
 	// Misc
 	savefile->WriteInt ( actionAnimNum );
@@ -251,7 +292,17 @@ void idAI::Save( idSaveGame *savefile ) const {
 	savefile->WriteInt ( flagOverrides );
 
 	// Combat variables
-	savefile->Write( &combat.fl, sizeof( combat.fl ) );
+	packedFlags = 0;
+	packedFlags |= combat.fl.ignoreEnemies ? BIT( 0 ) : 0;
+	packedFlags |= combat.fl.alert ? BIT( 1 ) : 0;
+	packedFlags |= combat.fl.aware ? BIT( 2 ) : 0;
+	packedFlags |= combat.fl.tetherNoBreak ? BIT( 3 ) : 0;
+	packedFlags |= combat.fl.tetherAutoBreak ? BIT( 4 ) : 0;
+	packedFlags |= combat.fl.tetherOutOfRange ? BIT( 5 ) : 0;
+	packedFlags |= combat.fl.seenEnemyDirectly ? BIT( 6 ) : 0;
+	packedFlags |= combat.fl.noChatter ? BIT( 7 ) : 0;
+	packedFlags |= combat.fl.crouchViewClear ? BIT( 8 ) : 0;
+	savefile->WriteInt( packedFlags );
 	savefile->WriteFloat ( combat.max_chasing_turn );
 	savefile->WriteFloat ( combat.shotAtTime );
 	savefile->WriteFloat ( combat.shotAtAngle );
@@ -288,11 +339,21 @@ void idAI::Save( idSaveGame *savefile ) const {
 	savefile->WriteInt	  ( passive.idleAnimChangeTime );
 	savefile->WriteInt	  ( passive.fidgetTime );
 	savefile->WriteInt	  ( passive.talkTime );
-	savefile->Write ( &passive.fl, sizeof(passive.fl) );
+	packedFlags = 0;
+	packedFlags |= passive.fl.disabled ? BIT( 0 ) : 0;
+	packedFlags |= passive.fl.multipleIdles ? BIT( 1 ) : 0;
+	packedFlags |= passive.fl.fidget ? BIT( 2 ) : 0;
+	savefile->WriteInt( packedFlags );
 
 	// Enemy 
 	enemy.ent.Save ( savefile );
-	savefile->Write ( &enemy.fl, sizeof(enemy.fl) );
+	packedFlags = 0;
+	packedFlags |= enemy.fl.lockOrigin ? BIT( 0 ) : 0;
+	packedFlags |= enemy.fl.dead ? BIT( 1 ) : 0;
+	packedFlags |= enemy.fl.inFov ? BIT( 2 ) : 0;
+	packedFlags |= enemy.fl.sighted ? BIT( 3 ) : 0;
+	packedFlags |= enemy.fl.visible ? BIT( 4 ) : 0;
+	savefile->WriteInt( packedFlags );
 	savefile->WriteInt ( enemy.lastVisibleChangeTime );
 	savefile->WriteVec3 ( enemy.lastKnownPosition );
 	savefile->WriteVec3 ( enemy.smoothedLinearVelocity );
@@ -359,9 +420,19 @@ idAI::Restore
 =====================
 */
 void idAI::Restore( idRestoreGame *savefile ) {
+// openQ4 BEGIN
+	savefile->ReadInt( liquidLevel );
+	savefile->ReadInt( liquidType );
+	savefile->ReadInt( liquidAirTics );
+	savefile->ReadInt( nextLiquidDamageTime );
+	savefile->ReadBool( liquidCanBreathe );
+	savefile->ReadBool( liquidImmune );
+// openQ4 END
+
 	bool		restorePhysics;
 	int			i;
 	int			num;
+	int			packedFlags;
 	idBounds	bounds;
 
 	InitNonPersistentSpawnArgs ( );
@@ -457,7 +528,32 @@ void idAI::Restore( idRestoreGame *savefile ) {
 	pusher.Restore( savefile );				// cnicholson: Added unrestored var
 	scriptedActionEnt.Restore ( savefile ); // cnicholson: Added unrestored var
 
-	savefile->Read( &aifl, sizeof( aifl ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedFlags );
+		aifl.awake = ( packedFlags & BIT( 0 ) ) != 0;
+		aifl.damage = ( packedFlags & BIT( 1 ) ) != 0;
+		aifl.pain = ( packedFlags & BIT( 2 ) ) != 0;
+		aifl.dead = ( packedFlags & BIT( 3 ) ) != 0;
+		aifl.activated = ( packedFlags & BIT( 4 ) ) != 0;
+		aifl.jump = ( packedFlags & BIT( 5 ) ) != 0;
+		aifl.hitEnemy = ( packedFlags & BIT( 6 ) ) != 0;
+		aifl.pushed = ( packedFlags & BIT( 7 ) ) != 0;
+		aifl.disableAttacks = ( packedFlags & BIT( 8 ) ) != 0;
+		aifl.scriptedEndWithIdle = ( packedFlags & BIT( 9 ) ) != 0;
+		aifl.scriptedNeverDormant = ( packedFlags & BIT( 10 ) ) != 0;
+		aifl.scripted = ( packedFlags & BIT( 11 ) ) != 0;
+		aifl.simpleThink = ( packedFlags & BIT( 12 ) ) != 0;
+		aifl.ignoreFlashlight = ( packedFlags & BIT( 13 ) ) != 0;
+		aifl.action = ( packedFlags & BIT( 14 ) ) != 0;
+		aifl.lookAtPlayer = ( packedFlags & BIT( 15 ) ) != 0;
+		aifl.disableLook = ( packedFlags & BIT( 16 ) ) != 0;
+		aifl.undying = ( packedFlags & BIT( 17 ) ) != 0;
+		aifl.tetherMover = ( packedFlags & BIT( 18 ) ) != 0;
+		aifl.meleeSuperhero = ( packedFlags & BIT( 19 ) ) != 0;
+		aifl.killerGuard = ( packedFlags & BIT( 20 ) ) != 0;
+	} else {
+		savefile->Read( &aifl, sizeof( aifl ) );
+	}
 
 	// Misc
 	savefile->ReadInt ( actionAnimNum );
@@ -466,7 +562,20 @@ void idAI::Restore( idRestoreGame *savefile ) {
 	savefile->ReadInt ( flagOverrides );
 
 	// Combat variables
-	savefile->Read ( &combat.fl, sizeof( combat.fl ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedFlags );
+		combat.fl.ignoreEnemies = ( packedFlags & BIT( 0 ) ) != 0;
+		combat.fl.alert = ( packedFlags & BIT( 1 ) ) != 0;
+		combat.fl.aware = ( packedFlags & BIT( 2 ) ) != 0;
+		combat.fl.tetherNoBreak = ( packedFlags & BIT( 3 ) ) != 0;
+		combat.fl.tetherAutoBreak = ( packedFlags & BIT( 4 ) ) != 0;
+		combat.fl.tetherOutOfRange = ( packedFlags & BIT( 5 ) ) != 0;
+		combat.fl.seenEnemyDirectly = ( packedFlags & BIT( 6 ) ) != 0;
+		combat.fl.noChatter = ( packedFlags & BIT( 7 ) ) != 0;
+		combat.fl.crouchViewClear = ( packedFlags & BIT( 8 ) ) != 0;
+	} else {
+		savefile->Read( &combat.fl, sizeof( combat.fl ) );
+	}
 	savefile->ReadFloat ( combat.max_chasing_turn );
 	savefile->ReadFloat ( combat.shotAtTime );
 	savefile->ReadFloat ( combat.shotAtAngle );
@@ -503,11 +612,27 @@ void idAI::Restore( idRestoreGame *savefile ) {
 	savefile->ReadInt	 ( passive.idleAnimChangeTime );
 	savefile->ReadInt	 ( passive.fidgetTime );
 	savefile->ReadInt	 ( passive.talkTime );
-	savefile->Read ( &passive.fl, sizeof(passive.fl) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedFlags );
+		passive.fl.disabled = ( packedFlags & BIT( 0 ) ) != 0;
+		passive.fl.multipleIdles = ( packedFlags & BIT( 1 ) ) != 0;
+		passive.fl.fidget = ( packedFlags & BIT( 2 ) ) != 0;
+	} else {
+		savefile->Read( &passive.fl, sizeof( passive.fl ) );
+	}
 
 	// Enemy 
 	enemy.ent.Restore ( savefile );
-	savefile->Read ( &enemy.fl, sizeof(enemy.fl) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedFlags );
+		enemy.fl.lockOrigin = ( packedFlags & BIT( 0 ) ) != 0;
+		enemy.fl.dead = ( packedFlags & BIT( 1 ) ) != 0;
+		enemy.fl.inFov = ( packedFlags & BIT( 2 ) ) != 0;
+		enemy.fl.sighted = ( packedFlags & BIT( 3 ) ) != 0;
+		enemy.fl.visible = ( packedFlags & BIT( 4 ) ) != 0;
+	} else {
+		savefile->Read( &enemy.fl, sizeof( enemy.fl ) );
+	}
 	savefile->ReadInt ( enemy.lastVisibleChangeTime );
 	savefile->ReadVec3 ( enemy.lastKnownPosition );
 	savefile->ReadVec3 ( enemy.smoothedLinearVelocity );
@@ -606,6 +731,14 @@ idAI::Spawn
 =====================
 */
 void idAI::Spawn( void ) {
+// openQ4 BEGIN
+	liquidCanBreathe	= spawnArgs.GetBool( "canBreatheLiquid", "0" );
+	liquidImmune		= spawnArgs.GetBool( "liquidImmune", "0" );
+	liquidAirTics		= pm_waterAirTics.GetInteger();
+	// the settle frames at the end of a map load must not burn a monster that starts in lava
+	nextLiquidDamageTime = gameLocal.time + 1000;
+// openQ4 END
+
 	const char*			jointname;
 	const idKeyValue*	kv;
 	idStr				jointName;
@@ -1166,6 +1299,92 @@ bool idAI::DoDormantTests ( void ) {
 idAI::Think
 =====================
 */
+// openQ4 BEGIN
+/*
+=====================
+idAI::UpdateLiquid
+
+Monsters get the same treatment the player does: lava and slime burn them, deep water drowns them,
+and breaking the surface splashes. Quake 2 gave its monsters waterlevel and M_WorldEffects for
+exactly this; Quake 4 shipped none of it because it has no liquids at all.
+
+Two def keys opt a monster out:
+	"canBreatheLiquid"  never drowns - anything aquatic, or that does not breathe
+	"liquidImmune"      lava and slime do nothing - anything already made of fire
+=====================
+*/
+void idAI::UpdateLiquid( void ) {
+	// events and damage are the server's business, and the settle frames at the end of a map load
+	// are not a good time to start hurting things
+	if ( gameLocal.isClient || gameLocal.GameState() != GAMESTATE_ACTIVE ) {
+		return;
+	}
+
+	int newType = 0;
+	const int newLevel = gameLocal.LiquidLevelForEntity( this, newType );
+
+	// breaking the surface, either way
+	if ( ( newLevel != 0 ) != ( liquidLevel != 0 ) ) {
+		const int splashType = newLevel ? newType : liquidType;
+		const char *liquid = gameLocal.LiquidTypeName( splashType );
+		const idBounds &bounds = GetPhysics()->GetBounds();
+
+		idVec3 splashOrigin = GetPhysics()->GetOrigin();
+		splashOrigin.z += bounds[0].z + ( bounds[1].z - bounds[0].z ) * 0.5f;
+
+		gameLocal.PlayLiquidSoundOn( this, va( newLevel ? "snd_enter_%s" : "snd_leave_%s", liquid ), SND_CHANNEL_BODY );
+		gameLocal.PlayLiquidEffectAt( va( "fx_splash_%s", liquid ), splashOrigin );
+	}
+
+	liquidLevel = newLevel;
+	liquidType = newType;
+
+	if ( !liquidLevel || health <= 0 || aifl.dead ) {
+		liquidAirTics = pm_waterAirTics.GetInteger();
+		return;
+	}
+
+	// drowning
+	if ( liquidLevel >= 3 && !liquidCanBreathe ) {
+		liquidAirTics--;
+		if ( liquidAirTics < 0 ) {
+			liquidAirTics = 0;
+			if ( gameLocal.time > nextLiquidDamageTime ) {
+				nextLiquidDamageTime = gameLocal.time + 1000;
+				Damage( NULL, NULL, vec3_origin, "damage_openq4_drown", (float)g_drownDamageMax.GetInteger() * 0.5f, INVALID_JOINT );
+				if ( g_debugLiquid.GetBool() ) {
+					gameLocal.Printf( "liquid: %s drowning, health %d\n", GetName(), health );
+				}
+				return;
+			}
+		}
+	} else {
+		liquidAirTics = pm_waterAirTics.GetInteger();
+	}
+
+	// lava and slime, scaled by how much of the monster is in it, exactly as for the player
+	if ( liquidImmune || !( liquidType & ( CONTENTS_LAVA | CONTENTS_SLIME ) ) ) {
+		return;
+	}
+	if ( gameLocal.time < nextLiquidDamageTime ) {
+		return;
+	}
+	nextLiquidDamageTime = gameLocal.time + g_liquidDamageInterval.GetInteger();
+
+	if ( g_debugLiquid.GetBool() ) {
+		gameLocal.Printf( "liquid: %s burning in %s at level %d, health %d\n",
+					   GetName(), gameLocal.LiquidTypeName( liquidType ), liquidLevel, health );
+	}
+
+	if ( liquidType & CONTENTS_LAVA ) {
+		Damage( NULL, NULL, vec3_origin, "damage_openq4_lava", (float)liquidLevel, INVALID_JOINT );
+	}
+	if ( liquidType & CONTENTS_SLIME ) {
+		Damage( NULL, NULL, vec3_origin, "damage_openq4_slime", (float)liquidLevel, INVALID_JOINT );
+	}
+}
+// openQ4 END
+
 void idAI::Think( void ) {
 
 	// if we are completely closed off from the player, don't do anything at all
@@ -1265,6 +1484,10 @@ void idAI::Think( void ) {
 	}
 
 	aasSensor->Update();
+
+// openQ4 BEGIN
+	UpdateLiquid();
+// openQ4 END
 
 	UpdateAnimation();
 	Present();

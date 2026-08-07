@@ -94,8 +94,7 @@ idBase64::Decode
 */
 int idBase64::Decode( byte *to ) const {
 	uint32_t w;
-	int i, j;
-	size_t n;
+	int i, j, n;
 	static char base64_to_sixtet[256];
 	static int tab_init = 0;
 	byte *from = data;

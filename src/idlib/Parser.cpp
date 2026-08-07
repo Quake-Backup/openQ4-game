@@ -343,7 +343,7 @@ define_t *idParser::DefineFromString( const char *string ) {
 	idParser src;
 	define_t *def;
 
-	if ( !src.LoadMemory(string, strlen(string), "*defineString") ) {
+	if ( !src.LoadMemory( string, idLib::SizeToInt( strlen( string ), "idParser::DefineFromString" ), "*defineString" ) ) {
 		return NULL;
 	}
 	// create a define from the source
@@ -3074,7 +3074,7 @@ void idParser::GetStringFromMarker( idStr& out, bool clean ) {
 	
 	// If cleaning then reparse
 	if ( clean ) {	
-		idParser temp( marker_p, strlen( marker_p ), "temp", flags );
+		idParser temp( marker_p, idLib::SizeToInt( strlen( marker_p ), "idParser::GetStringFromMarker" ), "temp", flags );
 		idToken token;
 		while ( temp.ReadToken ( &token ) ) {
 			out += token;

@@ -8,6 +8,7 @@
 #pragma hdrstop
 
 #include "../Game_local.h"
+#include "match/MatchDeadline.h"
 #include "RoundModes.h"
 
 gameStateType_t rvClanArenaGameState::type = GS_CA;
@@ -187,6 +188,13 @@ void rvFreezeTagGameState::Clear( void ) {
 	for ( i = 0; i < MAX_CLIENTS; i++ ) {
 		thawProgress[ i ] = 0;
 		lastThawAnnounce[ i ] = 0;
+	}
+}
+
+void rvFreezeTagGameState::ShiftMatchTime( int deltaMsec ) {
+	rvRoundGameState::ShiftMatchTime( deltaMsec );
+	for ( int index = 0; index < MAX_CLIENTS; ++index ) {
+		mpMatchShiftOptionalDeadline( lastThawAnnounce[ index ], deltaMsec );
 	}
 }
 

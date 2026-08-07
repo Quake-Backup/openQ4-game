@@ -270,7 +270,7 @@ void rvWeaponRocketLauncher::Restore( idRestoreGame *saveFile ) {
 	idEntity* ent = NULL;
 	rvClientEffect* clientEffect = NULL;
 
-	saveFile->ReadObject( reinterpret_cast<idClass *&>(clientEffect) );
+	saveFile->ReadObject( clientEffect );
 	guideEffect = clientEffect;
 	
 	saveFile->ReadInt( numEnts );
@@ -280,7 +280,7 @@ void rvWeaponRocketLauncher::Restore( idRestoreGame *saveFile ) {
 	guideEnts.Clear();
 	guideEnts.SetNum( numEnts );
 	for( int ix = 0; ix < numEnts; ++ix ) {
-		saveFile->ReadObject( reinterpret_cast<idClass *&>(ent) );
+		saveFile->ReadObject( ent );
 		guideEnts[ ix ] = ent;
 	}
 	

@@ -2224,6 +2224,116 @@ void rvBot::PressJump( usercmd_t &cmd ) const {
 	}
 }
 
+// openQ4 BEGIN
+// How far ahead a bot checks for lava and slime, and the small lift used on every probe so it
+// samples just inside the volume rather than exactly on the floor plane.
+const float BOT_LIQUID_LOOKAHEAD	= 56.0f;
+const float BOT_LIQUID_PROBE_LIFT	= 2.0f;
+
+/*
+================
+rvBot::LiquidAtFeet
+================
+*/
+int rvBot::LiquidAtFeet( void ) const {
+	idPlayer *self = GetPlayer();
+	if ( !self ) {
+		return 0;
+	}
+
+	const idVec3 probe = self->GetPhysics()->GetOrigin() + idVec3( 0.0f, 0.0f, BOT_LIQUID_PROBE_LIFT );
+	return gameLocal.LiquidContentsAtPoint( probe, self );
+}
+
+/*
+================
+rvBot::LiquidAtEye
+================
+*/
+int rvBot::LiquidAtEye( void ) const {
+	idPlayer *self = GetPlayer();
+	if ( !self ) {
+		return 0;
+	}
+
+	return gameLocal.LiquidContentsAtPoint( self->GetEyePosition(), self );
+}
+
+/*
+================
+rvBot::UpdateLiquidMovement
+
+Swimming and getting out of the fire. Held up rather than pulsed like PressJump, because in
+idPhysics_Player::WaterMove upmove is an analogue swim-up axis, not a jump edge.
+================
+*/
+void rvBot::UpdateLiquidMovement( idPlayer *self, usercmd_t &cmd ) {
+	const int feetLiquid = LiquidAtFeet();
+	if ( !feetLiquid ) {
+		return;
+	}
+
+	// Lava and slime are killing the bot right now, so climbing is the whole plan.
+	if ( feetLiquid & ( CONTENTS_LAVA | CONTENTS_SLIME ) ) {
+		cmd.upmove = 127;
+		cmd.buttons |= BUTTON_RUN;
+		return;
+	}
+
+	// Water: surface before the air runs out, then swim along the top rather than porpoising.
+	if ( LiquidAtEye() ) {
+		cmd.upmove = 127;
+	}
+}
+
+/*
+================
+rvBot::AvoidLiquidHazard
+
+Refuses to walk into lava or slime. Routing cannot help here - the navmesh is built from solids and
+a liquid volume is not solid, so a path will run straight across a lava pool. Probe a short way
+along the intended move and slide around the hazard instead of stepping into it.
+================
+*/
+idVec3 rvBot::AvoidLiquidHazard( const idVec3 &moveDir ) const {
+	idPlayer *self = GetPlayer();
+	if ( !self ) {
+		return moveDir;
+	}
+
+	idVec3 flat = moveDir;
+	flat.z = 0.0f;
+	if ( flat.Normalize() < VECTOR_EPSILON ) {
+		return moveDir;
+	}
+
+	// already standing in it: escaping is UpdateLiquidMovement's job, and refusing to move here
+	// would only pin the bot in the hazard
+	const int hazardMask = CONTENTS_LAVA | CONTENTS_SLIME;
+	if ( LiquidAtFeet() & hazardMask ) {
+		return moveDir;
+	}
+
+	const idVec3 lift( 0.0f, 0.0f, BOT_LIQUID_PROBE_LIFT );
+	const idVec3 origin = self->GetPhysics()->GetOrigin();
+
+	if ( !( gameLocal.LiquidContentsAtPoint( origin + flat * BOT_LIQUID_LOOKAHEAD + lift, self ) & hazardMask ) ) {
+		return moveDir;
+	}
+
+	// try both sides before giving up, so the bot skirts the pool instead of stopping in the open
+	const idVec3 side( -flat.y, flat.x, 0.0f );
+	for ( int i = 0; i < 2; i++ ) {
+		const idVec3 candidate = i ? -side : side;
+		if ( !( gameLocal.LiquidContentsAtPoint( origin + candidate * BOT_LIQUID_LOOKAHEAD + lift, self ) & hazardMask ) ) {
+			return candidate;
+		}
+	}
+
+	return vec3_origin;
+}
+// openQ4 END
+
 /*
 ================
 rvBot::ApplyMove
@@ -2238,8 +2348,12 @@ void rvBot::ApplyMove( const idVec3 &moveDir, usercmd_t &cmd ) const {
 	idAngles moveAngles( 0.0f, aimAngles.yaw, 0.0f );
 	moveAngles.ToVectors( &forward, &right, NULL );
 
-	cmd.forwardmove	= idMath::ClampChar( (int)( ( moveDir * forward ) * 127.0f ) );
-	cmd.rightmove	= idMath::ClampChar( (int)( ( moveDir * right ) * 127.0f ) );
+// openQ4 BEGIN
+	const idVec3 steerDir = AvoidLiquidHazard( moveDir );
+// openQ4 END
+
+	cmd.forwardmove	= idMath::ClampChar( (int)( ( steerDir * forward ) * 127.0f ) );
+	cmd.rightmove	= idMath::ClampChar( (int)( ( steerDir * right ) * 127.0f ) );
 
 	// Full speed needs the run button held; without it idPlayer::AdjustSpeed
 	// drops the bot to pm_walkspeed.
@@ -2359,6 +2473,13 @@ void rvBot::UpdateMovement( idPlayer *self, usercmd_t &cmd ) {
 	const idVec3 origin = self->GetPhysics()->GetOrigin();
 
 	TrackDamage( self );
+
+// openQ4 BEGIN
+	// Liquid comes first. A bot that cannot swim drowns in the first pool it walks into, and one
+	// that cannot tell lava from floor stands in it until it dies. This only adds the vertical
+	// axis, so the normal pathing below still runs and carries the bot out horizontally.
+	UpdateLiquidMovement( self, cmd );
+// openQ4 END
 
 	// Holding is an objective action, not an exhausted route.  Keep facing and
 	// firing through the normal aim/weapon stages, but do not let generic combat

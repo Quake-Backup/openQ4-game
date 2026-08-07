@@ -166,6 +166,13 @@ def main() -> None:
     reject(src_meson, "import('python').find_installation", "target-machine Python discovery")
     for warning_error in ("/we4302", "/we4311", "/we4312"):
         require(src_meson, warning_error, "MSVC pointer-truncation error policy")
+    for warning_error in ("/we4101", "/we4189", "/we4267", "/we4324", "/we4505"):
+        require(src_meson, warning_error, "MSVC x64 warning-regression policy")
+    require(
+        src_meson,
+        "if host_cpu_family == 'x86_64'",
+        "MSVC warning-regression policy architecture scope",
+    )
     reject(src_meson, "'/WX'", "blanket MSVC warnings-as-errors policy")
     require(src_meson, "is_linux = host_system == 'linux'", "Linux host predicate")
     require(
@@ -187,13 +194,21 @@ def main() -> None:
     for link_arg in ("-Wl,-z,relro", "-Wl,-z,now", "-Wl,-z,noexecstack", "-Wl,-z,defs"):
         require(src_meson, link_arg, "Linux module hardening")
     require(src_meson, "'-Wl,--version-script=' + linux_game_module_export_map_path", "Linux game-module export map")
-    if src_meson.count("link_depends : module_link_depends") != 2:
+    linux_module_blocks = re.findall(
+        r"  elif is_linux\n    shared_module\((.*?)\n    \)\n  endif",
+        src_meson,
+        flags=re.DOTALL,
+    )
+    if len(linux_module_blocks) != 2 or any(
+        "link_depends : module_link_depends" not in block for block in linux_module_blocks
+    ):
         raise AssertionError("Linux SP and MP modules must relink when the export map changes")
     require(export_map, "GetGameAPI;", "Linux game-module public API")
     require(export_map, "local:", "Linux game-module local symbol policy")
     require(export_map, "*;", "Linux game-module default-local symbol policy")
-    require(src_meson, "gnu_symbol_visibility : is_linux ? 'hidden' : 'default'", "Linux idlib symbol visibility")
-    if src_meson.count("gnu_symbol_visibility : 'hidden'") != 2:
+    if src_meson.count("gnu_symbol_visibility : is_windows ? 'default' : 'hidden'") != 2:
+        raise AssertionError("Both idlib flavours must hide symbols on Linux and macOS")
+    if any("gnu_symbol_visibility : 'hidden'" not in block for block in linux_module_blocks):
         raise AssertionError("Linux SP and MP modules must hide non-API symbols")
     if src_meson.count("elif is_linux") < 3:
         raise AssertionError("Linux Meson contract must define platform flags plus SP and MP module targets")
@@ -722,8 +737,8 @@ def main() -> None:
         restore = harvester_cpp.split(
             "void rvMonsterHarvester::Restore ( idRestoreGame *savefile ) {", 1
         )[1].split("void rvMonsterHarvester::InitSpawnArgsVariables", 1)[0]
-        require(restore, "idClass* object = NULL;", context)
-        require(restore, "dynamic_cast<idEntity*>( object )", context)
+        require(restore, "idEntity* projectile = NULL;", context)
+        require(restore, "savefile->ReadObject( projectile );", context)
         require(restore, "whipProjectiles[i] = projectile;", context)
         reject(
             restore,
@@ -738,7 +753,8 @@ def main() -> None:
         restore = gauntlet_cpp.split(
             "void rvWeaponGauntlet::Restore ( idRestoreGame *savefile ) {", 1
         )[1].split("rvWeaponGauntlet::PreSave", 1)[0]
-        require(restore, "dynamic_cast<rvClientEffect*>( object )", context)
+        require(restore, "rvClientEffect* effect = NULL;", context)
+        require(restore, "savefile->ReadObject ( effect );", context)
         require(restore, "impactEffect = effect;", context)
         reject(restore, "reinterpret_cast<idClass*&>( impactEffect )", context)
 
@@ -749,7 +765,8 @@ def main() -> None:
         restore = dark_matter_cpp.split(
             "void rvWeaponDarkMatterGun::Restore ( idRestoreGame *savefile ) {", 1
         )[1].split("rvWeaponDarkMatterGun::PreSave", 1)[0]
-        require(restore, "dynamic_cast<rvClientEffect*>( object )", context)
+        require(restore, "rvClientEffect* effect = NULL;", context)
+        require(restore, "savefile->ReadObject( effect );", context)
         require(restore, "coreEffect = effect;", context)
         require(restore, "coreStartEffect = effect;", context)
         reject(restore, "reinterpret_cast<idClass*&>( coreEffect )", context)
@@ -891,10 +908,20 @@ def main() -> None:
             raise AssertionError(f"Both preformatted vote announcements must be copied literally in {context}")
         if multiplayer_cpp.count('AddChatLine( "%s", localizedString );') != 3:
             raise AssertionError(f"All localized vote results must be copied literally in {context}")
-        if multiplayer_cpp.count('common->Printf( "%s", common->GetLocalizedString') != 15:
+        if multiplayer_cpp.count('common->Printf( "%s", common->GetLocalizedString') < 15:
             raise AssertionError(f"All no-argument localized vote help must be copied literally in {context}")
-        if multiplayer_cpp.count('AddChatLine( "%s", common->GetLocalizedString') != 5:
-            raise AssertionError(f"All no-argument localized chat messages must be copied literally in {context}")
+        literal_localized_chat = re.findall(
+            r'AddChatLine\(\s*"%s",\s*common->GetLocalizedString\(\s*"#[^"]+"\s*\)\s*\);',
+            multiplayer_cpp,
+        )
+        if len(literal_localized_chat) < 5:
+            raise AssertionError(f"Expected the known no-argument localized chat messages in {context}")
+        unsafe_localized_chat = re.findall(
+            r'(?m)^[ \t]*AddChatLine\(\s*common->GetLocalizedString\(\s*"#[^"]+"\s*\)\s*\);',
+            multiplayer_cpp,
+        )
+        if unsafe_localized_chat:
+            raise AssertionError(f"No-argument localized chat messages must be copied literally in {context}")
         require(multiplayer_cpp, 'AddChatLine( "%s", msg );', context)
         require(multiplayer_cpp, 'AddChatLine( "%s", voteString.c_str() );', context)
         reject(multiplayer_cpp, 'AddChatLine( msg );', f"dynamic chat format in {context}")

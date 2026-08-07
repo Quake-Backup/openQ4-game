@@ -207,12 +207,8 @@ void rvMonsterHarvester::Restore ( idRestoreGame *savefile ) {
 	
 	int i;
 	for ( i = 0; i < WHIP_MAX; i++ ) {
-		idClass* object = NULL;
-		savefile->ReadObject( object );
-		idEntity* projectile = dynamic_cast<idEntity*>( object );
-		if ( object && !projectile ) {
-			savefile->Error( "rvMonsterHarvester::Restore: whip projectile %d is not an entity", i );
-		}
+		idEntity* projectile = NULL;
+		savefile->ReadObject( projectile );
 		whipProjectiles[i] = projectile;
 	}
 

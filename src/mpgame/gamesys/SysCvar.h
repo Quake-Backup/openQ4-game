@@ -268,6 +268,16 @@ extern idCVar	pm_thirdPersonDeath;
 extern idCVar	pm_modelView;
 extern idCVar	pm_airTics;
 
+// openQ4 BEGIN
+extern idCVar	pm_waterAirTics;
+extern idCVar	g_liquidDamageInterval;
+extern idCVar	g_drownDamageMax;
+extern idCVar	g_liquidScreenTint;
+extern idCVar	g_debugLiquid;
+extern idCVar	g_liquidTestVolume;
+extern idCVar	g_liquidTestVolumeSize;
+// openQ4 END
+
 // nmckenzie: added ability to try alternate accelerations.
 extern idCVar	pm_acceloverride;
 extern idCVar	pm_frictionoverride;
@@ -400,6 +410,11 @@ extern idCVar	si_gameType;
 extern idCVar	si_map;
 extern idCVar	si_mapCycle;
 extern idCVar	si_arenaCampaign;
+extern idCVar	g_matchProfile;
+extern idCVar	si_matchRules;
+extern idCVar	g_refPassword;
+extern idCVar	g_matchEvidence;
+extern idCVar	g_matchSeriesRecoveryId;
 extern idCVar	si_spectators;
 extern idCVar	si_minPlayers;
 // RAVEN BEGIN

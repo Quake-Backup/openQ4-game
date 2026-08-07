@@ -53,7 +53,7 @@ void rvGameLogLocal::Shutdown	( void ) {
 	if ( initialized && file ) {
 		const char* out;
 		out = va(":%d %d", gameLocal.time, gameLocal.framenum );
-		file->Write ( out, strlen ( out ) );
+		file->Write ( out, idLib::SizeToInt( strlen( out ), "rvGameLogLocal::Shutdown" ) );
 		file->Flush ( );
 		fileSystem->CloseFile ( file );
 		file = NULL;
@@ -145,7 +145,7 @@ void rvGameLogLocal::EndFrame ( void ) {
 	for ( ; indexCount < index.Num(); indexCount ++ ) {
 		const char* out;
 		out = va("#%d ", indexCount );
-		file->Write ( out, strlen ( out ) );
+		file->Write ( out, idLib::SizeToInt( strlen( out ), "rvGameLogLocal::EndFrame" ) );
 		file->Write ( index[indexCount].c_str(), index[indexCount].Length() );	
 		file->Write ( "\r\n", 2 );
 	}
@@ -157,11 +157,11 @@ void rvGameLogLocal::EndFrame ( void ) {
 		if ( oldframe[i] != frame[i] ) {
 			if ( !wroteTime ) {
 				out = va(":%d %d", gameLocal.time, gameLocal.framenum );
-				file->Write ( out, strlen ( out ) );
+				file->Write ( out, idLib::SizeToInt( strlen( out ), "rvGameLogLocal::EndFrame" ) );
 				wroteTime = true;
 			}		
 			out = va(" %d \"", i );
-			file->Write ( out, strlen(out) );
+			file->Write ( out, idLib::SizeToInt( strlen( out ), "rvGameLogLocal::EndFrame" ) );
 			file->Write ( frame[i].c_str(), frame[i].Length ( ) );
 			file->Write ( "\"", 1 );
 			oldframe[i] = frame[i];

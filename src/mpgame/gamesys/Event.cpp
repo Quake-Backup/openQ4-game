@@ -746,6 +746,35 @@ void idEvent::ClearEventList( void ) {
 
 /*
 ================
+idEvent::ShiftEvents
+
+Posted idClass events are gameplay-domain deadlines.  A two-pass update keeps
+the queue unchanged on overflow and preserves its ordering because every
+timestamp receives the same positive delta.
+================
+*/
+bool idEvent::ShiftEvents( int deltaMsec ) {
+	if ( deltaMsec < 0 ) {
+		return false;
+	}
+	if ( deltaMsec == 0 || EventQueue.IsListEmpty() ) {
+		return true;
+	}
+
+	const int maxInt = 0x7fffffff;
+	for ( idEvent *event = EventQueue.Next(); event != NULL; event = event->eventNode.Next() ) {
+		if ( event->time < 0 || event->time > maxInt - deltaMsec ) {
+			return false;
+		}
+	}
+	for ( idEvent *event = EventQueue.Next(); event != NULL; event = event->eventNode.Next() ) {
+		event->time += deltaMsec;
+	}
+	return true;
+}
+
+/*
+================
 idEvent::ServiceEvents
 ================
 */
@@ -983,8 +1012,10 @@ void idEvent::Restore( idRestoreGame *savefile ) {
 			savefile->Error( "idEvent::Restore: unknown class '%s' on event '%s'", name.c_str(), event->eventdef->GetName() );
 		}
 
-		savefile->ReadObject( event->object );
-		assert( event->object );
+		savefile->ReadObject( event->object, *event->typeinfo, event->eventdef->GetName() );
+		if ( event->object == NULL ) {
+			savefile->Error( "idEvent::Restore: event '%s' has a NULL target object", event->eventdef->GetName() );
+		}
 
 		// read the args
 		savefile->ReadInt( argsize );

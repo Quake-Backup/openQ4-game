@@ -180,6 +180,15 @@ private:
 	void					ApplyMove( const idVec3 &moveDir, usercmd_t &cmd ) const;
 	void					PressJump( usercmd_t &cmd ) const;
 
+// openQ4 BEGIN
+	// Liquid handling. The navmesh is generated against solids only, so liquid volumes are
+	// invisible to routing and all of this has to work locally, off point queries.
+	int						LiquidAtFeet( void ) const;
+	int						LiquidAtEye( void ) const;
+	void					UpdateLiquidMovement( idPlayer *self, usercmd_t &cmd );
+	idVec3					AvoidLiquidHazard( const idVec3 &moveDir ) const;
+// openQ4 END
+
 	int						clientNum;
 	idStr					name;
 	bool					active;

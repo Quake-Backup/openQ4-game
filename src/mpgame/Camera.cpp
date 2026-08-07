@@ -112,8 +112,8 @@ void idCameraView::Restore( idRestoreGame *savefile ) {
 	savefile->ReadFloat( setf );
 	fov.SetEndValue( setf );
 // RAVEN END
-	savefile->ReadObject( reinterpret_cast<idClass *&>( attachedTo ) );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( attachedView ) );
+	savefile->ReadObject( attachedTo );
+	savefile->ReadObject( attachedView );
 }
 
 /*
@@ -1569,7 +1569,7 @@ int idDeclCameraDef::GetAnim( const char *name ) const {
 	int				numAnims;
 	int				len;
 
-	len = strlen( name );
+	len = idLib::SizeToInt( strlen( name ), "idDeclCameraDef::GetAnim" );
 	if ( len && idStr::CharIsNumeric( name[ len - 1 ] ) ) {
 		// find a specific animation
 		return GetSpecificAnim( name );

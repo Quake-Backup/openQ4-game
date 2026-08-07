@@ -207,6 +207,9 @@ public:
 
 	// thinking
 	virtual void			Think( void );
+	// Central competitive-pause hook.  Implementations may rebase their own
+	// absolute gameplay deadlines but must not advance gameplay or emit damage.
+	virtual void			ThinkMatchPaused( int deltaMsec );
 	bool					CheckDormant( void );	// dormant == on the active list, but out of PVS
 	virtual	void			DormantBegin( void );	// called when entity becomes dormant
 	virtual	void			DormantEnd( void );		// called when entity wakes from being dormant
@@ -753,6 +756,7 @@ public:
 
 	virtual void			ClientPredictionThink( void );
 	virtual void			Think( void );
+	virtual void			ThinkMatchPaused( int deltaMsec );
 
 	void					UpdateAnimation( void );
 

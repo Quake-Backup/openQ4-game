@@ -72,6 +72,8 @@ public:
 	virtual void			ForceFlush( void );
 							// Causes any buffered data to be written to the file.
 	virtual void			Flush( void );
+							// Flushes buffered data and asks the operating system to persist it.
+	virtual bool			Sync( void );
 							// Seek on a file.
 	virtual int				Seek( long offset, fsOrigin_t origin );
 							// Go back to the beginning of the file.
@@ -237,6 +239,7 @@ public:
 	virtual int				Tell( void );
 	virtual void			ForceFlush( void );
 	virtual void			Flush( void );
+	virtual bool			Sync( void );
 	virtual int				Seek( long offset, fsOrigin_t origin );
 
 	// returns file pointer

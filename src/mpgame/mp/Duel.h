@@ -21,7 +21,7 @@ public:
 
 	virtual void	Clear( void );
 	virtual void	Run( void );
-	virtual void	NewState( mpGameState_t newState );
+	virtual bool	NewState( mpGameState_t newState );
 
 	virtual void	ClientDisconnect( idPlayer* player );
 

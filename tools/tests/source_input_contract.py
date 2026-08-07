@@ -18,10 +18,16 @@ def require(haystack: str, needle: str, context: str) -> None:
         raise AssertionError(f"Missing {needle!r} in {context}")
 
 
+def reject(haystack: str, needle: str, context: str) -> None:
+    if needle in haystack:
+        raise AssertionError(f"Unexpected {needle!r} in {context}")
+
+
 def main() -> None:
     readme = read("README.md")
     agents = read("AGENTS.md")
     src_meson = read("src/meson.build")
+    lib_h = read("src/idlib/Lib.h")
     workflow = read(".github/workflows/commit-validation.yml")
 
     require(readme, "canonical source-input repository", "README source-input overview")
@@ -40,10 +46,21 @@ def main() -> None:
         "Meson Linux compiler contract",
     )
 
+    require(lib_h, "if ( text != NULL )", "null-safe idException construction")
+    require(
+        lib_h,
+        "i < (int)sizeof( error ) - 1 && text[i] != '\\0'",
+        "bounded idException construction",
+    )
+    require(lib_h, "error[i] = '\\0';", "terminated idException construction")
+    reject(lib_h, "strcpy( error, text )", "idException construction")
+
     require(workflow, "runs-on: ubuntu-24.04", "Linux CI runner")
     require(workflow, "Linux x64 GameLibs", "Linux standalone CI job")
     require(workflow, "Linux ARM64 GameLibs", "Linux ARM64 standalone CI job")
     require(workflow, "meson compile -C builddir", "Linux standalone CI compile")
+    require(workflow, "tools/tests/lexer_peek_contract.py", "workflow lexer lookahead test compile")
+    require(workflow, "python tools/tests/lexer_peek_contract.py", "workflow lexer lookahead test run")
     require(workflow, "tools/tests/source_input_contract.py", "workflow source-input test compile")
     require(workflow, "python tools/tests/source_input_contract.py", "workflow source-input test run")
 

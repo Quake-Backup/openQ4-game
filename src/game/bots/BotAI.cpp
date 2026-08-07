@@ -729,7 +729,7 @@ rvmBot::BotAimAtEnemy
 void rvmBot::BotAimAtEnemy( bot_state_t* bs )
 {
 	int i, enemyvisible;
-	float dist, f, aim_skill, aim_accuracy, speed, reactiontime;
+	float dist, f, aim_skill, aim_accuracy, reactiontime;
 	idVec3 dir, bestorigin, end, start, groundtarget, cmdmove, enemyvelocity;
 	idVec3 mins( -4, -4, -4 );
 	idVec3 maxs( 4, 4, 4 );

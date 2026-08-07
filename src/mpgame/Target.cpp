@@ -900,7 +900,7 @@ void idTarget_SetInfluence::Restore( idRestoreGame *savefile ) {
 	savefile->ReadString( flashInSound );
 	savefile->ReadString( flashOutSound );
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( switchToCamera ) );
+	savefile->ReadObject( switchToCamera );
 
 	savefile->ReadFloat( set );
 	fovSetting.SetStartTime( set );

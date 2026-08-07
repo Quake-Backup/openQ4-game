@@ -591,7 +591,17 @@ public:
 	idDynamicBlock<type> *			prev;					// previous memory block
 	idDynamicBlock<type> *			next;					// next memory block
 	idBTreeNode<idDynamicBlock<type>,int> *node;			// node in the B-Tree with free blocks
+#if defined( _WIN64 ) || defined( __LP64__ )
+	byte						alignmentPadding[8];		// explicit tail padding required by alignas(16) on 64-bit targets
+#endif
 };
+
+static_assert( alignof( idDynamicBlock<byte> ) == 16, "idDynamicBlock alignment is part of the allocator contract" );
+#if defined( _WIN64 ) || defined( __LP64__ )
+static_assert( sizeof( idDynamicBlock<byte> ) == 64, "64-bit idDynamicBlock layout changed" );
+#else
+static_assert( sizeof( idDynamicBlock<byte> ) == 32, "32-bit idDynamicBlock layout changed" );
+#endif
 
 template<class type, int baseBlockSize, int minBlockSize, byte memoryTag>
 class idDynamicBlockAlloc {

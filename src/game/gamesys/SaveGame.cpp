@@ -39,6 +39,71 @@ file be unloadable in some way (for example, due to script changes).
 #define MAX_PRINT_MSG		4096
 // RAVEN END
 
+const char *OpenQ4SaveGameWireABI( void ) {
+#if defined( _WIN32 )
+	#define OPENQ4_SAVEGAME_ABI_OS "windows"
+	#define OPENQ4_SAVEGAME_ABI_COMPILER "msvcabi"
+#elif defined( __APPLE__ )
+	#define OPENQ4_SAVEGAME_ABI_OS "macos"
+	#define OPENQ4_SAVEGAME_ABI_COMPILER "itaniumabi"
+#elif defined( __linux__ )
+	#define OPENQ4_SAVEGAME_ABI_OS "linux"
+	#define OPENQ4_SAVEGAME_ABI_COMPILER "itaniumabi"
+#else
+	#define OPENQ4_SAVEGAME_ABI_OS "unknownos"
+	#define OPENQ4_SAVEGAME_ABI_COMPILER "unknownabi"
+#endif
+#if defined( _M_X64 ) || defined( __x86_64__ )
+	#define OPENQ4_SAVEGAME_ABI_ARCH "x64"
+#elif defined( _M_ARM64 ) || defined( __aarch64__ )
+	#define OPENQ4_SAVEGAME_ABI_ARCH "arm64"
+#elif defined( _M_IX86 ) || defined( __i386__ )
+	#define OPENQ4_SAVEGAME_ABI_ARCH "x86"
+#elif defined( _M_ARM ) || defined( __arm__ )
+	#define OPENQ4_SAVEGAME_ABI_ARCH "arm32"
+#else
+	#define OPENQ4_SAVEGAME_ABI_ARCH "unknownarch"
+#endif
+#if defined( __BYTE_ORDER__ ) && defined( __ORDER_BIG_ENDIAN__ ) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	#define OPENQ4_SAVEGAME_ABI_ENDIAN "be"
+#else
+	#define OPENQ4_SAVEGAME_ABI_ENDIAN "le"
+#endif
+	return OPENQ4_SAVEGAME_ABI_OS "-" OPENQ4_SAVEGAME_ABI_COMPILER "-" OPENQ4_SAVEGAME_ABI_ARCH "-" OPENQ4_SAVEGAME_ABI_ENDIAN "-raw1";
+#undef OPENQ4_SAVEGAME_ABI_ENDIAN
+#undef OPENQ4_SAVEGAME_ABI_ARCH
+#undef OPENQ4_SAVEGAME_ABI_COMPILER
+#undef OPENQ4_SAVEGAME_ABI_OS
+}
+
+struct openQ4SaveGameV2Snapshot_t {
+	int build;
+	const char *sourceHash;
+	int sourceFileCount;
+	const char *wireABI;
+};
+
+static const openQ4SaveGameV2Snapshot_t OPENQ4_SAVEGAME_V2_SNAPSHOTS[] = {
+	{ 639, "d64f5bd29149262e67ce65107ea44b3f10af22011e7af354f23ca01550210fde", 404, "windows-msvcabi-x64-le-raw1" },
+	{ 614, "0c27fa5c6ef48b1bfe44c7be82b8a696772af4625eeefeed25de27da9640dd3f", 404, "windows-msvcabi-x64-le-raw1" },
+	{ 556, "871e5811e1732be750b18374b3d537aa38a91a050fb94cef847e2e3d39769cc2", 218, "windows-msvcabi-x64-le-raw1" },
+	{ 544, "82b545ffb5c9d8d27239eb8d1ed7eb5a22db1c40410dec4f3752f6f90fe76a60", 218, "windows-msvcabi-x64-le-raw1" },
+	{ 544, "ab567aef25905e8cf52e191523bc591f671b8cee3e63939a67af692bde3de446", 218, "windows-msvcabi-x64-le-raw1" },
+	{ 544, "9b26849ccdc3652aad892fdeeb5f219b631119fe601de00eb691fb5b4c13e02f", 218, "windows-msvcabi-x64-le-raw1" }
+};
+
+static bool SaveGame_IsSupportedV2Snapshot( int build, const idStr &sourceHash, int sourceFileCount ) {
+	for ( int i = 0; i < static_cast<int>( sizeof( OPENQ4_SAVEGAME_V2_SNAPSHOTS ) / sizeof( OPENQ4_SAVEGAME_V2_SNAPSHOTS[0] ) ); i++ ) {
+		const openQ4SaveGameV2Snapshot_t &snapshot = OPENQ4_SAVEGAME_V2_SNAPSHOTS[i];
+		if ( build == snapshot.build && sourceFileCount == snapshot.sourceFileCount &&
+			 sourceHash.Icmp( snapshot.sourceHash ) == 0 &&
+			 idStr::Icmp( OpenQ4SaveGameWireABI(), snapshot.wireABI ) == 0 ) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static const int MAX_SAVEGAME_OBJECTS = MAX_GENTITIES + MAX_CENTITIES + 4096;
 static const int MAX_SAVEGAME_DICT_ENTRIES = 16384;
 
@@ -100,6 +165,37 @@ private:
 	idScopedSaveMemoryFile &operator=( const idScopedSaveMemoryFile & );
 
 	idFile *file;
+};
+
+static void SaveGame_DeleteUnrestoredObjects( idList<idClass *> &objectList ) {
+	for ( int i = 1; i < objectList.Num(); i++ ) {
+		delete objectList[ i ];
+		objectList[ i ] = NULL;
+	}
+	objectList.Clear();
+}
+
+class idScopedUnrestoredObjectCleanup {
+public:
+	explicit idScopedUnrestoredObjectCleanup( idList<idClass *> &objectList ) : objects( objectList ), released( false ) {
+	}
+
+	~idScopedUnrestoredObjectCleanup( void ) {
+		if ( !released ) {
+			SaveGame_DeleteUnrestoredObjects( objects );
+		}
+	}
+
+	void Release( void ) {
+		released = true;
+	}
+
+private:
+	idScopedUnrestoredObjectCleanup( const idScopedUnrestoredObjectCleanup & );
+	idScopedUnrestoredObjectCleanup &operator=( const idScopedUnrestoredObjectCleanup & );
+
+	idList<idClass *> &objects;
+	bool released;
 };
 
 /*
@@ -355,7 +451,7 @@ void idSaveGame::WriteString( const char *string ) {
 		string = "";
 	}
 
-	len = strlen( string );
+	len = idLib::SizeToInt( strlen( string ), "idSaveGame::WriteString" );
 
 // RAVEN BEGIN
 // jscott: added safety check for silly length strings
@@ -482,10 +578,8 @@ void idSaveGame::WriteObject( const idClass *obj ) {
 
 	index = SaveGame_FindObjectIndex( objects, objectHash, obj );
 	if ( index < 0 ) {
-		gameLocal.DPrintf( "idSaveGame::WriteObject - WriteObject FindIndex failed\n" );
-
-		// Use the NULL index
-		index = 0;
+		gameLocal.Error( "idSaveGame::WriteObject: non-NULL object of type '%s' is not registered in the savegame object list",
+			obj->GetClassname() );
 	}
 
 	WriteInt( index );
@@ -1125,6 +1219,7 @@ void idSaveGame::WriteBuildNumber( const int value ) {
 	WriteInt( value );
 	WriteString( OPENQ4_SAVEGAME_COMPAT_SOURCE_HASH );
 	WriteInt( OPENQ4_SAVEGAME_COMPAT_SOURCE_FILE_COUNT );
+	WriteString( OpenQ4SaveGameWireABI() );
 }
 
 /*
@@ -1215,17 +1310,18 @@ void idRestoreGame::CreateObjects( void ) {
 	int i, num;
 	idStr classname;
 	idTypeInfo *type;
+	idList<idTypeInfo *> objectTypes;
 
 	ReadInt( num );
 	if ( num < 0 || num > MAX_SAVEGAME_OBJECTS ) {
 		Error( "idRestoreGame::CreateObjects: invalid object count %d at offset %d", num, file->Tell() );
 	}
 
-	// create all the objects
-	objects.SetNum( num + 1 );
-	memset( objects.Ptr(), 0, sizeof( objects[ 0 ] ) * objects.Num() );
-
-	for ( i = 1; i < objects.Num(); i++ ) {
+	// Validate the complete type table before allocating any objects. This keeps a
+	// corrupt later class name from leaving a partially constructed object graph.
+	objectTypes.SetNum( num + 1 );
+	objectTypes[ 0 ] = NULL;
+	for ( i = 1; i < objectTypes.Num(); i++ ) {
 		ReadString( classname );
 		if ( classname.IsEmpty() ) {
 			Error( "idRestoreGame::CreateObjects: empty class name for object %d", i );
@@ -1234,11 +1330,20 @@ void idRestoreGame::CreateObjects( void ) {
 		if ( !type ) {
 			Error( "idRestoreGame::CreateObjects: Unknown class '%s'", classname.c_str() );
 		}
-		objects[ i ] = type->CreateInstance();
+		objectTypes[ i ] = type;
+	}
+
+	objects.SetNum( num + 1 );
+	memset( objects.Ptr(), 0, sizeof( objects[ 0 ] ) * objects.Num() );
+	idScopedUnrestoredObjectCleanup cleanup( objects );
+
+	for ( i = 1; i < objects.Num(); i++ ) {
+		objects[ i ] = objectTypes[ i ]->CreateInstance();
 		if ( objects[ i ] == NULL ) {
-			Error( "idRestoreGame::CreateObjects: failed to create class '%s'", classname.c_str() );
+			Error( "idRestoreGame::CreateObjects: failed to create class '%s'", objectTypes[ i ]->classname );
 		}
 	}
+	cleanup.Release();
 }
 
 /*
@@ -1279,11 +1384,7 @@ void idRestoreGame::DeleteObjects
 ====================
 */
 void idRestoreGame::DeleteObjects( void ) {
-
-	// Remove the NULL object before deleting
-	objects.RemoveIndex( 0 );
-
-	objects.DeleteContents( true );
+	SaveGame_DeleteUnrestoredObjects( objects );
 }
 
 /*
@@ -1619,14 +1720,35 @@ idRestoreGame::ReadObject
 ================
 */
 void idRestoreGame::ReadObject( idClass *&obj ) {
-	int index;
+	ReadObject( obj, idClass::GetClassType(), "idClass" );
+}
 
+/*
+================
+idRestoreGame::ReadObject
+================
+*/
+void idRestoreGame::ReadObject( idClass *&obj, const idTypeInfo &expectedType, const char *detail ) {
+	int index;
+	const int offset = file->Tell();
+
+	obj = NULL;
 	ReadInt( index );
 	if ( ( index < 0 ) || ( index >= objects.Num() ) ) {
 		Error( "idRestoreGame::ReadObject: invalid object index %d (count %d, offset %d)",
-			index, objects.Num(), file->Tell() );
+			index, objects.Num(), offset );
 	}
 	obj = objects[ index ];
+	if ( index != 0 && obj == NULL ) {
+		Error( "idRestoreGame::ReadObject: unresolved object index %d while restoring %s (offset %d)",
+			index, detail ? detail : expectedType.classname, offset );
+	}
+	if ( obj != NULL && !obj->IsType( expectedType ) ) {
+		const char *actualClass = obj->GetClassname();
+		obj = NULL;
+		Error( "idRestoreGame::ReadObject: object index %d has type '%s', expected '%s' while restoring %s (offset %d)",
+			index, actualClass, expectedType.classname, detail ? detail : expectedType.classname, offset );
+	}
 }
 
 /*
@@ -2415,13 +2537,16 @@ void idRestoreGame::ReadBuildNumber( void ) {
 
 	if ( marker != OPENQ4_SAVEGAME_COMPATIBILITY_MAGIC ) {
 		buildNumber = marker;
-		if ( buildNumber == BUILD_NUMBER ) {
+		if ( buildNumber == BUILD_NUMBER &&
+			 idStr::Icmp( OpenQ4SaveGameWireABI(), "windows-msvcabi-x64-le-raw1" ) == 0 ) {
 			openQ4SaveGameCompatible = true;
 		} else {
 			openQ4SaveGameCompatibilityError = va(
-				"legacy save payload build %d does not match current build %d",
+				"legacy save payload build/ABI %d/%s is not supported by current build/ABI %d/%s",
 				buildNumber,
-				BUILD_NUMBER );
+				OpenQ4SaveGameWireABI(),
+				BUILD_NUMBER,
+				OpenQ4SaveGameWireABI() );
 		}
 		return;
 	}
@@ -2430,39 +2555,48 @@ void idRestoreGame::ReadBuildNumber( void ) {
 	ReadInt( openQ4SaveGameCompatibilityVersion );
 	ReadInt( buildNumber );
 	ReadString( openQ4SaveGameCompatibilityStamp );
+	ReadInt( openQ4SaveGameCompatibilitySourceFileCount );
 
-	if ( openQ4SaveGameCompatibilityVersion != OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+	if ( openQ4SaveGameCompatibilityVersion != OPENQ4_SAVEGAME_COMPATIBILITY_VERSION &&
+		 openQ4SaveGameCompatibilityVersion != OPENQ4_SAVEGAME_PREVIOUS_COMPATIBILITY_VERSION ) {
 		openQ4SaveGameCompatibilityError = va(
-			"payload format version %d does not match current version %d",
+			"payload format version %d is not supported (supported %d and %d)",
 			openQ4SaveGameCompatibilityVersion,
+			OPENQ4_SAVEGAME_PREVIOUS_COMPATIBILITY_VERSION,
 			OPENQ4_SAVEGAME_COMPATIBILITY_VERSION );
 		return;
 	}
 
-	ReadInt( openQ4SaveGameCompatibilitySourceFileCount );
-
-	if ( buildNumber != BUILD_NUMBER ) {
-		openQ4SaveGameCompatibilityError = va(
-			"payload build %d does not match current build %d",
-			buildNumber,
-			BUILD_NUMBER );
-		return;
-	}
-
-	if ( openQ4SaveGameCompatibilityStamp.Icmp( OPENQ4_SAVEGAME_COMPAT_SOURCE_HASH ) != 0 ) {
-		openQ4SaveGameCompatibilityError = va(
-			"source snapshot %s does not match current snapshot %s",
-			openQ4SaveGameCompatibilityStamp.c_str(),
-			OPENQ4_SAVEGAME_COMPAT_SOURCE_HASH );
-		return;
-	}
-
-	if ( openQ4SaveGameCompatibilitySourceFileCount != OPENQ4_SAVEGAME_COMPAT_SOURCE_FILE_COUNT ) {
-		openQ4SaveGameCompatibilityError = va(
-			"source snapshot file count %d does not match current count %d",
-			openQ4SaveGameCompatibilitySourceFileCount,
-			OPENQ4_SAVEGAME_COMPAT_SOURCE_FILE_COUNT );
-		return;
+	if ( openQ4SaveGameCompatibilityVersion == OPENQ4_SAVEGAME_PREVIOUS_COMPATIBILITY_VERSION ) {
+		if ( !SaveGame_IsSupportedV2Snapshot( buildNumber, openQ4SaveGameCompatibilityStamp, openQ4SaveGameCompatibilitySourceFileCount ) ) {
+			openQ4SaveGameCompatibilityError = va(
+				"unsupported v%d source snapshot %s (%d files), build %d",
+				openQ4SaveGameCompatibilityVersion,
+				openQ4SaveGameCompatibilityStamp.c_str(),
+				openQ4SaveGameCompatibilitySourceFileCount,
+				buildNumber );
+			return;
+		}
+	} else {
+		idStr savedWireABI;
+		ReadString( savedWireABI );
+		if ( savedWireABI.Icmp( OpenQ4SaveGameWireABI() ) != 0 ) {
+			openQ4SaveGameCompatibilityError = va(
+				"wire ABI %s does not match current ABI %s",
+				savedWireABI.c_str(), OpenQ4SaveGameWireABI() );
+			return;
+		}
+		if ( openQ4SaveGameCompatibilitySourceFileCount < 0 || openQ4SaveGameCompatibilityStamp.IsEmpty() ) {
+			openQ4SaveGameCompatibilityError = "invalid payload source metadata";
+			return;
+		}
+		if ( buildNumber != BUILD_NUMBER ||
+			 openQ4SaveGameCompatibilityStamp.Icmp( OPENQ4_SAVEGAME_COMPAT_SOURCE_HASH ) != 0 ||
+			 openQ4SaveGameCompatibilitySourceFileCount != OPENQ4_SAVEGAME_COMPAT_SOURCE_FILE_COUNT ) {
+			common->DPrintf( "Schema-compatible save source differs: saved %d/%s (%d files), current %d/%s (%d files)\n",
+				buildNumber, openQ4SaveGameCompatibilityStamp.c_str(), openQ4SaveGameCompatibilitySourceFileCount,
+				BUILD_NUMBER, OPENQ4_SAVEGAME_COMPAT_SOURCE_HASH, OPENQ4_SAVEGAME_COMPAT_SOURCE_FILE_COUNT );
+		}
 	}
 
 	openQ4SaveGameCompatible = true;
@@ -2514,6 +2648,30 @@ void idRestoreGame::ReadSaveGameFooter( void ) {
 			savedSyncCount, openQ4SaveGameNextSyncId );
 	}
 
+	if ( openQ4SaveGameCompatibilityVersion == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		const int integrityOffset = file->Tell();
+		int integrityMarker;
+		int integrityVersion;
+		int protectedLength;
+		int checksumBits;
+		ReadInt( integrityMarker );
+		ReadInt( integrityVersion );
+		ReadInt( protectedLength );
+		ReadInt( checksumBits );
+		if ( integrityMarker != OPENQ4_SAVEGAME_INTEGRITY_MAGIC ) {
+			Error( "idRestoreGame::ReadSaveGameFooter: invalid integrity marker 0x%08x", integrityMarker );
+		}
+		if ( integrityVersion != OPENQ4_SAVEGAME_INTEGRITY_VERSION ) {
+			Error( "idRestoreGame::ReadSaveGameFooter: integrity version %d does not match current version %d",
+				integrityVersion, OPENQ4_SAVEGAME_INTEGRITY_VERSION );
+		}
+		if ( protectedLength != integrityOffset ) {
+			Error( "idRestoreGame::ReadSaveGameFooter: protected length %d does not match integrity offset %d",
+				protectedLength, integrityOffset );
+		}
+		(void)checksumBits; // The engine preflight verifies the checksum before map teardown.
+	}
+
 	const int fileLength = file->Length();
 	const int endOffset = file->Tell();
 	if ( fileLength > 0 && endOffset >= 0 && endOffset != fileLength ) {
@@ -2529,6 +2687,15 @@ idRestoreGame::GetBuildNumber
 */
 int idRestoreGame::GetBuildNumber( void ) {
 	return buildNumber;
+}
+
+/*
+=====================
+idRestoreGame::GetOpenQ4SaveGameCompatibilityVersion
+=====================
+*/
+int idRestoreGame::GetOpenQ4SaveGameCompatibilityVersion( void ) const {
+	return openQ4SaveGameCompatibilityVersion;
 }
 
 /*

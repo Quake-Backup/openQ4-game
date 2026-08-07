@@ -22,20 +22,14 @@
 
 #include "GameState.h"
 
-typedef enum {
-	RS_INACTIVE = 0,	// between rounds, nothing scheduled yet
-	RS_COUNTDOWN,		// round is being set up; weapons are locked
-	RS_ACTIVE,			// round is live
-	RS_COMPLETE			// round is decided; result is on screen
-} roundState_t;
-
 class rvRoundGameState : public rvGameState {
 public:
 					rvRoundGameState( bool allocPrevious = true );
 
 	virtual void	Clear( void );
 	virtual void	Run( void );
-	virtual void	NewState( mpGameState_t newState );
+	virtual bool	NewState( mpGameState_t newState );
+	virtual void	ShiftMatchTime( int deltaMsec );
 	virtual void	GameStateChanged( void );
 
 	virtual void	SendState( const idMessageSender &sender, int clientNum = -1 );
@@ -104,10 +98,10 @@ protected:
 	// announces the round result and scores it
 	void			AwardRound( int winningTeam );
 
-	void			SetRoundState( roundState_t newState );
+	bool			SetRoundState( roundState_t newState );
 	// wipes the arena and puts everyone back on their feet
 	void			ResetRound( void );
-	void			ScheduleNextRound( void );
+	bool			ScheduleNextRound( void );
 
 	bool			IsEliminated( int clientNum ) const;
 	void			SetEliminated( int clientNum, bool value );

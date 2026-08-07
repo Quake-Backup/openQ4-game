@@ -58,7 +58,7 @@ void idIK::Restore( idRestoreGame *savefile ) {
 
 	savefile->ReadBool( initialized );
 	savefile->ReadBool( ik_activate );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( self ) );
+	savefile->ReadObject( self );
 	savefile->ReadString( anim );
 	//savefile->ReadInt( modifiedAnim );	// This is defined below
 	savefile->ReadVec3( modelOffset );
@@ -270,27 +270,29 @@ idIK_Walk::Save
 ================
 */
 void idIK_Walk::Save( idSaveGame *savefile ) const {
+	int i;
+
 	idIK::Save( savefile );
 
 	savefile->WriteClipModel( footModel );
 
 	savefile->WriteInt( numLegs );
 	savefile->WriteInt( enabledLegs );
-	savefile->Write( footJoints, sizeof( footJoints ) );
-	savefile->Write( ankleJoints, sizeof( ankleJoints ) );
-	savefile->Write( kneeJoints, sizeof( kneeJoints ) );
-	savefile->Write( hipJoints, sizeof( hipJoints ) );
-	savefile->Write( dirJoints, sizeof( dirJoints ) );
-	savefile->Write( &waistJoint, sizeof( waistJoint ) );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteJoint( footJoints[i] );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteJoint( ankleJoints[i] );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteJoint( kneeJoints[i] );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteJoint( hipJoints[i] );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteJoint( dirJoints[i] );
+	savefile->WriteJoint( waistJoint );
 
-	savefile->Write( hipForward, sizeof( hipForward ) );
-	savefile->Write( kneeForward, sizeof( kneeForward ) );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteVec3( hipForward[i] );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteVec3( kneeForward[i] );
 
-	savefile->Write( upperLegLength, sizeof( upperLegLength ) );
-	savefile->Write( lowerLegLength, sizeof( lowerLegLength ) );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteFloat( upperLegLength[i] );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteFloat( lowerLegLength[i] );
 
-	savefile->Write( upperLegToHipJoint, sizeof( upperLegToHipJoint ) );
-	savefile->Write( lowerLegToKneeJoint, sizeof( lowerLegToKneeJoint ) );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteMat3( upperLegToHipJoint[i] );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteMat3( lowerLegToKneeJoint[i] );
 
 	savefile->WriteFloat( smoothing );
 	savefile->WriteFloat( waistSmoothing );
@@ -308,7 +310,7 @@ void idIK_Walk::Save( idSaveGame *savefile ) const {
 	savefile->WriteVec3( pivotPos );
 	savefile->WriteBool( oldHeightsValid );
 	savefile->WriteFloat( oldWaistHeight );
-	savefile->Write( oldAnkleHeights, sizeof( oldAnkleHeights ) );
+	for ( i = 0; i < MAX_LEGS; i++ ) savefile->WriteFloat( oldAnkleHeights[i] );
 	savefile->WriteVec3( waistOffset );
 }
 
@@ -318,27 +320,50 @@ idIK_Walk::Restore
 ================
 */
 void idIK_Walk::Restore( idRestoreGame *savefile ) {
+	int i;
+
 	idIK::Restore( savefile );
 
 	savefile->ReadClipModel( footModel );
 
 	savefile->ReadInt( numLegs );
+	if ( numLegs < 0 || numLegs > MAX_LEGS ) {
+		savefile->Error( "idIK_Walk::Restore: invalid leg count %d", numLegs );
+	}
 	savefile->ReadInt( enabledLegs );
-	savefile->Read( footJoints, sizeof( footJoints ) );
-	savefile->Read( ankleJoints, sizeof( ankleJoints ) );
-	savefile->Read( kneeJoints, sizeof( kneeJoints ) );
-	savefile->Read( hipJoints, sizeof( hipJoints ) );
-	savefile->Read( dirJoints, sizeof( dirJoints ) );
-	savefile->Read( &waistJoint, sizeof( waistJoint ) );
+	if ( enabledLegs < 0 || ( enabledLegs & ~(( 1 << MAX_LEGS ) - 1) ) != 0 ) {
+		savefile->Error( "idIK_Walk::Restore: invalid enabled leg mask %d", enabledLegs );
+	}
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadJoint( footJoints[i] );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadJoint( ankleJoints[i] );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadJoint( kneeJoints[i] );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadJoint( hipJoints[i] );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadJoint( dirJoints[i] );
+		savefile->ReadJoint( waistJoint );
 
-	savefile->Read( hipForward, sizeof( hipForward ) );
-	savefile->Read( kneeForward, sizeof( kneeForward ) );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadVec3( hipForward[i] );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadVec3( kneeForward[i] );
 
-	savefile->Read( upperLegLength, sizeof( upperLegLength ) );
-	savefile->Read( lowerLegLength, sizeof( lowerLegLength ) );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadFloat( upperLegLength[i] );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadFloat( lowerLegLength[i] );
 
-	savefile->Read( upperLegToHipJoint, sizeof( upperLegToHipJoint ) );
-	savefile->Read( lowerLegToKneeJoint, sizeof( lowerLegToKneeJoint ) );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadMat3( upperLegToHipJoint[i] );
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadMat3( lowerLegToKneeJoint[i] );
+	} else {
+		savefile->Read( footJoints, sizeof( footJoints ) );
+		savefile->Read( ankleJoints, sizeof( ankleJoints ) );
+		savefile->Read( kneeJoints, sizeof( kneeJoints ) );
+		savefile->Read( hipJoints, sizeof( hipJoints ) );
+		savefile->Read( dirJoints, sizeof( dirJoints ) );
+		savefile->Read( &waistJoint, sizeof( waistJoint ) );
+		savefile->Read( hipForward, sizeof( hipForward ) );
+		savefile->Read( kneeForward, sizeof( kneeForward ) );
+		savefile->Read( upperLegLength, sizeof( upperLegLength ) );
+		savefile->Read( lowerLegLength, sizeof( lowerLegLength ) );
+		savefile->Read( upperLegToHipJoint, sizeof( upperLegToHipJoint ) );
+		savefile->Read( lowerLegToKneeJoint, sizeof( lowerLegToKneeJoint ) );
+	}
 
 	savefile->ReadFloat( smoothing );
 	savefile->ReadFloat( waistSmoothing );
@@ -356,7 +381,11 @@ void idIK_Walk::Restore( idRestoreGame *savefile ) {
 	savefile->ReadVec3( pivotPos );
 	savefile->ReadBool( oldHeightsValid );
 	savefile->ReadFloat( oldWaistHeight );
-	savefile->Read( oldAnkleHeights, sizeof( oldAnkleHeights ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		for ( i = 0; i < MAX_LEGS; i++ ) savefile->ReadFloat( oldAnkleHeights[i] );
+	} else {
+		savefile->Read( oldAnkleHeights, sizeof( oldAnkleHeights ) );
+	}
 	savefile->ReadVec3( waistOffset );
 }
 
@@ -834,23 +863,22 @@ idIK_Reach::Save
 ================
 */
 void idIK_Reach::Save( idSaveGame *savefile ) const {
+	int i;
+
 	idIK::Save( savefile );
 
 	savefile->WriteInt( numArms );
 	savefile->WriteInt( enabledArms );
-	savefile->Write( handJoints, sizeof( handJoints ) );
-	savefile->Write( elbowJoints, sizeof( elbowJoints ) );
-	savefile->Write( shoulderJoints, sizeof( shoulderJoints ) );
-	savefile->Write( dirJoints, sizeof( dirJoints ) );
-
-	savefile->Write( shoulderForward, sizeof( shoulderForward ) );
-	savefile->Write( elbowForward, sizeof( elbowForward ) );
-
-	savefile->Write( upperArmLength, sizeof( upperArmLength ) );
-	savefile->Write( lowerArmLength, sizeof( lowerArmLength ) );
-
-	savefile->Write( upperArmToShoulderJoint, sizeof( upperArmToShoulderJoint ) );
-	savefile->Write( lowerArmToElbowJoint, sizeof( lowerArmToElbowJoint ) );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteJoint( handJoints[i] );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteJoint( elbowJoints[i] );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteJoint( shoulderJoints[i] );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteJoint( dirJoints[i] );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteVec3( shoulderForward[i] );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteVec3( elbowForward[i] );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteFloat( upperArmLength[i] );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteFloat( lowerArmLength[i] );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteMat3( upperArmToShoulderJoint[i] );
+	for ( i = 0; i < MAX_ARMS; i++ ) savefile->WriteMat3( lowerArmToElbowJoint[i] );
 }
 
 /*
@@ -859,23 +887,41 @@ idIK_Reach::Restore
 ================
 */
 void idIK_Reach::Restore( idRestoreGame *savefile ) {
+	int i;
+
 	idIK::Restore( savefile );
 
 	savefile->ReadInt( numArms );
+	if ( numArms < 0 || numArms > MAX_ARMS ) {
+		savefile->Error( "idIK_Reach::Restore: invalid arm count %d", numArms );
+	}
 	savefile->ReadInt( enabledArms );
-	savefile->Read( handJoints, sizeof( handJoints ) );
-	savefile->Read( elbowJoints, sizeof( elbowJoints ) );
-	savefile->Read( shoulderJoints, sizeof( shoulderJoints ) );
-	savefile->Read( dirJoints, sizeof( dirJoints ) );
-
-	savefile->Read( shoulderForward, sizeof( shoulderForward ) );
-	savefile->Read( elbowForward, sizeof( elbowForward ) );
-
-	savefile->Read( upperArmLength, sizeof( upperArmLength ) );
-	savefile->Read( lowerArmLength, sizeof( lowerArmLength ) );
-
-	savefile->Read( upperArmToShoulderJoint, sizeof( upperArmToShoulderJoint ) );
-	savefile->Read( lowerArmToElbowJoint, sizeof( lowerArmToElbowJoint ) );
+	if ( enabledArms < 0 || ( enabledArms & ~(( 1 << MAX_ARMS ) - 1) ) != 0 ) {
+		savefile->Error( "idIK_Reach::Restore: invalid enabled arm mask %d", enabledArms );
+	}
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadJoint( handJoints[i] );
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadJoint( elbowJoints[i] );
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadJoint( shoulderJoints[i] );
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadJoint( dirJoints[i] );
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadVec3( shoulderForward[i] );
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadVec3( elbowForward[i] );
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadFloat( upperArmLength[i] );
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadFloat( lowerArmLength[i] );
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadMat3( upperArmToShoulderJoint[i] );
+		for ( i = 0; i < MAX_ARMS; i++ ) savefile->ReadMat3( lowerArmToElbowJoint[i] );
+	} else {
+		savefile->Read( handJoints, sizeof( handJoints ) );
+		savefile->Read( elbowJoints, sizeof( elbowJoints ) );
+		savefile->Read( shoulderJoints, sizeof( shoulderJoints ) );
+		savefile->Read( dirJoints, sizeof( dirJoints ) );
+		savefile->Read( shoulderForward, sizeof( shoulderForward ) );
+		savefile->Read( elbowForward, sizeof( elbowForward ) );
+		savefile->Read( upperArmLength, sizeof( upperArmLength ) );
+		savefile->Read( lowerArmLength, sizeof( lowerArmLength ) );
+		savefile->Read( upperArmToShoulderJoint, sizeof( upperArmToShoulderJoint ) );
+		savefile->Read( lowerArmToElbowJoint, sizeof( lowerArmToElbowJoint ) );
+	}
 }
 
 /*

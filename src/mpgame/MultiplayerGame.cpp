@@ -7,6 +7,15 @@
 #pragma hdrstop
 
 #include "Game_local.h"
+#include "mp/match/MatchControlProjection.h"
+#include "mp/match/MatchDisclosurePolicy.h"
+#include "mp/match/MatchEvidenceFileSystem.h"
+#include "mp/match/MatchEvidenceView.h"
+#include "mp/match/MatchSeriesRecoveryFileSystem.h"
+#include "mp/match/MatchSeriesReportFileSystem.h"
+
+#include <limits.h>
+#include <time.h>
 
 idCVar g_spectatorChat( "g_spectatorChat", "0", CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "let spectators talk to everyone during game" );
 
@@ -21,6 +30,57 @@ static const float ARENA_CAMERA_MIN_USABLE_DISTANCE = 32.0f;
 static const float ARENA_CAMERA_FALLBACK_SWEEP_DEGREES = 12.0f;
 static const float ARENA_DOF_EFFECT_RANGE = 4.0f;
 static const float ARENA_DOF_DISTANCE_SCALE = 512.0f;
+
+// Item timing is intentionally a strict semantic allowlist.  Entity names,
+// map labels and inventory display strings are neither stable identifiers nor
+// safe presentation values, so the live adapter never forwards them.
+static mpMatchItemTimingKind_t CompetitiveItemTimingKind( const idItem *item ) {
+	if ( item == NULL ) {
+		return MP_MATCH_ITEM_TIMING_KIND_INVALID;
+	}
+	const char *className = item->spawnArgs.GetString( "classname" );
+	if ( idStr::Icmp( className, "powerup_quad_damage" ) == 0 ) {
+		return MP_MATCH_ITEM_TIMING_KIND_QUAD_DAMAGE;
+	}
+	if ( idStr::Icmp( className, "powerup_haste" ) == 0 ) {
+		return MP_MATCH_ITEM_TIMING_KIND_HASTE;
+	}
+	if ( idStr::Icmp( className, "powerup_regeneration" ) == 0 ) {
+		return MP_MATCH_ITEM_TIMING_KIND_REGENERATION;
+	}
+	if ( idStr::Icmp( className, "powerup_invisibility" ) == 0 ) {
+		return MP_MATCH_ITEM_TIMING_KIND_INVISIBILITY;
+	}
+	if ( idStr::Icmp( className, "item_health_mega" ) == 0 ) {
+		return MP_MATCH_ITEM_TIMING_KIND_MEGA_HEALTH;
+	}
+	if ( idStr::Icmp( className, "item_armor_large" ) == 0 ||
+		idStr::Icmp( className, "item_armor_large_mp" ) == 0 ) {
+		return MP_MATCH_ITEM_TIMING_KIND_LARGE_ARMOR;
+	}
+	if ( idStr::Icmp( className, "item_armor_small" ) == 0 ||
+		idStr::Icmp( className, "item_armor_small_mp" ) == 0 ) {
+		return MP_MATCH_ITEM_TIMING_KIND_SMALL_ARMOR;
+	}
+	return MP_MATCH_ITEM_TIMING_KIND_INVALID;
+}
+
+static float CompetitiveItemRespawnSeconds( const idItem *item ) {
+	if ( item == NULL || item->spawnArgs.GetBool( "dropped" ) ||
+		item->spawnArgs.GetBool( "no_respawn" ) ||
+		item->spawnArgs.GetBool( "inv_objective" ) ||
+		item->spawnArgs.GetInt( "givenToPlayer", "-1" ) != -1 ||
+		item->spawnArgs.FindKey( "weaponclass" ) != NULL ||
+		CompetitiveItemTimingKind( item ) == MP_MATCH_ITEM_TIMING_KIND_INVALID ) {
+		return 0.0f;
+	}
+	float respawn = item->spawnArgs.GetFloat( va( "respawn_%s",
+		gameLocal.serverInfo.GetString( "si_gameType" ) ), "-1.0" );
+	if ( respawn < 0.0f ) {
+		respawn = item->spawnArgs.GetFloat( "respawn", "5.0" );
+	}
+	return respawn > 0.0f ? respawn : 0.0f;
+}
 
 typedef enum {
 	ARENA_RESULT_LOSS = 0,
@@ -111,6 +171,188 @@ CompareTeamByScore
 int CompareTeamsByScore( const void* left, const void* right ) {
 	return ((const rvPair<int, int>*)right)->Second() -
 	 		((const rvPair<int, int>*)left)->Second();
+}
+
+/*
+================
+IsValidVotePlayerSlot
+
+Network vote messages carry client slots as bytes or strings.  A range check
+alone is not enough: disconnected slots below numClients retain addressable
+userinfo storage and must not become kick targets.
+================
+*/
+static bool IsValidVotePlayerSlot( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= gameLocal.numClients || clientNum >= MAX_CLIENTS ) {
+		return false;
+	}
+
+	idEntity *entity = gameLocal.entities[ clientNum ];
+	return entity != NULL && entity->IsType( idPlayer::GetClassType() );
+}
+
+/*
+================
+IsEligibleVotePlayerSlot
+
+Until the typed proposal service replaces the inherited vote transports, use
+one strict electorate predicate.  Only connected, active human players may
+create a vote or enter its frozen electorate; spectators and bots cannot skew
+the threshold.
+================
+*/
+static bool IsEligibleVotePlayerSlot( int clientNum ) {
+	if ( !IsValidVotePlayerSlot( clientNum ) || !gameLocal.mpGame.IsInGame( clientNum ) ) {
+		return false;
+	}
+
+	idPlayer *player = static_cast< idPlayer * >( gameLocal.entities[ clientNum ] );
+	return !player->spectating && !player->wantSpectate && !player->IsFakeClient();
+}
+
+/*
+================
+ParseBoundedVoteInteger
+
+Vote payloads are untrusted network input.  Accept only a non-empty unsigned
+decimal value which fits the caller-provided half-open range.
+================
+*/
+static bool ParseBoundedVoteInteger( const char *text, int maxExclusive, int &value ) {
+	value = -1;
+	if ( text == NULL || text[ 0 ] == '\0' || maxExclusive <= 0 ) {
+		return false;
+	}
+
+	const int maxValue = maxExclusive - 1;
+	int parsed = 0;
+	for ( const char *cursor = text; *cursor != '\0'; ++cursor ) {
+		if ( *cursor < '0' || *cursor > '9' ) {
+			return false;
+		}
+
+		const int digit = *cursor - '0';
+		if ( parsed > maxValue / 10 || ( parsed == maxValue / 10 && digit > maxValue % 10 ) ) {
+			return false;
+		}
+		parsed = parsed * 10 + digit;
+	}
+
+	value = parsed;
+	return true;
+}
+
+/*
+================
+ParseVoteIntegerRange
+
+Legacy vote values are text supplied by a remote client.  Keep their parser as
+strict as the packed transport: unsigned decimal only, no whitespace, signs,
+suffixes or overflow, and an inclusive caller-provided range.
+================
+*/
+static bool ParseVoteIntegerRange( const char *text, int minValue, int maxValue, int &value ) {
+	value = -1;
+	if ( text == NULL || text[ 0 ] == '\0' || minValue < 0 || maxValue < minValue ) {
+		return false;
+	}
+
+	int parsed = 0;
+	for ( const char *cursor = text; *cursor != '\0'; ++cursor ) {
+		if ( *cursor < '0' || *cursor > '9' ) {
+			return false;
+		}
+
+		const int digit = *cursor - '0';
+		if ( parsed > maxValue / 10 || ( parsed == maxValue / 10 && digit > maxValue % 10 ) ) {
+			return false;
+		}
+		parsed = parsed * 10 + digit;
+	}
+
+	if ( parsed < minValue ) {
+		return false;
+	}
+
+	value = parsed;
+	return true;
+}
+
+/*
+================
+HasBoundedMessageString
+
+idBitMsg::ReadString deliberately consumes and truncates oversized strings.
+That is useful for display text but not for typed vote fields, where accepting
+a truncated value would make validation differ from the bytes the client sent.
+================
+*/
+static bool HasBoundedMessageString( const idBitMsg &msg, int maxBytesIncludingTerminator ) {
+	if ( msg.GetReadBit() != 0 || maxBytesIncludingTerminator <= 0 ) {
+		return false;
+	}
+
+	const int remainingBytes = msg.GetRemainingData();
+	if ( remainingBytes <= 0 ) {
+		return false;
+	}
+
+	const int searchBytes = Min( remainingBytes, maxBytesIncludingTerminator );
+	return memchr( msg.GetReadData(), '\0', searchBytes ) != NULL;
+}
+
+/*
+================
+ParseVotePlayerSlot
+
+Legacy votes encode a kick target as text.  Accept only a canonical unsigned
+decimal slot and validate the live player before any userInfo access.
+================
+*/
+static bool ParseVotePlayerSlot( const char *text, int &clientNum ) {
+	if ( !ParseBoundedVoteInteger( text, MAX_CLIENTS, clientNum ) ) {
+		return false;
+	}
+	return IsValidVotePlayerSlot( clientNum );
+}
+
+/*
+================
+LegacyVoteFieldFlag
+
+The original one-field transport predates voteStruct_t.  Map each supported
+legacy vote to the same si_voteFlags policy bit used by the packed transport;
+zero deliberately rejects unknown values and VOTE_MULTIFIELD on this channel.
+================
+*/
+static int LegacyVoteFieldFlag( idMultiplayerGame::vote_flags_t voteIndex ) {
+	switch ( voteIndex ) {
+		case idMultiplayerGame::VOTE_RESTART:
+			return VOTEFLAG_RESTART;
+		case idMultiplayerGame::VOTE_BUYING:
+			return VOTEFLAG_BUYING;
+		case idMultiplayerGame::VOTE_AUTOBALANCE:
+			return VOTEFLAG_TEAMBALANCE;
+		case idMultiplayerGame::VOTE_KICK:
+			return VOTEFLAG_KICK;
+		case idMultiplayerGame::VOTE_MAP:
+		case idMultiplayerGame::VOTE_NEXTMAP:
+			return VOTEFLAG_MAP;
+		case idMultiplayerGame::VOTE_GAMETYPE:
+			return VOTEFLAG_GAMETYPE;
+		case idMultiplayerGame::VOTE_TIMELIMIT:
+			return VOTEFLAG_TIMELIMIT;
+		case idMultiplayerGame::VOTE_ROUNDLIMIT:
+			return VOTEFLAG_TOURNEYLIMIT;
+		case idMultiplayerGame::VOTE_CAPTURELIMIT:
+			return VOTEFLAG_CAPTURELIMIT;
+		case idMultiplayerGame::VOTE_FRAGLIMIT:
+			return VOTEFLAG_FRAGLIMIT;
+		case idMultiplayerGame::VOTE_CONTROLTIME:
+			return VOTEFLAG_CONTROLTIME;
+		default:
+			return 0;
+	}
 }
 
 /*
@@ -244,6 +486,61 @@ static const char *ResolveScoreboardMapName( const char *mapPath, idStr &mapName
 	}
 
 	return mapNameOut.c_str();
+}
+
+static bool ResolveMatchControlParticipantText( void *callbackContext,
+		mpMatchProtocolParticipantId_t participantId, char *destination,
+		int destinationBytes ) {
+	if ( callbackContext == NULL || destination == NULL ||
+		destinationBytes <= 0 || participantId == 0 ) {
+		return false;
+	}
+	destination[ 0 ] = '\0';
+	idMultiplayerGame *multiplayer =
+		static_cast<idMultiplayerGame *>( callbackContext );
+	const mpSessionView *view = multiplayer->GetClientMatchView();
+	if ( view == NULL ) {
+		return false;
+	}
+	for ( int index = 0;
+		index < view->publicState.participantSummaryCount; ++index ) {
+		const mpMatchViewParticipantSummary_t &participant =
+			view->publicState.participantSummaries[ index ];
+		if ( participant.participantId != participantId ||
+			!participant.connected ||
+			participant.slot >= MAX_CLIENTS ||
+			participant.slot >= gameLocal.numClients ) {
+			continue;
+		}
+		idEntity *entity = gameLocal.entities[ participant.slot ];
+		if ( entity == NULL || !entity->IsType( idPlayer::GetClassType() ) ) {
+			return false;
+		}
+		const char *name = gameLocal.userInfo[ participant.slot ].GetString(
+			"ui_name", "" );
+		if ( name == NULL || name[ 0 ] == '\0' ) {
+			return false;
+		}
+		idStr::Copynz( destination, name, destinationBytes );
+		return destination[ 0 ] != '\0';
+	}
+	return false;
+}
+
+static bool ResolveMatchControlMapText( void *callbackContext,
+		const char *mapToken, char *destination, int destinationBytes ) {
+	if ( callbackContext == NULL || mapToken == NULL || mapToken[ 0 ] == '\0' ||
+		destination == NULL || destinationBytes <= 0 ) {
+		return false;
+	}
+	destination[ 0 ] = '\0';
+	idStr mapName;
+	const char *resolved = ResolveScoreboardMapName( mapToken, mapName );
+	if ( resolved == NULL || resolved[ 0 ] == '\0' ) {
+		return false;
+	}
+	idStr::Copynz( destination, resolved, destinationBytes );
+	return destination[ 0 ] != '\0';
 }
 
 static const char* mpMenuModelTeamSuffix[ TEAM_MAX ] = {
@@ -423,51 +720,6 @@ static void ApplyMPMenuAppearancePreviewEffects( idUserInterface *gui, const int
 	gui->SetStateString( "player_rimlight_color", rimlight.ToString() );
 	gui->SetStateString( "player_brightskin_color", brightSkin.ToString() );
 	gui->SetStateFloat( "player_outline_width", idMath::ClampFloat( 0.5f, 6.0f, cvarSystem->GetCVarFloat( "cl_player_outline_width" ) ) );
-}
-
-enum {
-	MP_MENU_ASPECT_OTHER = 0,
-	MP_MENU_ASPECT_16_9 = 1,
-	MP_MENU_ASPECT_16_10 = 2
-};
-
-static int ClassifyMPMenuAspectGroup( int width, int height ) {
-	if ( width <= 0 || height <= 0 ) {
-		return MP_MENU_ASPECT_OTHER;
-	}
-
-	const float aspect = static_cast<float>( width ) / static_cast<float>( height );
-	if ( idMath::Fabs( aspect - ( 16.0f / 10.0f ) ) < 0.02f ) {
-		return MP_MENU_ASPECT_16_10;
-	}
-	if ( idMath::Fabs( aspect - ( 16.0f / 9.0f ) ) < 0.02f ) {
-		return MP_MENU_ASPECT_16_9;
-	}
-
-	return MP_MENU_ASPECT_OTHER;
-}
-
-static int GetMPMenuAspectGroupForMode( int mode ) {
-	if ( mode == -1 ) {
-		return ClassifyMPMenuAspectGroup(
-			cvarSystem->GetCVarInteger( "r_customWidth" ),
-			cvarSystem->GetCVarInteger( "r_customHeight" ) );
-	}
-
-	switch ( mode ) {
-	case 0:
-	case 1:
-	case 2:
-	case 3:
-	case 6:
-	case 8:
-	case 10:
-		return MP_MENU_ASPECT_16_9;
-	case 4:
-		return MP_MENU_ASPECT_16_10;
-	default:
-		return MP_MENU_ASPECT_OTHER;
-	}
 }
 
 static const idDeclEntityDef* FindMPMenuModelDef( void ) {
@@ -740,6 +992,79 @@ idMultiplayerGame::idMultiplayerGame
 ================
 */
 idMultiplayerGame::idMultiplayerGame() {
+	nextMatchSessionId = 0;
+	matchSeriesId = 0;
+	matchSeriesLinkedSessionId = 0;
+	matchSeriesNeedsBindingRecovery = false;
+	matchSeriesAwaitingMapSession = false;
+	matchSessionOperational = false;
+	nextMatchConnectionId = 0;
+	memset( matchConnectionId, 0, sizeof( matchConnectionId ) );
+	memset( matchSeriesCompetitionConnection, 0,
+		sizeof( matchSeriesCompetitionConnection ) );
+	for ( int slot = 0; slot < MAX_CLIENTS; ++slot ) {
+		matchSeriesCompetitionSide[ slot ] = MP_SERIES_SIDE_NONE;
+	}
+	for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+		matchSeriesContestantSlot[ side ] = -1;
+		matchSeriesContestantConnection[ side ] = 0;
+		matchSeriesGameSideForCompetition[ side ] = side;
+	}
+	matchEvidenceFinalized = false;
+	matchEvidencePersisted = false;
+	matchEvidenceFinalizationPending = false;
+	matchEvidenceMode = 0;
+	matchMVDStartedBySession = false;
+	matchMVDAttemptedBySession = false;
+	matchMVDOperatorOwnedBySession = false;
+	memset( matchMVDQPath, 0, sizeof( matchMVDQPath ) );
+	matchPhaseEffectsSessionId = 0;
+	matchPhaseEffectsRevision = 0;
+	matchRefereeCredentialInitialized = false;
+	matchRefereeCredentialIsReal = false;
+	memset( pendingRefereePassword, 0, sizeof( pendingRefereePassword ) );
+	pendingRefereePasswordLength = 0;
+	pendingRefereePasswordDeadline = 0;
+	pendingRefereeChallenge.Clear();
+	pendingRefereeChallengeValid = false;
+	clientMatchView.Clear();
+	clientMatchViewValid = false;
+	clientMatchControlModel.Clear();
+	clientMatchControlError.Clear();
+	clientMatchControlErrorValid = false;
+	clientMatchControlChoiceSessionId = 0;
+	clientMatchMenuProjectedViewRevision = 0;
+	clientMatchHudProjectedViewRevision = 0;
+	clientMatchScoreboardProjectedViewRevision = 0;
+	clientMatchOperationResult.Clear();
+	clientMatchOperationResultValid = false;
+	clientPendingMatchConfirmation.Clear();
+	clientPendingMatchConfirmationValid = false;
+	matchViewRevision = 0;
+	matchControlRevision = 0;
+	matchViewObservedSessionRevision = 0;
+	matchViewObservedRulesRevision = 0;
+	matchViewObservedRulesDigest = 0;
+	matchViewObservedProposalRevision = 0;
+	matchViewObservedSeriesRevision = 0;
+	matchViewObservedTeamsRevision = 0;
+	matchViewObservedEvidenceRevision = 0;
+	matchViewObservedItemTimingRevision = 0;
+	matchViewObservedEvidenceFinalized = false;
+	matchViewObservedEvidencePersisted = false;
+	matchViewObservedMVDRecording = false;
+	matchItemTimingNeedsInitialScan = false;
+	matchViewNextClockUpdateTime = 0;
+	nextClientMatchRequestId = 0;
+	nextTrustedLocalMatchRequestId = 0;
+	nextMatchProposalId = 0;
+	memset( matchViewSentRevision, 0, sizeof( matchViewSentRevision ) );
+	memset( lastMatchRequestId, 0, sizeof( lastMatchRequestId ) );
+	memset( lastMatchRequestResultValid, 0, sizeof( lastMatchRequestResultValid ) );
+	memset( matchOperationNextAllowedTime, 0, sizeof( matchOperationNextAllowedTime ) );
+	competitiveRulesValidForSession = false;
+	competitiveRulesInitialized = false;
+	competitiveRulesFailure = MP_RULE_VALID;
 // RITUAL BEGIN
 // squirrel: Mode-agnostic buymenus
 	buyMenu = NULL;
@@ -794,13 +1119,7531 @@ idMultiplayerGame::idMultiplayerGame() {
 	lastAnnouncerSound = AS_NUM_SOUNDS;
 }
 
+static int CompetitionSeriesTokenCompare( const char *lhs, const char *rhs ) {
+	return idStr::Icmp( lhs != NULL ? lhs : "", rhs != NULL ? rhs : "" );
+}
+
+static int CompetitionSeriesFindToken(
+		const char storage[ MP_SERIES_MAX_MAP_POOL ][ MP_SERIES_MAP_TOKEN_BYTES ],
+		int count, const char *token ) {
+	for ( int index = 0; index < count; ++index ) {
+		if ( CompetitionSeriesTokenCompare( storage[ index ], token ) == 0 ) {
+			return index;
+		}
+	}
+	return -1;
+}
+
+static bool CompetitionSeriesAppendToken(
+		char storage[ MP_SERIES_MAX_MAP_POOL ][ MP_SERIES_MAP_TOKEN_BYTES ],
+		int &count, const char *token ) {
+	if ( count < 0 || count >= MP_SERIES_MAX_MAP_POOL ||
+		!mpCompetitionSeries::IsSafeMapToken( token ) ||
+		CompetitionSeriesFindToken( storage, count, token ) >= 0 ) {
+		return false;
+	}
+	idStr::Copynz( storage[ count ], token, MP_SERIES_MAP_TOKEN_BYTES );
+	++count;
+	return true;
+}
+
+// Keeps the lexicographically first `capacity` supported maps regardless of
+// decl enumeration order, making an implicit pool deterministic across hosts.
+static void CompetitionSeriesInsertSortedToken(
+		char storage[ MP_SERIES_MAX_MAP_POOL ][ MP_SERIES_MAP_TOKEN_BYTES ],
+		int &count, int capacity, const char *token ) {
+	if ( capacity <= 0 || capacity > MP_SERIES_MAX_MAP_POOL ||
+		!mpCompetitionSeries::IsSafeMapToken( token ) ||
+		CompetitionSeriesFindToken( storage, count, token ) >= 0 ) {
+		return;
+	}
+	int insertion = 0;
+	while ( insertion < count &&
+		CompetitionSeriesTokenCompare( storage[ insertion ], token ) < 0 ) {
+		++insertion;
+	}
+	if ( count == capacity && insertion >= capacity ) {
+		return;
+	}
+	const int last = Min( count, capacity - 1 );
+	for ( int index = last; index > insertion; --index ) {
+		idStr::Copynz( storage[ index ], storage[ index - 1 ],
+			MP_SERIES_MAP_TOKEN_BYTES );
+	}
+	idStr::Copynz( storage[ insertion ], token, MP_SERIES_MAP_TOKEN_BYTES );
+	if ( count < capacity ) {
+		++count;
+	}
+}
+
+static bool ParseCompetitionSeriesId( const char *text, uint64_t &value ) {
+	value = 0;
+	if ( text == NULL || text[ 0 ] == '\0' ) {
+		return false;
+	}
+	int digits = 0;
+	for ( const char *cursor = text; *cursor != '\0'; ++cursor ) {
+		unsigned int nibble = 0;
+		if ( *cursor >= '0' && *cursor <= '9' ) {
+			nibble = static_cast<unsigned int>( *cursor - '0' );
+		} else if ( *cursor >= 'a' && *cursor <= 'f' ) {
+			nibble = static_cast<unsigned int>( *cursor - 'a' + 10 );
+		} else if ( *cursor >= 'A' && *cursor <= 'F' ) {
+			nibble = static_cast<unsigned int>( *cursor - 'A' + 10 );
+		} else {
+			value = 0;
+			return false;
+		}
+		if ( ++digits > 16 || value > ( UINT64_MAX - nibble ) / 16 ) {
+			value = 0;
+			return false;
+		}
+		value = value * 16 + nibble;
+	}
+	return value != 0;
+}
+
+static void ShiftCompetitiveDeadline( int &deadline, int deltaMsec ) {
+	if ( deadline <= 0 || deltaMsec <= 0 ) {
+		return;
+	}
+	const int maxInt = 0x7fffffff;
+	deadline = deadline > maxInt - deltaMsec ? maxInt : deadline + deltaMsec;
+}
+
+static void ShiftCompetitiveDeadline( float &deadline, int deltaMsec ) {
+	if ( deadline > 0.0f && deltaMsec > 0 ) {
+		deadline += static_cast<float>( deltaMsec );
+	}
+}
+
+static unsigned long long MatchViewTimeValue( int64_t value ) {
+	return value > 0 ? static_cast<unsigned long long>( value ) : 0ull;
+}
+
+static mpMatchViewPauseState_t MatchViewPauseState( mpMatchPauseState_t state ) {
+	switch ( state ) {
+		case MP_MATCH_PAUSE_PENDING: return MP_MATCH_VIEW_PAUSE_PENDING;
+		case MP_MATCH_PAUSED: return MP_MATCH_VIEW_PAUSED;
+		case MP_MATCH_RESUME_COUNTDOWN: return MP_MATCH_VIEW_RESUME_COUNTDOWN;
+		default: return MP_MATCH_VIEW_PAUSE_RUNNING;
+	}
+}
+
+static mpMatchViewPauseKind_t MatchViewPauseKind( mpMatchPauseKind_t kind ) {
+	switch ( kind ) {
+		case MP_MATCH_PAUSE_KIND_TEAM_TIMEOUT: return MP_MATCH_VIEW_PAUSE_KIND_TEAM_TIMEOUT;
+		case MP_MATCH_PAUSE_KIND_TECHNICAL: return MP_MATCH_VIEW_PAUSE_KIND_TECHNICAL;
+		default: return MP_MATCH_VIEW_PAUSE_KIND_NONE;
+	}
+}
+
+static mpMatchViewPauseReason_t MatchViewPauseReason( mpMatchPauseReason_t reason ) {
+	switch ( reason ) {
+		case MP_MATCH_PAUSE_REASON_TACTICAL: return MP_MATCH_VIEW_PAUSE_REASON_TACTICAL;
+		case MP_MATCH_PAUSE_REASON_PLAYER_DISCONNECT: return MP_MATCH_VIEW_PAUSE_REASON_PLAYER_DISCONNECT;
+		case MP_MATCH_PAUSE_REASON_TECHNICAL_FAULT: return MP_MATCH_VIEW_PAUSE_REASON_TECHNICAL_FAULT;
+		case MP_MATCH_PAUSE_REASON_SERVER_FAULT: return MP_MATCH_VIEW_PAUSE_REASON_SERVER_FAULT;
+		case MP_MATCH_PAUSE_REASON_REFEREE: return MP_MATCH_VIEW_PAUSE_REASON_REFEREE;
+		default: return MP_MATCH_VIEW_PAUSE_REASON_NONE;
+	}
+}
+
+static mpMatchViewResumePolicy_t MatchViewResumePolicy(
+		mpMatchResumePolicy_t policy ) {
+	switch ( policy ) {
+		case MP_MATCH_RESUME_BOTH_TEAMS_OR_AUTHORITY:
+			return MP_MATCH_VIEW_RESUME_BOTH_SIDES_OR_REFEREE;
+		case MP_MATCH_RESUME_AUTHORITY_ONLY:
+			return MP_MATCH_VIEW_RESUME_REFEREE_ONLY;
+		default:
+			return MP_MATCH_VIEW_RESUME_OWNER_OR_REFEREE;
+	}
+}
+
+static mpMatchViewBallot_t MatchViewProposalBallot( mpProposalBallot_t ballot ) {
+	switch ( ballot ) {
+		case MP_PROPOSAL_BALLOT_YES: return MP_MATCH_VIEW_BALLOT_YES;
+		case MP_PROPOSAL_BALLOT_NO: return MP_MATCH_VIEW_BALLOT_NO;
+		case MP_PROPOSAL_BALLOT_ABSTAIN: return MP_MATCH_VIEW_BALLOT_ABSTAIN;
+		default: return MP_MATCH_VIEW_BALLOT_NONE;
+	}
+}
+
+static void PopulateMatchViewProposal( const mpProposalRecord_t &proposal,
+		mpProposalScope_t scope, uint32_t recipientSequence,
+		mpMatchViewProposalSummary_t &summary ) {
+	summary.Clear();
+	summary.present = true;
+	summary.proposalId = proposal.proposalId;
+	summary.opcode = proposal.operation.opcode;
+	summary.scope = scope == MP_PROPOSAL_SCOPE_GLOBAL ?
+		MP_MATCH_VIEW_PROPOSAL_GLOBAL : MP_MATCH_VIEW_PROPOSAL_SIDE;
+	summary.side = scope == MP_PROPOSAL_SCOPE_TEAM_A ? 0 :
+		( scope == MP_PROPOSAL_SCOPE_TEAM_B ? 1 : MP_MATCH_VIEW_SIDE_NONE );
+	summary.callerParticipantId = proposal.caller;
+	summary.yesCount = proposal.yesCount;
+	summary.noCount = proposal.noCount;
+	summary.abstainCount = proposal.abstainCount;
+	summary.castCount = proposal.castCount;
+	summary.eligibleCount = proposal.electorateCount;
+	summary.requiredQuorumCount = proposal.requiredQuorum;
+	summary.requiredYesCount = proposal.requiredYes;
+	summary.expiresAtEngineMsec = MatchViewTimeValue(
+		proposal.expiresAt.Milliseconds() );
+	for ( int index = 0; index < proposal.electorateCount; ++index ) {
+		if ( proposal.electorate[ index ].participant != recipientSequence ) {
+			continue;
+		}
+		summary.recipientEligible = true;
+		summary.recipientBallot = MatchViewProposalBallot(
+			proposal.electorate[ index ].ballot );
+		break;
+	}
+}
+
+static mpMatchViewPublicRole_t MatchViewPublicRole( mpMatchRole_t role ) {
+	switch ( role ) {
+		case MP_MATCH_ROLE_PLAYER: return MP_MATCH_VIEW_ROLE_PLAYER;
+		case MP_MATCH_ROLE_CAPTAIN: return MP_MATCH_VIEW_ROLE_CAPTAIN;
+		case MP_MATCH_ROLE_COACH: return MP_MATCH_VIEW_ROLE_COACH;
+		case MP_MATCH_ROLE_BROADCASTER: return MP_MATCH_VIEW_ROLE_BROADCASTER;
+		case MP_MATCH_ROLE_REFEREE: return MP_MATCH_VIEW_ROLE_REFEREE;
+		default: return MP_MATCH_VIEW_ROLE_NONE;
+	}
+}
+
+static mpMatchViewPublicRoleMask_t MatchViewPublicRoleMask(
+		mpMatchRoleMask_t roles ) {
+	mpMatchViewPublicRoleMask_t result = 0;
+	for ( int role = MP_MATCH_ROLE_PLAYER; role <= MP_MATCH_ROLE_REFEREE; ++role ) {
+		if ( ( roles & MPMatchRoleBit( static_cast<mpMatchRole_t>( role ) ) ) == 0 ) {
+			continue;
+		}
+		const mpMatchViewPublicRole_t publicRole = MatchViewPublicRole(
+			static_cast<mpMatchRole_t>( role ) );
+		if ( publicRole != MP_MATCH_VIEW_ROLE_NONE ) {
+			result |= MPMatchViewRoleBit( publicRole );
+		}
+	}
+	return result;
+}
+
+static mpMatchViewRosterRole_t MatchViewRosterRole(
+		mpMatchRosterRole_t role ) {
+	switch ( role ) {
+		case MP_MATCH_ROSTER_CAPTAIN: return MP_MATCH_VIEW_ROSTER_CAPTAIN;
+		case MP_MATCH_ROSTER_COACH: return MP_MATCH_VIEW_ROSTER_COACH;
+		case MP_MATCH_ROSTER_SUBSTITUTE: return MP_MATCH_VIEW_ROSTER_SUBSTITUTE;
+		default: return MP_MATCH_VIEW_ROSTER_PLAYER;
+	}
+}
+
+static mpMatchViewRuleType_t MatchViewRuleType( mpRuleFieldType_t type ) {
+	switch ( type ) {
+		case MP_RULE_TYPE_BOOL: return MP_MATCH_VIEW_RULE_BOOL;
+		case MP_RULE_TYPE_ENUM: return MP_MATCH_VIEW_RULE_ENUM;
+		default: return MP_MATCH_VIEW_RULE_INTEGER;
+	}
+}
+
+static mpMatchViewVetoAction_t MatchViewVetoAction(
+		mpSeriesVetoAction_t action ) {
+	switch ( action ) {
+		case MP_SERIES_VETO_PICK: return MP_MATCH_VIEW_VETO_PICK;
+		case MP_SERIES_VETO_SIDE: return MP_MATCH_VIEW_VETO_SIDE;
+		case MP_SERIES_VETO_DECIDER: return MP_MATCH_VIEW_VETO_DECIDER;
+		default: return MP_MATCH_VIEW_VETO_BAN;
+	}
+}
+
+static mpMatchViewMapDisposition_t MatchViewMapDisposition(
+		mpSeriesMapDisposition_t disposition ) {
+	switch ( disposition ) {
+		case MP_SERIES_MAP_BANNED: return MP_MATCH_VIEW_MAP_BANNED;
+		case MP_SERIES_MAP_SELECTED: return MP_MATCH_VIEW_MAP_SELECTED;
+		default: return MP_MATCH_VIEW_MAP_AVAILABLE;
+	}
+}
+
+static mpMatchViewMapOutcome_t MatchViewMapOutcome(
+		mpSeriesMapOutcome_t outcome ) {
+	switch ( outcome ) {
+		case MP_SERIES_MAP_DECIDED: return MP_MATCH_VIEW_MAP_DECIDED;
+		case MP_SERIES_MAP_FORFEIT: return MP_MATCH_VIEW_MAP_FORFEIT;
+		case MP_SERIES_MAP_ABORTED: return MP_MATCH_VIEW_MAP_ABORTED;
+		default: return MP_MATCH_VIEW_MAP_UNPLAYED;
+	}
+}
+
+static mpMatchViewSeriesState_t MatchViewSeriesState(
+		mpSeriesState_t state ) {
+	switch ( state ) {
+		case MP_SERIES_SETUP: return MP_MATCH_VIEW_SERIES_SETUP;
+		case MP_SERIES_VETO: return MP_MATCH_VIEW_SERIES_VETO;
+		case MP_SERIES_READY: return MP_MATCH_VIEW_SERIES_READY;
+		case MP_SERIES_MAP_ACTIVE: return MP_MATCH_VIEW_SERIES_MAP_ACTIVE;
+		case MP_SERIES_MAP_COMPLETE: return MP_MATCH_VIEW_SERIES_MAP_COMPLETE;
+		case MP_SERIES_COMPLETE: return MP_MATCH_VIEW_SERIES_COMPLETE;
+		case MP_SERIES_CANCELLED: return MP_MATCH_VIEW_SERIES_CANCELLED;
+		default: return MP_MATCH_VIEW_SERIES_DISABLED;
+	}
+}
+
+static void AddMatchViewRoleSummary( mpMatchViewPublicState_t &state,
+		mpMatchViewPublicRole_t role, int side ) {
+	if ( role == MP_MATCH_VIEW_ROLE_NONE ) {
+		return;
+	}
+	for ( int index = 0; index < state.roleSummaryCount; ++index ) {
+		mpMatchViewRoleSummary_t &summary = state.roleSummaries[ index ];
+		if ( summary.role == role && summary.side == side ) {
+			if ( summary.count < MP_MATCH_VIEW_MAX_PARTICIPANTS ) {
+				++summary.count;
+			}
+			return;
+		}
+	}
+	if ( state.roleSummaryCount >= MP_MATCH_VIEW_MAX_ROLE_SUMMARIES ) {
+		return;
+	}
+	mpMatchViewRoleSummary_t &summary = state.roleSummaries[ state.roleSummaryCount++ ];
+	summary.role = role;
+	summary.side = side;
+	summary.count = 1;
+}
+
+static const mpMatchOperationArgument_t *MatchOperationArgument(
+		const mpMatchOperationRequest_t &request, unsigned char fieldId ) {
+	for ( int index = 0; index < request.argumentCount; ++index ) {
+		if ( request.arguments[ index ].fieldId == fieldId ) {
+			return &request.arguments[ index ];
+		}
+	}
+	return NULL;
+}
+
+/*
+================
+ResolveCompetitionMapPath
+
+Map-pool entries may use either a mapDef name or its path.  Resolve both to the
+same extension-free path used by the actually loaded map before establishing a
+series/session identity.
+================
+*/
+static bool ResolveCompetitionMapPath( const char *mapToken,
+		idStr &resolvedPath ) {
+	resolvedPath.Clear();
+	if ( mapToken == NULL || mapToken[ 0 ] == '\0' ) {
+		return false;
+	}
+	const idDict *mapDecl = MultiplayerResolveMapDecl( mapToken );
+	const char *declaredPath = mapDecl != NULL ? mapDecl->GetString( "path" ) : "";
+	NormalizeMapDeclPath( declaredPath != NULL && declaredPath[ 0 ] != '\0' ?
+		declaredPath : mapToken, resolvedPath );
+	return resolvedPath.Length() > 0;
+}
+
+/*
+================
+CompetitionSeriesMapMatchesRuntime
+
+The loaded map file is immutable for the lifetime of a map session; si_map is
+not.  Use the former as the authority whenever a selected series map is bound
+or committed.
+================
+*/
+static bool CompetitionSeriesMapMatchesRuntime(
+		const mpCompetitionSeries &series, int runtimeGameType,
+		const char *loadedMap, idStr *selectedTokenOut = NULL ) {
+	if ( selectedTokenOut != NULL ) {
+		selectedTokenOut->Clear();
+	}
+	const mpSeriesState_t state = series.GetState();
+	if ( state != MP_SERIES_MAP_ACTIVE && state != MP_SERIES_MAP_COMPLETE ) {
+		return false;
+	}
+	const mpSeriesConfiguration &configuration = series.GetConfiguration();
+	if ( configuration.gameType != runtimeGameType ) {
+		return false;
+	}
+	const mpSeriesSelectedMap *selection = series.GetSelectedMap(
+		series.GetCurrentSelectionIndex() );
+	if ( selection == NULL || selection->poolIndex < 0 ||
+		selection->poolIndex >= configuration.mapPoolCount ) {
+		return false;
+	}
+	const char *selectedToken = configuration.mapPool[ selection->poolIndex ];
+	if ( selectedTokenOut != NULL ) {
+		*selectedTokenOut = selectedToken;
+	}
+	const idDict *mapDecl = MultiplayerResolveMapDecl( selectedToken );
+	if ( mapDecl == NULL || !MPMapSupportsGameType( mapDecl, runtimeGameType ) ) {
+		return false;
+	}
+	idStr selectedPath;
+	idStr runtimePath;
+	if ( !ResolveCompetitionMapPath( selectedToken, selectedPath ) ) {
+		return false;
+	}
+	NormalizeMapDeclPath( loadedMap, runtimePath );
+	return runtimePath.Length() > 0 &&
+		idStr::Icmp( selectedPath.c_str(), runtimePath.c_str() ) == 0;
+}
+
+static const int MP_REFEREE_AUTH_REQUEST_BYTES = 9;
+static const char MP_REFEREE_AUTH_REQUEST_TOKEN[] = "challenge";
+static const int MP_REFEREE_AUTH_PROOF_CREDENTIAL_BYTES = 84;
+
+static unsigned char MatchAuthHexValue( char value, bool &valid ) {
+	if ( value >= '0' && value <= '9' ) {
+		return static_cast<unsigned char>( value - '0' );
+	}
+	if ( value >= 'a' && value <= 'f' ) {
+		return static_cast<unsigned char>( value - 'a' + 10 );
+	}
+	if ( value >= 'A' && value <= 'F' ) {
+		return static_cast<unsigned char>( value - 'A' + 10 );
+	}
+	valid = false;
+	return 0;
+}
+
+static bool MatchAuthIsChallengeRequest( const mpMatchOperationArgument_t *credential ) {
+	return credential != NULL && credential->value.type == MP_MATCH_VALUE_STRING &&
+		credential->value.stringLength == MP_REFEREE_AUTH_REQUEST_BYTES &&
+		memcmp( credential->value.stringValue, MP_REFEREE_AUTH_REQUEST_TOKEN,
+			MP_REFEREE_AUTH_REQUEST_BYTES ) == 0;
+}
+
+static bool ParseMatchAuthProofCredential(
+		const mpMatchOperationArgument_t *credential,
+		uint64_t &challengeGeneration, mpRefereeAuthProof &proof ) {
+	challengeGeneration = 0;
+	MPRefereeAuthSecureZero( proof.bytes, sizeof( proof.bytes ) );
+	if ( credential == NULL || credential->value.type != MP_MATCH_VALUE_STRING ||
+		credential->value.stringLength != MP_REFEREE_AUTH_PROOF_CREDENTIAL_BYTES ) {
+		return false;
+	}
+	const char *text = credential->value.stringValue;
+	if ( text[ 0 ] != 'v' || text[ 1 ] != '1' || text[ 2 ] != ':' ||
+		text[ 19 ] != ':' || text[ MP_REFEREE_AUTH_PROOF_CREDENTIAL_BYTES ] != '\0' ) {
+		return false;
+	}
+	bool valid = true;
+	for ( int index = 3; index < 19; ++index ) {
+		challengeGeneration = ( challengeGeneration << 4 ) |
+			MatchAuthHexValue( text[ index ], valid );
+	}
+	if ( !valid || challengeGeneration == 0 ||
+		!MPRefereeAuthProofFromHex( text + 20, MP_REFEREE_AUTH_PROOF_HEX_BYTES,
+			proof ) ) {
+		challengeGeneration = 0;
+		MPRefereeAuthSecureZero( proof.bytes, sizeof( proof.bytes ) );
+		return false;
+	}
+	return true;
+}
+
+static bool BuildMatchAuthProofCredential( uint64_t challengeGeneration,
+		const mpRefereeAuthProof &proof,
+		char output[ MP_MATCH_PROTOCOL_MAX_STRING_BYTES + 1 ] ) {
+	if ( challengeGeneration == 0 ) {
+		return false;
+	}
+	static const char digits[] = "0123456789abcdef";
+	memset( output, 0, MP_MATCH_PROTOCOL_MAX_STRING_BYTES + 1 );
+	output[ 0 ] = 'v';
+	output[ 1 ] = '1';
+	output[ 2 ] = ':';
+	for ( int index = 0; index < 16; ++index ) {
+		const int shift = ( 15 - index ) * 4;
+		output[ 3 + index ] = digits[ ( challengeGeneration >> shift ) & 15u ];
+	}
+	output[ 19 ] = ':';
+	return MPRefereeAuthProofToHex( proof, output + 20,
+		MP_REFEREE_AUTH_PROOF_HEX_BYTES + 1 );
+}
+
+static void ClearMatchOperationSensitiveArguments( mpMatchOperationRequest_t &request ) {
+	if ( request.opcode != MP_MATCH_OP_REF_AUTHENTICATE ) {
+		return;
+	}
+	for ( int index = 0; index < request.argumentCount; ++index ) {
+		mpMatchOperationArgument_t &argument = request.arguments[ index ];
+		if ( argument.fieldId == MP_MATCH_ARG_CREDENTIAL ) {
+			MPRefereeAuthSecureZero( argument.value.stringValue,
+				sizeof( argument.value.stringValue ) );
+			argument.value.stringLength = 0;
+		}
+	}
+}
+
+static bool ApplyMatchRuleOperationValue( mpMatchRulesDraft &draft,
+		const mpRuleFieldDescriptor_t &field,
+		const mpMatchOperationValue_t &value,
+		mpRuleValidationFailure_t &failure ) {
+	switch ( field.type ) {
+		case MP_RULE_TYPE_BOOL:
+			if ( value.type == MP_MATCH_VALUE_BOOL ) {
+				return draft.SetBool( field.id, value.unsignedValue != 0, failure );
+			}
+			break;
+		case MP_RULE_TYPE_INTEGER:
+			if ( value.type == MP_MATCH_VALUE_INT32 ) {
+				return draft.SetInteger( field.id, value.signedValue, failure );
+			}
+			if ( value.type == MP_MATCH_VALUE_UINT32 &&
+				value.unsignedValue <= 0x7fffffffu ) {
+				return draft.SetInteger( field.id,
+					static_cast<int>( value.unsignedValue ), failure );
+			}
+			break;
+		case MP_RULE_TYPE_ENUM:
+			if ( value.type == MP_MATCH_VALUE_ENUM ) {
+				return draft.SetEnum( field.id, value.enumValue, failure );
+			}
+			break;
+		default:
+			break;
+	}
+	return value.type == MP_MATCH_VALUE_STRING &&
+		draft.SetParsedValue( field.id, value.stringValue, failure );
+}
+
+static mpMatchProtocolReason_t MatchOperationProtocolReason(
+		const mpOperationExecutionResult_t &execution ) {
+	if ( execution.protocolReason != MP_MATCH_PROTOCOL_REASON_NONE ) {
+		return execution.protocolReason;
+	}
+	switch ( execution.reason ) {
+		case MP_OPERATION_REASON_SESSION_MISMATCH:
+			return MP_MATCH_PROTOCOL_REASON_INVALID_SESSION_ID;
+		case MP_OPERATION_REASON_TRANSPORT_MISMATCH:
+			return MP_MATCH_PROTOCOL_REASON_INVALID_ACTOR_SLOT;
+		case MP_OPERATION_REASON_BINDING_STALE:
+			return MP_MATCH_PROTOCOL_REASON_INVALID_BINDING_GENERATION;
+		case MP_OPERATION_REASON_PARTICIPANT_UNKNOWN:
+		case MP_OPERATION_REASON_PARTICIPANT_INACTIVE:
+			return MP_MATCH_PROTOCOL_REASON_INVALID_PARTICIPANT;
+		case MP_OPERATION_REASON_TARGET_UNKNOWN:
+		case MP_OPERATION_REASON_TARGET_ALIGNMENT:
+			return MP_MATCH_PROTOCOL_REASON_INVALID_TARGET;
+		case MP_OPERATION_REASON_NOT_AUTHORIZED:
+			return MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED;
+		case MP_OPERATION_REASON_WRONG_PHASE:
+			return MP_MATCH_PROTOCOL_REASON_ILLEGAL_PHASE;
+		case MP_OPERATION_REASON_STALE_SESSION_REVISION:
+		case MP_OPERATION_REASON_STALE_RULES_REVISION:
+		case MP_OPERATION_REASON_STALE_PROPOSAL_REVISION:
+		case MP_OPERATION_REASON_STALE_SERIES_REVISION:
+			return MP_MATCH_PROTOCOL_REASON_STALE_REVISION;
+		case MP_OPERATION_REASON_RULE_VALUE_TYPE:
+			return MP_MATCH_PROTOCOL_REASON_ARGUMENT_TYPE;
+		case MP_OPERATION_REASON_PROPOSAL_UNKNOWN:
+		case MP_OPERATION_REASON_PROPOSAL_NOT_PASSED:
+		case MP_OPERATION_REASON_RULE_STATE:
+		case MP_OPERATION_REASON_SERIES_STATE:
+		case MP_OPERATION_REASON_CORE_REJECTED:
+			return MP_MATCH_PROTOCOL_REASON_CONFLICT;
+		case MP_OPERATION_REASON_UNREPRESENTABLE:
+		case MP_OPERATION_REASON_INVARIANT:
+			return MP_MATCH_PROTOCOL_REASON_INTERNAL;
+		default:
+			return MP_MATCH_PROTOCOL_REASON_INTERNAL;
+	}
+}
+
+/*
+================
+idMultiplayerGame::BeginCompetitiveFrame
+
+This is intentionally called before bots, gameplay network events, entity
+thinking and posted events.  It is the sole frame-boundary owner for the
+session clocks and pause-overlay commits.
+================
+*/
+void idMultiplayerGame::BeginCompetitiveFrame( void ) {
+	if ( !gameLocal.isServer || !gameLocal.isMultiplayer || gameState == NULL ||
+		!matchSessionOperational ) {
+		return;
+	}
+	if ( gameLocal.isListenServer && pendingRefereeChallengeValid ) {
+		mpRefereeAuthChallenge challenge = pendingRefereeChallenge;
+		pendingRefereeChallenge.Clear();
+		pendingRefereeChallengeValid = false;
+		CompleteRefereeAuthChallenge( challenge );
+		challenge.Clear();
+	}
+
+	// A recovery record intentionally contains no transient client slots.  Team
+	// authority can be recovered from the persisted competition-to-game-side
+	// permutation because it belongs to the side, not a person.  Duel authority
+	// must never be guessed from slot order, display name, address or GUID; it
+	// remains unbound until a trusted operator explicitly binds each current
+	// connection.
+	if ( matchSeriesNeedsBindingRecovery && gameLocal.IsTeamGame() ) {
+		const bool validMapping =
+			matchSeriesGameSideForCompetition[ 0 ] >= 0 &&
+			matchSeriesGameSideForCompetition[ 0 ] < MP_SERIES_SIDE_COUNT &&
+			matchSeriesGameSideForCompetition[ 1 ] >= 0 &&
+			matchSeriesGameSideForCompetition[ 1 ] < MP_SERIES_SIDE_COUNT &&
+			matchSeriesGameSideForCompetition[ 0 ] !=
+				matchSeriesGameSideForCompetition[ 1 ];
+		if ( validMapping ) {
+			for ( int slot = 0; slot < MAX_CLIENTS; ++slot ) {
+				matchSeriesCompetitionSide[ slot ] = MP_SERIES_SIDE_NONE;
+				matchSeriesCompetitionConnection[ slot ] = 0;
+			}
+			for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+				matchSeriesContestantSlot[ side ] = -1;
+				matchSeriesContestantConnection[ side ] = 0;
+			}
+			matchSeriesNeedsBindingRecovery = false;
+			PersistCompetitionSeries();
+		}
+	}
+
+	const mpMatchMutationResult frameAdvance = matchSession.AdvanceFrame(
+		mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ) );
+	if ( frameAdvance.WasRejected() ) {
+		gameLocal.Warning( "competitive match clock rejected frame %d (reason %d)",
+			gameLocal.time, frameAdvance.reason );
+		return;
+	}
+	InitializeMatchItemTimingObservations();
+
+	if ( IsGameplayFrozen() ) {
+		RebaseCompetitivePauseFrame( Max( 0, gameLocal.msec ) );
+	}
+	if ( matchProposals.GetSessionId() == matchSession.GetSessionId() ) {
+		const mpProposalEngineTime now = mpProposalEngineTime::FromMilliseconds(
+			Max( 0, gameLocal.time ) );
+		matchProposals.Expire( matchSession.GetSessionId(), now,
+			matchProposals.GetRevision() );
+		matchProposals.InvalidateForPhase( matchSession.GetSessionId(),
+			matchSession.GetPhase(), now, matchProposals.GetRevision() );
+		ProcessPassedMatchProposals();
+		matchProposals.InvalidateForPhase( matchSession.GetSessionId(),
+			matchSession.GetPhase(), now, matchProposals.GetRevision() );
+	}
+	if ( matchTeams.GetSessionId() == matchSession.GetSessionId() ) {
+		const mpMatchTeamsMutationResult_t expired =
+			matchTeams.ExpireRosterInvitations( matchSession.GetSessionId(),
+				mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+				matchTeams.GetRevision() );
+		if ( expired.WasRejected() ) {
+			gameLocal.Warning( "competitive roster invitation expiry rejected "
+				"(reason %d)", expired.reason );
+		}
+	}
+	ProcessMatchTeamQueue();
+	ObserveMatchEvidence( mpParticipantId::Invalid() );
+	if ( matchSession.GetPhase() == COUNTDOWN ) {
+		StartMatchMVDIfRequired();
+	} else if ( matchSession.GetPhase() == GAMEREVIEW && !matchEvidenceFinalized ) {
+		const mpMatchTransitionView &transition = matchSession.GetLastTransition();
+		RecordMatchEvidenceResult( transition.reason, transition.authorizer );
+		FinalizeMatchEvidence( false );
+	}
+	const mpSeriesState_t seriesState = matchSeries.GetState();
+	if ( matchSeriesId != 0 && matchSeriesReport.IsInitialized() &&
+		!matchSeriesReport.IsFinalized() &&
+		seriesState != MP_SERIES_DISABLED &&
+		seriesState != MP_SERIES_COMPLETE &&
+		seriesState != MP_SERIES_CANCELLED ) {
+		mpCompetitionSeriesReport reportCandidate = matchSeriesReport;
+		if ( ReconcileCompetitionSeriesMVDResults( reportCandidate, false ) ) {
+			const uint64_t linkedSession = matchSeriesLinkedSessionId != 0 ?
+				matchSeriesLinkedSessionId : matchSession.GetSessionId();
+			if ( PersistCompetitionSeriesCandidate( matchSeries, reportCandidate,
+					matchSeriesId, linkedSession ) ) {
+				matchSeriesReport = reportCandidate;
+			} else {
+				gameLocal.Warning( "competition MVD reconciliation remains pending "
+					"because its checkpoint could not commit" );
+			}
+		}
+	}
+	AdvanceMatchViewRevision();
+}
+
+bool idMultiplayerGame::IsGameplayFrozen( void ) const {
+	if ( !gameLocal.isMultiplayer ) {
+		return false;
+	}
+	if ( gameLocal.isClient ) {
+		return clientMatchViewValid &&
+			clientMatchView.publicState.lifecycle.pauseState !=
+				MP_MATCH_VIEW_PAUSE_RUNNING;
+	}
+	return matchSession.GetPause().state != MP_MATCH_PAUSE_RUNNING;
+}
+
+void idMultiplayerGame::RebaseCompetitivePauseFrame( int deltaMsec ) {
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+
+	// These are match-domain deadlines owned by the multiplayer adapter.  Vote,
+	// proposal, authentication and ping clocks deliberately remain in engine or
+	// host time and are therefore not shifted here.
+	ShiftCompetitiveDeadline( matchStartedTime, deltaMsec );
+	ShiftCompetitiveDeadline( arenaResultReportTime, deltaMsec );
+	ShiftCompetitiveDeadline( announcerPlayTime, deltaMsec );
+	for ( announcerSoundNode_t *sound = announcerSoundQueue.Next(); sound != NULL;
+			sound = sound->announcerSoundNode.Next() ) {
+		ShiftCompetitiveDeadline( sound->time, deltaMsec );
+	}
+	for ( int side = 0; side < TEAM_MAX; ++side ) {
+		for ( int index = 0; index < MAX_TEAM_POWERUPS; ++index ) {
+			ShiftCompetitiveDeadline( teamPowerups[ side ][ index ].endTime, deltaMsec );
+		}
+	}
+	gameState->ShiftMatchTime( deltaMsec );
+}
+
+/*
+================
+idMultiplayerGame::BuildMatchItemTimingIdentity
+
+The map entity number is stable for the life of this map instance and is never
+reused as presentation text.  When a map contains more than one item of the
+same semantic kind, a deterministic map-order ordinal makes the wire token
+unique without trusting a map-authored name or location string.
+================
+*/
+bool idMultiplayerGame::BuildMatchItemTimingIdentity( const idItem *item,
+		mpMatchItemTimingKind_t &kind, char *adapterToken,
+		int adapterTokenBytes ) const {
+	kind = MP_MATCH_ITEM_TIMING_KIND_INVALID;
+	if ( adapterToken == NULL || adapterTokenBytes <= 0 ) {
+		return false;
+	}
+	adapterToken[ 0 ] = '\0';
+	if ( item == NULL || item->entityNumber < 0 ||
+		item->entityNumber >= MAX_GENTITIES ||
+		gameLocal.entities[ item->entityNumber ] != item ||
+		CompetitiveItemRespawnSeconds( item ) <= 0.0f ) {
+		return false;
+	}
+
+	const mpMatchItemTimingKind_t semanticKind =
+		CompetitiveItemTimingKind( item );
+	if ( semanticKind == MP_MATCH_ITEM_TIMING_KIND_INVALID ) {
+		return false;
+	}
+	int ordinal = 0;
+	int total = 0;
+	for ( int entityNumber = 0; entityNumber < MAX_GENTITIES; ++entityNumber ) {
+		idEntity *entity = gameLocal.entities[ entityNumber ];
+		if ( entity == NULL || !entity->IsType( idItem::GetClassType() ) ) {
+			continue;
+		}
+		const idItem *candidate = static_cast<const idItem *>( entity );
+		if ( CompetitiveItemTimingKind( candidate ) != semanticKind ||
+			CompetitiveItemRespawnSeconds( candidate ) <= 0.0f ) {
+			continue;
+		}
+		++total;
+		if ( candidate == item ) {
+			ordinal = total;
+		}
+	}
+	if ( ordinal <= 0 || total <= 0 ) {
+		return false;
+	}
+	if ( total == 1 ) {
+		kind = semanticKind;
+		return true;
+	}
+
+	const char *semanticToken = MPMatchItemTimingSemanticToken( semanticKind );
+	if ( semanticToken == NULL || idStr::snPrintf( adapterToken,
+		adapterTokenBytes, "%s.%d", semanticToken, ordinal ) < 0 ||
+		!MPMatchItemTimingIsAdapterToken( adapterToken ) ) {
+		adapterToken[ 0 ] = '\0';
+		return false;
+	}
+	kind = MP_MATCH_ITEM_TIMING_KIND_ADAPTER_TOKEN;
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::ObserveCompetitiveItemState
+================
+*/
+void idMultiplayerGame::ObserveCompetitiveItemState( const idItem *item,
+		bool available, int respawnMsec ) {
+	if ( !gameLocal.isServer || !IsManagedMatch() ||
+		!matchItemTiming.IsInitialized() || item == NULL ||
+		( !available && ( respawnMsec <= 0 ||
+			respawnMsec > 24 * 60 * 60 * 1000 ) ) ) {
+		return;
+	}
+
+	mpMatchItemTimingKind_t kind;
+	char adapterToken[ MP_MATCH_ITEM_TIMING_TOKEN_BYTES + 1 ];
+	if ( !BuildMatchItemTimingIdentity( item, kind, adapterToken,
+		sizeof( adapterToken ) ) ) {
+		return;
+	}
+	const mpMatchTime observedAt = matchSession.GetMatchTime();
+	if ( !observedAt.IsValid() || ( !available &&
+		observedAt.Milliseconds() > INT64_MAX - respawnMsec ) ) {
+		return;
+	}
+
+	mpMatchItemTimingObservationInput input;
+	input.sourceId = static_cast<uint64_t>( item->entityNumber ) + 1u;
+	input.kind = kind;
+	input.adapterToken = kind == MP_MATCH_ITEM_TIMING_KIND_ADAPTER_TOKEN ?
+		adapterToken : NULL;
+	input.observedAtMatchTime = observedAt;
+	input.matchDeadline = mpMatchTime::FromMilliseconds( available ?
+		observedAt.Milliseconds() : observedAt.Milliseconds() + respawnMsec );
+	input.available = available;
+	const mpMatchItemTimingMutationResult mutation = matchItemTiming.Observe(
+		input, matchItemTiming.GetRevision() );
+	if ( mutation.WasRejected() &&
+		mutation.reason != MP_MATCH_ITEM_TIMING_REASON_CAPACITY ) {
+		gameLocal.Warning( "competitive item timing rejected entity %d (reason %d)",
+			item->entityNumber, mutation.reason );
+	}
+}
+
+void idMultiplayerGame::ObserveCompetitiveItemPickup( const idItem *item,
+		float respawnSeconds ) {
+	// Reject NaN, zero, negative and unreasonable map-authored intervals before
+	// converting the float to an integer event duration.
+	if ( !( respawnSeconds > 0.0f ) || respawnSeconds > 24.0f * 60.0f * 60.0f ) {
+		return;
+	}
+	const int respawnMsec = SEC2MS( respawnSeconds );
+	ObserveCompetitiveItemState( item, false, respawnMsec );
+}
+
+void idMultiplayerGame::ObserveCompetitiveItemAvailable( const idItem *item ) {
+	ObserveCompetitiveItemState( item, true, 0 );
+}
+
+void idMultiplayerGame::InitializeMatchItemTimingObservations( void ) {
+	if ( !matchItemTimingNeedsInitialScan ) {
+		return;
+	}
+	matchItemTimingNeedsInitialScan = false;
+	if ( !gameLocal.isServer || !IsManagedMatch() ||
+		!matchItemTiming.IsInitialized() ) {
+		return;
+	}
+	for ( int entityNumber = 0; entityNumber < MAX_GENTITIES; ++entityNumber ) {
+		idEntity *entity = gameLocal.entities[ entityNumber ];
+		if ( entity == NULL || !entity->IsType( idItem::GetClassType() ) ) {
+			continue;
+		}
+		const idItem *item = static_cast<const idItem *>( entity );
+		if ( !item->IsHidden() ) {
+			ObserveCompetitiveItemAvailable( item );
+		}
+	}
+}
+
+void idMultiplayerGame::AdvanceMatchViewRevision( bool forceClockSample ) {
+	if ( !gameLocal.isServer || matchSession.GetSessionId() == 0 ) {
+		return;
+	}
+	const bool clockDue = gameLocal.time >= matchViewNextClockUpdateTime;
+	const bool controlChanged =
+		matchViewObservedSessionRevision != matchSession.GetSessionRevision() ||
+		matchViewObservedRulesRevision != matchRules.Committed().Revision() ||
+		matchViewObservedRulesDigest != matchRules.Committed().Digest() ||
+		matchViewObservedProposalRevision != matchProposals.GetRevision() ||
+		matchViewObservedSeriesRevision != matchSeries.GetRevision() ||
+		matchViewObservedTeamsRevision != matchTeams.GetRevision();
+	const bool effectiveMVDRecording = matchEvidence.IsInitialized() &&
+		networkSystem->ServerIsMVDRecording();
+	const bool evidenceChanged =
+		matchViewObservedEvidenceRevision != matchEvidence.GetEvidenceRevision() ||
+		matchViewObservedEvidenceFinalized != matchEvidenceFinalized ||
+		matchViewObservedEvidencePersisted != matchEvidencePersisted ||
+		matchViewObservedMVDRecording != effectiveMVDRecording;
+	const bool itemTimingChanged = matchViewObservedItemTimingRevision !=
+		matchItemTiming.GetRevision();
+	const bool changed = forceClockSample || clockDue || controlChanged ||
+		evidenceChanged || itemTimingChanged;
+	if ( !changed ) {
+		return;
+	}
+	if ( matchViewRevision == ~static_cast<uint64_t>( 0 ) ) {
+		gameLocal.Warning( "competitive match view revision exhausted" );
+		return;
+	}
+	++matchViewRevision;
+	if ( controlChanged ) {
+		if ( matchControlRevision == ~static_cast<uint64_t>( 0 ) ) {
+			gameLocal.Warning( "competitive match control revision exhausted" );
+		} else {
+			++matchControlRevision;
+		}
+	}
+	matchViewObservedSessionRevision = matchSession.GetSessionRevision();
+	matchViewObservedRulesRevision = matchRules.Committed().Revision();
+	matchViewObservedRulesDigest = matchRules.Committed().Digest();
+	matchViewObservedProposalRevision = matchProposals.GetRevision();
+	matchViewObservedSeriesRevision = matchSeries.GetRevision();
+	matchViewObservedTeamsRevision = matchTeams.GetRevision();
+	matchViewObservedEvidenceRevision = matchEvidence.GetEvidenceRevision();
+	matchViewObservedItemTimingRevision = matchItemTiming.GetRevision();
+	matchViewObservedEvidenceFinalized = matchEvidenceFinalized;
+	matchViewObservedEvidencePersisted = matchEvidencePersisted;
+	matchViewObservedMVDRecording = effectiveMVDRecording;
+	if ( forceClockSample || clockDue ) {
+		matchViewNextClockUpdateTime = gameLocal.time > 0x7fffffff - 1000 ?
+			0x7fffffff : gameLocal.time + 1000;
+	}
+}
+
+mpMatchViewAllowedOperationMask_t idMultiplayerGame::AllowedMatchOperationsFor(
+		mpParticipantId participant ) const {
+	if ( gameLocal.isServer && !matchSessionOperational ) {
+		return 0;
+	}
+	const mpMatchParticipantState *state = matchSession.FindParticipant( participant );
+	if ( state == NULL || !state->connected || !state->human ) {
+		return 0;
+	}
+	const mpMatchCapabilityMask_t capabilities =
+		matchSession.GetParticipantCapabilities( participant );
+	const bool localOperator = gameLocal.isListenServer && state->slot == gameLocal.localClientNum;
+	const bool referee = ( state->roles & MPMatchRoleBit( MP_MATCH_ROLE_REFEREE ) ) != 0;
+	const bool competitionContestant = gameLocal.gameType == GAME_DUEL &&
+		ResolveCompetitionSide( participant ) != MP_SERIES_SIDE_NONE;
+	mpMatchViewAllowedOperationMask_t allowed = 0;
+	for ( int rawOpcode = MP_MATCH_OP_INVALID + 1; rawOpcode < MP_MATCH_OP_COUNT; ++rawOpcode ) {
+		const mpMatchOperationOpcode_t opcode = static_cast<mpMatchOperationOpcode_t>( rawOpcode );
+		const mpMatchOperationDescriptor_t *descriptor = MPMatchOperationDescriptor( opcode );
+		if ( descriptor == NULL || matchSession.GetPhase() < INACTIVE ||
+			matchSession.GetPhase() >= STATE_COUNT ||
+			( descriptor->legalPhaseMask & ( 1u << matchSession.GetPhase() ) ) == 0 ) {
+			continue;
+		}
+		if ( opcode == MP_MATCH_OP_ROSTER_LEAVE &&
+			!matchSession.CanSelfLeaveRoster( participant ) ) {
+			continue;
+		}
+		if ( opcode == MP_MATCH_OP_REF_AUTHENTICATE ) {
+			if ( !referee ) {
+				allowed |= MPMatchViewOperationBit( opcode );
+			}
+			continue;
+		}
+		const mpOperationCapabilityPolicy_t *policy =
+			MPOperationCapabilityPolicy( descriptor->requiredCapability );
+		if ( policy != NULL && ( ( capabilities & policy->anySessionCapability ) != 0 ||
+			( localOperator && policy->localOperatorAllowed ) ||
+			( referee && policy->refereeGrantAllowed ) ||
+			( competitionContestant && ( opcode == MP_MATCH_OP_VETO_SELECT ||
+				opcode == MP_MATCH_OP_FORFEIT ) ) ) ) {
+			allowed |= MPMatchViewOperationBit( opcode );
+		}
+	}
+	return allowed;
+}
+
+/*
+================
+idMultiplayerGame::BuildMatchDisclosurePolicy
+
+The stock spectator experience remains open on ordinary servers.  A managed
+match closes every live observation domain until dedicated captain-controlled
+spectator locks and invitations are available; explicit coach, broadcaster and
+referee roles still use their own policy paths.
+================
+*/
+mpMatchDisclosurePolicy_t idMultiplayerGame::BuildMatchDisclosurePolicy( void ) const {
+	mpMatchDisclosurePolicy_t policy;
+	policy.Clear();
+	const mpGameState_t phase = matchSession.GetPhase();
+	const bool managedMatch =
+		matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH );
+	const bool protectLivePov = managedMatch && ( phase == COUNTDOWN ||
+		phase == GAMEON || phase == SUDDENDEATH );
+
+	// Roster/join locks and roster invitations are not spectator credentials.
+	policy.lockedSpectatorSideMask = protectLivePov ?
+		MPMatchDisclosureAllSideBits() : 0;
+	policy.allowSpectatorInvitations = false;
+	policy.allowCoachObservation = true;
+	policy.allowLiveBroadcasterObservation = true;
+	policy.allowBroadcasterItemTiming = managedMatch;
+	policy.allowRefereeObservation = true;
+	policy.allowRefereeItemTiming = managedMatch;
+	// This is recipient authorization, not a delayed broadcast service.  The
+	// explicit broadcaster/referee sees an authoritative state transition on the
+	// same pause-safe match clock used by the item respawn itself.
+	policy.itemTimingDelayMsec = 0;
+	return policy;
+}
+
+/*
+================
+idMultiplayerGame::BuildMatchDisclosureRecipient
+
+Construct a disclosure identity only from the current authoritative transport
+slot binding.  Callers deliberately rebuild it instead of caching a grant.
+================
+*/
+bool idMultiplayerGame::BuildMatchDisclosureRecipient( int clientNum,
+		mpParticipantId &participant,
+		mpMatchDisclosureRecipient_t &recipient ) const {
+	participant = mpParticipantId();
+	recipient.Clear();
+	if ( !gameLocal.isServer || clientNum < 0 ||
+		clientNum >= gameLocal.numClients || clientNum >= MAX_CLIENTS ) {
+		return false;
+	}
+	idEntity *entity = gameLocal.entities[ clientNum ];
+	if ( entity == NULL || !entity->IsType( idPlayer::GetClassType() ) ) {
+		return false;
+	}
+	idPlayer *player = static_cast<idPlayer *>( entity );
+	if ( player->IsFakeClient() || botManager.IsBot( clientNum ) ) {
+		return false;
+	}
+
+	uint32_t generation = 0;
+	if ( !matchSession.GetSlotGeneration( clientNum, generation ) ||
+		!matchSession.ResolveSlotBinding( clientNum, generation, participant ) ) {
+		return false;
+	}
+	const mpMatchParticipantState *state =
+		matchSession.FindParticipant( participant );
+	if ( state == NULL || !state->connected || !state->human ||
+		state->slot != clientNum ) {
+		return false;
+	}
+
+	recipient.sessionId = matchSession.GetSessionId();
+	recipient.sessionRevision = matchSession.GetSessionRevision();
+	recipient.participantId = participant.SequencePart();
+	recipient.slot = clientNum;
+	recipient.bindingGeneration = generation;
+	recipient.side = state->side;
+	recipient.roles = state->roles;
+	recipient.active = state->active;
+	recipient.repeater = gameLocal.isRepeater;
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::ResolveMatchDisclosureTargetSide
+
+MatchSession correctly keeps FFA, Duel and Tourney participants unsided.  The
+disclosure model has two team observation domains, so non-team targets map to
+one synthetic domain solely at this adapter boundary.  Their canonical match
+side remains NONE.  This lets an unlocked ordinary server expose every target
+while the all-domain managed-live lock remains fail closed.
+================
+*/
+int idMultiplayerGame::ResolveMatchDisclosureTargetSide(
+		const mpMatchParticipantState &target ) const {
+	if ( target.side >= 0 && target.side < MP_MATCH_SIDE_COUNT ) {
+		return target.side;
+	}
+	if ( target.side == MP_MATCH_SIDE_NONE && !gameLocal.IsTeamGame() ) {
+		return 0;
+	}
+	return MP_MATCH_SIDE_NONE;
+}
+
+/*
+================
+idMultiplayerGame::CanSpectatorFollow
+
+Fresh server-side authorization for an actual camera transition.  A MatchView
+follow row is discovery data, never an authorization token.
+================
+*/
+bool idMultiplayerGame::CanSpectatorFollow( int observerSlot,
+		int targetSlot ) const {
+	if ( !gameLocal.isServer || observerSlot < 0 || targetSlot < 0 ||
+		observerSlot >= gameLocal.numClients || targetSlot >= gameLocal.numClients ||
+		observerSlot >= MAX_CLIENTS || targetSlot >= MAX_CLIENTS ||
+		observerSlot == targetSlot ) {
+		return false;
+	}
+
+	idEntity *observerEntity = gameLocal.entities[ observerSlot ];
+	idEntity *targetEntity = gameLocal.entities[ targetSlot ];
+	if ( observerEntity == NULL || targetEntity == NULL ||
+		!observerEntity->IsType( idPlayer::GetClassType() ) ||
+		!targetEntity->IsType( idPlayer::GetClassType() ) ) {
+		return false;
+	}
+	idPlayer *observerPlayer = static_cast<idPlayer *>( observerEntity );
+	idPlayer *targetPlayer = static_cast<idPlayer *>( targetEntity );
+	if ( observerPlayer->IsFakeClient() || botManager.IsBot( observerSlot ) ||
+		!observerPlayer->spectating ||
+		targetPlayer->spectating || targetPlayer->wantSpectate ||
+		!playerState[ targetSlot ].ingame ) {
+		return false;
+	}
+
+	mpParticipantId observerParticipant;
+	mpMatchDisclosureRecipient_t recipient;
+	if ( !BuildMatchDisclosureRecipient( observerSlot, observerParticipant,
+		recipient ) ) {
+		return false;
+	}
+
+	uint32_t targetGeneration = 0;
+	mpParticipantId targetParticipant;
+	if ( !matchSession.GetSlotGeneration( targetSlot, targetGeneration ) ||
+		!matchSession.ResolveSlotBinding( targetSlot, targetGeneration,
+			targetParticipant ) || targetParticipant == observerParticipant ) {
+		return false;
+	}
+	const mpMatchParticipantState *targetState =
+		matchSession.FindParticipant( targetParticipant );
+	if ( targetState == NULL || !targetState->connected ||
+		!targetState->active || targetState->slot != targetSlot ) {
+		return false;
+	}
+	const int disclosureSide =
+		ResolveMatchDisclosureTargetSide( *targetState );
+	if ( disclosureSide < 0 || disclosureSide >= MP_MATCH_SIDE_COUNT ) {
+		return false;
+	}
+
+	// Active bots are valid camera targets.  Bots and demo/repeater fake players
+	// are rejected as observers because neither is a trusted human recipient.
+	return MPMatchDisclosureCanFollow( BuildMatchDisclosurePolicy(), recipient,
+		targetParticipant.SequencePart(), disclosureSide, true );
+}
+
+bool idMultiplayerGame::BuildMatchView( int clientNum, mpSessionView &view ) const {
+	if ( !gameLocal.isServer || clientNum < 0 || clientNum >= gameLocal.numClients ||
+		clientNum >= MAX_CLIENTS || matchViewRevision == 0 ) {
+		return false;
+	}
+	mpParticipantId participant;
+	mpMatchDisclosureRecipient_t disclosureRecipient;
+	if ( !BuildMatchDisclosureRecipient( clientNum, participant,
+		disclosureRecipient ) ) {
+		return false;
+	}
+	const mpMatchParticipantState *recipient = matchSession.FindParticipant( participant );
+	if ( recipient == NULL ) {
+		return false;
+	}
+	const uint32_t generation = disclosureRecipient.bindingGeneration;
+	const bool repeaterRecipient = disclosureRecipient.repeater;
+
+	mpMatchViewSource_t source;
+	source.Clear();
+	mpMatchViewPublicState_t &publicState = source.publicState;
+	publicState.sessionId = matchSession.GetSessionId();
+	publicState.sessionRevision = matchSession.GetSessionRevision();
+	publicState.controlRevision = matchControlRevision;
+	publicState.viewRevision = matchViewRevision;
+	publicState.lifecycle.phase = matchSession.GetPhase();
+	publicState.lifecycle.round = matchSession.GetRoundState();
+	const mpMatchPauseView &pause = matchSession.GetPause();
+	publicState.lifecycle.pauseState = MatchViewPauseState( pause.state );
+	publicState.lifecycle.pauseKind = MatchViewPauseKind( pause.kind );
+	publicState.lifecycle.pauseReason = MatchViewPauseReason( pause.reason );
+	publicState.lifecycle.pauseOwnerSide = pause.ownerSide;
+	publicState.lifecycle.hasPauseExpiry = pause.pauseExpiry.IsValid() &&
+		pause.pauseExpiry.Milliseconds() > 0;
+	publicState.lifecycle.pauseExpiryEngineMsec = publicState.lifecycle.hasPauseExpiry ?
+		MatchViewTimeValue( pause.pauseExpiry.Milliseconds() ) : 0;
+	publicState.lifecycle.hasResumeDeadline = pause.resumeDeadline.IsValid() &&
+		pause.resumeDeadline.Milliseconds() > 0;
+	publicState.lifecycle.resumeDeadlineEngineMsec = publicState.lifecycle.hasResumeDeadline ?
+		MatchViewTimeValue( pause.resumeDeadline.Milliseconds() ) : 0;
+	publicState.lifecycle.resumePolicy = MatchViewResumePolicy(
+		matchSession.GetResumePolicy() );
+	if ( pause.state != MP_MATCH_PAUSE_RUNNING &&
+		pause.state != MP_MATCH_PAUSE_PENDING ) {
+		if ( matchSession.GetResumePolicy() ==
+			MP_MATCH_RESUME_BOTH_TEAMS_OR_AUTHORITY ) {
+			publicState.lifecycle.resumeRequiredSideMask =
+				static_cast<unsigned char>( ( 1u << MP_MATCH_SIDE_COUNT ) - 1u );
+		} else if ( matchSession.GetResumePolicy() ==
+			MP_MATCH_RESUME_OWNER_OR_AUTHORITY &&
+			pause.kind == MP_MATCH_PAUSE_KIND_TEAM_TIMEOUT &&
+			pause.ownerSide >= 0 && pause.ownerSide < MP_MATCH_SIDE_COUNT ) {
+			publicState.lifecycle.resumeRequiredSideMask =
+				static_cast<unsigned char>( 1u << pause.ownerSide );
+		}
+	}
+	publicState.lifecycle.resumeConsentingSideMask = static_cast<unsigned char>(
+		pause.resumeConsentMask & publicState.lifecycle.resumeRequiredSideMask );
+
+	publicState.clocks.engineTimeMsec = MatchViewTimeValue(
+		matchSession.GetEngineTime().Milliseconds() );
+	publicState.clocks.matchTimeMsec = MatchViewTimeValue(
+		matchSession.GetMatchTime().Milliseconds() );
+	const mpMatchLivePeriodView &period = matchSession.GetLivePeriod();
+	publicState.clocks.livePeriod = period.period;
+	publicState.clocks.isOvertime = period.period != 0;
+	publicState.clocks.hasLiveDeadline = period.hasDeadline &&
+		period.deadline.IsValid() && period.deadline.Milliseconds() > 0;
+	publicState.clocks.liveDeadlineMatchMsec = publicState.clocks.hasLiveDeadline ?
+		MatchViewTimeValue( period.deadline.Milliseconds() ) : 0;
+
+	const mpMatchReadinessView readiness = matchSession.EvaluateReadiness();
+	mpMatchTeamsRecipientSnapshot_t teamsSnapshot;
+	teamsSnapshot.Clear();
+	const bool teamsSnapshotValid = matchTeams.BuildRecipientSnapshot(
+		matchSession, participant,
+		mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+		teamsSnapshot );
+	publicState.readiness.blockers = readiness.blockers;
+	publicState.readiness.readyCount = static_cast<unsigned short>(
+		idMath::ClampInt( 0, MP_MATCH_VIEW_MAX_PARTICIPANTS, readiness.readyParticipants ) );
+	publicState.readiness.eligibleCount = static_cast<unsigned short>(
+		idMath::ClampInt( 0, MP_MATCH_VIEW_MAX_PARTICIPANTS,
+			readiness.readyEligibleParticipants ) );
+	publicState.readiness.activeHumans = static_cast<unsigned short>(
+		idMath::ClampInt( 0, MP_MATCH_VIEW_MAX_PARTICIPANTS, readiness.activeHumans ) );
+	publicState.readiness.vacantRequiredSeats = static_cast<unsigned short>(
+		idMath::ClampInt( 0, MP_MATCH_VIEW_MAX_PARTICIPANTS,
+			readiness.vacantRequiredSeats ) );
+	for ( int side = 0; side < MP_MATCH_SIDE_COUNT; ++side ) {
+		const mpMatchTimeoutBudgetState &budget = matchSession.GetTimeoutBudget( side );
+		mpMatchViewTimeoutBudget_t &summary = publicState.timeoutBudgets[ side ];
+		summary.configured = static_cast<unsigned char>(
+			idMath::ClampInt( 0, MP_MATCH_VIEW_MAX_PARTICIPANTS, budget.configured ) );
+		summary.remaining = static_cast<unsigned char>(
+			idMath::ClampInt( 0, summary.configured, budget.remaining ) );
+		summary.consumed = static_cast<unsigned char>( summary.configured - summary.remaining );
+		summary.durationSeconds = summary.configured > 0 ? static_cast<unsigned short>(
+			idMath::ClampInt( 1, 65535, matchSession.GetTimeoutDurationMsec() / 1000 ) ) : 0;
+	}
+
+	for ( int index = 0; index < MP_MATCH_MAX_PARTICIPANTS; ++index ) {
+		const mpMatchParticipantState *entry = matchSession.GetParticipantByIndex( index );
+		if ( entry == NULL || !entry->connected || !entry->human ) {
+			continue;
+		}
+		for ( int role = MP_MATCH_ROLE_PLAYER; role <= MP_MATCH_ROLE_REFEREE; ++role ) {
+			if ( ( entry->roles & MPMatchRoleBit( static_cast<mpMatchRole_t>( role ) ) ) == 0 ) {
+				continue;
+			}
+			const mpMatchViewPublicRole_t publicRole =
+				MatchViewPublicRole( static_cast<mpMatchRole_t>( role ) );
+			const bool sided = publicRole == MP_MATCH_VIEW_ROLE_PLAYER ||
+				publicRole == MP_MATCH_VIEW_ROLE_CAPTAIN || publicRole == MP_MATCH_VIEW_ROLE_COACH;
+			AddMatchViewRoleSummary( publicState, publicRole,
+				sided && entry->side >= 0 && entry->side < MP_MATCH_SIDE_COUNT ?
+					entry->side : MP_MATCH_VIEW_SIDE_NONE );
+		}
+	}
+
+	for ( int side = 0; side < MP_MATCH_SIDE_COUNT; ++side ) {
+		mpMatchViewRosterSummary_t summary;
+		summary.Clear();
+		summary.side = side;
+		summary.teamReady = matchSession.IsTeamReady( side );
+		summary.locked = teamsSnapshotValid && teamsSnapshot.sideLocked[ side ];
+		for ( int participantIndex = 0;
+			participantIndex < MP_MATCH_MAX_PARTICIPANTS; ++participantIndex ) {
+			const mpMatchParticipantState *teamParticipant =
+				matchSession.GetParticipantByIndex( participantIndex );
+			if ( teamParticipant != NULL && teamParticipant->connected &&
+				teamParticipant->active && teamParticipant->side == side &&
+				summary.activeParticipants < MP_MATCH_VIEW_MAX_PARTICIPANTS ) {
+				++summary.activeParticipants;
+			}
+		}
+		for ( int queueIndex = 0; queueIndex < matchTeams.GetQueueCount();
+			++queueIndex ) {
+			const mpMatchQueueEntry_t *queueEntry =
+				matchTeams.GetQueueEntry( queueIndex );
+			if ( queueEntry != NULL && queueEntry->requestedSide == side &&
+				summary.queueDepth < MP_MATCH_VIEW_MAX_QUEUE_ENTRIES ) {
+				++summary.queueDepth;
+			}
+		}
+		for ( int seat = 0; seat < MP_MATCH_MAX_ROSTER_SEATS; ++seat ) {
+			const mpMatchRosterSeat *rosterSeat = matchSession.GetRosterSeat( seat );
+			if ( rosterSeat == NULL || !rosterSeat->declared || rosterSeat->side != side ) {
+				continue;
+			}
+			++summary.declaredSeats;
+			if ( !rosterSeat->occupant.IsValid() ) {
+				continue;
+			}
+			++summary.occupiedSeats;
+			const mpMatchParticipantState *occupant =
+				matchSession.FindParticipant( rosterSeat->occupant );
+			if ( occupant != NULL && occupant->connected ) {
+				++summary.connectedOccupants;
+				if ( occupant->ready ) {
+					++summary.readyOccupants;
+				}
+			}
+		}
+		if ( matchSession.GetReadinessPolicy().teamMode ||
+			summary.declaredSeats > 0 ) {
+			publicState.rosterSummaries[ publicState.rosterSummaryCount++ ] = summary;
+		}
+	}
+
+	for ( int index = 0; index < MP_MATCH_MAX_PARTICIPANTS; ++index ) {
+		const mpMatchParticipantState *entry =
+			matchSession.GetParticipantByIndex( index );
+		if ( entry == NULL || !entry->id.IsValid() ||
+			publicState.participantSummaryCount >=
+				MP_MATCH_VIEW_MAX_PARTICIPANTS ) {
+			continue;
+		}
+		mpMatchViewParticipantSummary_t &summary =
+			publicState.participantSummaries[
+				publicState.participantSummaryCount++ ];
+		summary.participantId = entry->id.SequencePart();
+		summary.slot = entry->connected ?
+			static_cast<unsigned char>( entry->slot ) : 0xffu;
+		summary.side = entry->side;
+		summary.publicRoleMask = MatchViewPublicRoleMask( entry->roles );
+		summary.connected = entry->connected;
+		summary.human = entry->human;
+		summary.active = entry->connected && entry->active;
+	}
+
+	const mpProposalRecord_t *globalProposal =
+		matchProposals.GetProposal( MP_PROPOSAL_SCOPE_GLOBAL );
+	if ( globalProposal != NULL && globalProposal->IsActive() ) {
+		PopulateMatchViewProposal( *globalProposal, MP_PROPOSAL_SCOPE_GLOBAL,
+			participant.SequencePart(), publicState.globalProposal );
+		if ( repeaterRecipient ) {
+			publicState.globalProposal.recipientEligible = false;
+			publicState.globalProposal.recipientBallot = MP_MATCH_VIEW_BALLOT_NONE;
+		}
+	}
+	for ( int side = 0; !repeaterRecipient && side < MP_MATCH_SIDE_COUNT;
+		++side ) {
+		const mpProposalScope_t scope = side == 0 ?
+			MP_PROPOSAL_SCOPE_TEAM_A : MP_PROPOSAL_SCOPE_TEAM_B;
+		const mpProposalRecord_t *sideProposal = matchProposals.GetProposal( scope );
+		if ( sideProposal == NULL || !sideProposal->IsActive() ||
+			source.proposalCandidateCount >= MP_MATCH_VIEW_SIDE_COUNT ) {
+			continue;
+		}
+		mpMatchViewProposalCandidate_t &candidate =
+			source.proposalCandidates[ source.proposalCandidateCount++ ];
+		candidate.authorization.audience = MP_MATCH_VIEW_AUDIENCE_OWN_SIDE;
+		candidate.authorization.audienceSide = side;
+		PopulateMatchViewProposal( *sideProposal, scope, participant.SequencePart(),
+			candidate.value );
+	}
+
+	const mpMatchRulesSnapshot &committedRules = matchRules.Committed();
+	publicState.committedRules.present = true;
+	publicState.committedRules.rulesSchemaVersion = committedRules.SchemaVersion();
+	publicState.committedRules.revision = committedRules.Revision();
+	publicState.committedRules.digest = committedRules.Digest();
+	publicState.committedRules.profileId = committedRules.SourceProfile();
+	publicState.committedRules.customized = committedRules.IsCustomized();
+	publicState.committedRules.boundary = matchSession.HasFrozenRules() ?
+		MP_MATCH_VIEW_RULES_FROZEN_FOR_MAP :
+		MP_MATCH_VIEW_RULES_OPEN_FOR_COMMIT;
+	for ( int fieldIndex = 0; fieldIndex < MPMatchRuleFieldCount() &&
+		fieldIndex < MP_MATCH_VIEW_MAX_RULE_FIELDS; ++fieldIndex ) {
+		const mpRuleFieldDescriptor_t *descriptor = MPMatchRuleField( fieldIndex );
+		if ( descriptor == NULL ) {
+			continue;
+		}
+		mpMatchViewRuleValue_t &value = publicState.committedRules.values[
+			publicState.committedRules.valueCount++ ];
+		value.fieldId = static_cast<unsigned char>( descriptor->id );
+		value.type = MatchViewRuleType( descriptor->type );
+		value.value = committedRules.GetInteger( descriptor->id );
+		value.editable = !matchSession.HasFrozenRules() ||
+			descriptor->frozenMutation == MP_RULE_FROZEN_STAGE;
+	}
+
+	const bool localOperator = gameLocal.isListenServer &&
+		clientNum == gameLocal.localClientNum;
+	const bool refereeRecipient = ( recipient->roles &
+		MPMatchRoleBit( MP_MATCH_ROLE_REFEREE ) ) != 0;
+	const bool broadcasterRecipient = ( recipient->roles &
+		MPMatchRoleBit( MP_MATCH_ROLE_BROADCASTER ) ) != 0;
+	const bool rulesRecipient = localOperator || refereeRecipient ||
+		( matchSession.GetParticipantCapabilities( participant ) &
+			MPMatchCapabilityBit( MP_MATCH_CAP_RULES_BOUNDARY ) ) != 0;
+	const mpMatchRulesSnapshot *stagedRules = matchRules.StagedSnapshot();
+	if ( !repeaterRecipient && rulesRecipient && stagedRules != NULL &&
+		source.stagedRulesCandidateCount < 4 ) {
+		mpMatchViewStagedRulesCandidate_t &candidate =
+			source.stagedRulesCandidates[ source.stagedRulesCandidateCount++ ];
+		candidate.authorization.audience = MP_MATCH_VIEW_AUDIENCE_RECIPIENT;
+		candidate.authorization.audienceParticipantId = participant.SequencePart();
+		candidate.value.present = true;
+		candidate.value.revision = stagedRules->Revision();
+		candidate.value.digest = stagedRules->Digest();
+		candidate.value.profileId = stagedRules->SourceProfile();
+		candidate.value.customized = stagedRules->IsCustomized();
+		for ( int fieldIndex = 0; fieldIndex < MPMatchRuleFieldCount() &&
+			fieldIndex < MP_MATCH_VIEW_MAX_RULE_FIELDS; ++fieldIndex ) {
+			const mpRuleFieldDescriptor_t *descriptor = MPMatchRuleField( fieldIndex );
+			if ( descriptor == NULL || committedRules.GetInteger( descriptor->id ) ==
+				stagedRules->GetInteger( descriptor->id ) ) {
+				continue;
+			}
+			candidate.value.changedFieldMask |= 1ull << descriptor->id;
+			mpMatchViewStagedRuleValue_t &value = candidate.value.values[
+				candidate.value.valueCount++ ];
+			value.fieldId = static_cast<unsigned char>( descriptor->id );
+			value.type = MatchViewRuleType( descriptor->type );
+			value.value = stagedRules->GetInteger( descriptor->id );
+		}
+	}
+
+	for ( int seatIndex = 0; seatIndex < MP_MATCH_MAX_ROSTER_SEATS &&
+		source.rosterSeatCandidateCount < MP_MATCH_VIEW_MAX_PRIVATE_CANDIDATES;
+		++seatIndex ) {
+		const mpMatchRosterSeat *seat = matchSession.GetRosterSeat( seatIndex );
+		if ( repeaterRecipient || seat == NULL || !seat->declared ||
+			!( localOperator || refereeRecipient || broadcasterRecipient ||
+				recipient->side == seat->side ) ) {
+			continue;
+		}
+		mpMatchViewRosterSeatCandidate_t &candidate =
+			source.rosterSeatCandidates[ source.rosterSeatCandidateCount++ ];
+		candidate.authorization.audience = MP_MATCH_VIEW_AUDIENCE_RECIPIENT;
+		candidate.authorization.audienceParticipantId = participant.SequencePart();
+		candidate.value.seatIndex = static_cast<unsigned char>( seatIndex );
+		candidate.value.side = seat->side;
+		candidate.value.role = MatchViewRosterRole( seat->role );
+		candidate.value.required = seat->required;
+		candidate.value.occupied = seat->occupant.IsValid();
+		if ( candidate.value.occupied ) {
+			candidate.value.participantId = seat->occupant.SequencePart();
+			const mpMatchParticipantState *occupant =
+				matchSession.FindParticipant( seat->occupant );
+			candidate.value.connected = occupant != NULL && occupant->connected;
+			candidate.value.ready = candidate.value.connected && occupant->ready;
+			candidate.value.active = candidate.value.connected && occupant->active;
+		}
+	}
+
+	if ( teamsSnapshotValid && !repeaterRecipient ) {
+		for ( int invitationIndex = 0;
+			invitationIndex < teamsSnapshot.invitationCount &&
+			source.invitationCandidateCount < MP_MATCH_VIEW_MAX_PRIVATE_CANDIDATES;
+			++invitationIndex ) {
+			const mpMatchRosterInvitation_t &invitation =
+				teamsSnapshot.invitations[ invitationIndex ];
+			mpMatchViewInvitationCandidate_t &candidate =
+				source.invitationCandidates[ source.invitationCandidateCount++ ];
+			candidate.authorization.audience = MP_MATCH_VIEW_AUDIENCE_RECIPIENT;
+			candidate.authorization.audienceParticipantId = participant.SequencePart();
+			candidate.value.invitationId = invitation.invitationId;
+			candidate.value.side = invitation.side;
+			candidate.value.role = MatchViewRosterRole( invitation.role );
+			candidate.value.inviterParticipantId = invitation.issuer.SequencePart();
+			candidate.value.inviteeParticipantId = invitation.target.SequencePart();
+			candidate.value.expiresAtEngineMsec = MatchViewTimeValue(
+				invitation.expiresAt.Milliseconds() );
+		}
+	}
+
+	for ( int queueIndex = 0; !repeaterRecipient &&
+		queueIndex < matchTeams.GetQueueCount() &&
+		source.queueEntryCandidateCount < MP_MATCH_VIEW_MAX_PRIVATE_CANDIDATES;
+		++queueIndex ) {
+		const mpMatchQueueEntry_t *queueEntry = matchTeams.GetQueueEntry( queueIndex );
+		if ( queueEntry == NULL ||
+			!( queueEntry->participant == participant || localOperator ||
+				refereeRecipient ) ) {
+			continue;
+		}
+		mpMatchViewQueueEntryCandidate_t &candidate =
+			source.queueEntryCandidates[ source.queueEntryCandidateCount++ ];
+		if ( queueEntry->participant == participant ) {
+			candidate.authorization.audience = MP_MATCH_VIEW_AUDIENCE_RECIPIENT;
+			candidate.authorization.audienceParticipantId =
+				participant.SequencePart();
+		} else {
+			candidate.authorization.audience = MP_MATCH_VIEW_AUDIENCE_REFEREE;
+		}
+		candidate.value.participantId = queueEntry->participant.SequencePart();
+		candidate.value.side = queueEntry->requestedSide;
+		candidate.value.position = static_cast<unsigned char>( queueIndex + 1 );
+		candidate.value.state = queueEntry->deferralCount > 0 ?
+			MP_MATCH_VIEW_QUEUE_DEFERRED : MP_MATCH_VIEW_QUEUE_WAITING;
+	}
+
+	if ( matchSeries.GetState() != MP_SERIES_DISABLED ) {
+		const mpSeriesConfiguration &configuration =
+			matchSeries.GetConfiguration();
+		publicState.series.present = true;
+		publicState.series.seriesId = matchSeriesId;
+		publicState.series.state = MatchViewSeriesState( matchSeries.GetState() );
+		publicState.series.revision = matchSeries.GetRevision();
+		publicState.series.gameType = configuration.gameType;
+		publicState.series.bestOf = static_cast<unsigned char>( configuration.bestOf );
+		const int attemptedMaps = matchSeries.GetAttemptCount();
+		const bool currentMapPending = matchSeries.GetState() == MP_SERIES_READY ||
+			matchSeries.GetState() == MP_SERIES_MAP_ACTIVE;
+		publicState.series.currentMapNumber = static_cast<unsigned char>(
+			idMath::ClampInt( 0, publicState.series.bestOf,
+				attemptedMaps + ( currentMapPending ? 1 : 0 ) ) );
+		publicState.series.wins[ 0 ] = static_cast<unsigned char>( matchSeries.GetWins( 0 ) );
+		publicState.series.wins[ 1 ] = static_cast<unsigned char>( matchSeries.GetWins( 1 ) );
+		publicState.series.currentVetoStep = static_cast<unsigned char>(
+			matchSeries.GetCurrentVetoStep() );
+		publicState.series.vetoStepCount = static_cast<unsigned char>(
+			configuration.vetoStepCount );
+		if ( matchSeries.GetState() == MP_SERIES_VETO &&
+			matchSeries.GetCurrentVetoStep() < configuration.vetoStepCount ) {
+			const mpSeriesVetoStep &step = configuration.vetoSteps[
+				matchSeries.GetCurrentVetoStep() ];
+			publicState.series.hasVetoTurn = true;
+			publicState.series.vetoTurnAction = MatchViewVetoAction( step.action );
+			publicState.series.vetoTurnSide = step.expectedSide;
+		}
+		publicState.series.mapPoolCount = static_cast<unsigned char>(
+			configuration.mapPoolCount );
+		for ( int poolIndex = 0; poolIndex < configuration.mapPoolCount;
+			++poolIndex ) {
+			mpMatchViewSeriesMap_t &map = publicState.series.mapPool[ poolIndex ];
+			map.poolIndex = static_cast<unsigned char>( poolIndex );
+			map.disposition = MatchViewMapDisposition(
+				matchSeries.GetMapDisposition( poolIndex ) );
+			map.SetMapToken( configuration.mapPool[ poolIndex ] );
+			for ( int selectionIndex = 0;
+				selectionIndex < matchSeries.GetSelectedMapCount(); ++selectionIndex ) {
+				const mpSeriesSelectedMap *selection =
+					matchSeries.GetSelectedMap( selectionIndex );
+				if ( selection == NULL || selection->poolIndex != poolIndex ) {
+					continue;
+				}
+				map.selectedBySide = selection->selectedBySide;
+				map.selectionNumber = static_cast<unsigned char>( selectionIndex + 1 );
+				map.decider = selection->decider;
+				map.hasStartingGameSide = selection->hasStartingGameSide;
+				map.startingGameSide = selection->hasStartingGameSide ?
+					selection->startingGameSide : MP_MATCH_VIEW_SIDE_NONE;
+				map.gameSideChosenBy = selection->hasStartingGameSide ?
+					selection->gameSideChosenBy : MP_MATCH_VIEW_SIDE_NONE;
+				break;
+			}
+		}
+		publicState.series.vetoHistoryCount = static_cast<unsigned char>(
+			matchSeries.GetAppliedVetoCount() );
+		for ( int vetoIndex = 0;
+			vetoIndex < matchSeries.GetAppliedVetoCount(); ++vetoIndex ) {
+			const mpSeriesAppliedVeto *applied =
+				matchSeries.GetAppliedVeto( vetoIndex );
+			if ( applied == NULL ) {
+				continue;
+			}
+			mpMatchViewVetoHistory_t &history =
+				publicState.series.vetoHistory[ vetoIndex ];
+			history.sequenceNumber = static_cast<unsigned char>( vetoIndex + 1 );
+			history.action = MatchViewVetoAction( applied->action );
+			history.actingSide = applied->actingSide;
+			history.mapPoolIndex = static_cast<unsigned char>( applied->poolIndex );
+			history.hasSelectedGameSide =
+				applied->action == MP_SERIES_VETO_SIDE;
+			history.selectedGameSide = history.hasSelectedGameSide ?
+				applied->selectedGameSide : MP_MATCH_VIEW_SIDE_NONE;
+		}
+		publicState.series.mapHistoryCount = static_cast<unsigned char>(
+			matchSeries.GetAttemptCount() );
+		for ( int attemptIndex = 0; attemptIndex < matchSeries.GetAttemptCount();
+			++attemptIndex ) {
+			const mpSeriesMapAttempt *attempt = matchSeries.GetAttempt( attemptIndex );
+			if ( attempt == NULL || attempt->selectionIndex < 0 ||
+				attempt->selectionIndex >= matchSeries.GetSelectedMapCount() ) {
+				continue;
+			}
+			const mpSeriesSelectedMap *selection = matchSeries.GetSelectedMap(
+				attempt->selectionIndex );
+			if ( selection == NULL ) {
+				continue;
+			}
+			mpMatchViewSeriesMapHistory_t &history =
+				publicState.series.mapHistory[ attemptIndex ];
+			history.attemptNumber = static_cast<unsigned char>( attemptIndex + 1 );
+			history.mapPoolIndex = static_cast<unsigned char>( selection->poolIndex );
+			history.outcome = MatchViewMapOutcome( attempt->outcome );
+			history.winnerSide = attempt->winnerSide;
+			for ( int side = 0; side < MP_MATCH_VIEW_SIDE_COUNT; ++side ) {
+				history.scores[ side ] = static_cast<unsigned short>(
+					idMath::ClampInt( 0, 65535, attempt->score[ side ] ) );
+			}
+		}
+		const char *nextMap = matchSeries.GetNextMapToken();
+		if ( nextMap != NULL && nextMap[ 0 ] != '\0' ) {
+			publicState.series.SetNextMap( nextMap );
+		}
+	}
+
+	mpMatchEvidenceViewLifecycle_t evidenceLifecycle;
+	evidenceLifecycle.initialized = matchEvidence.IsInitialized();
+	evidenceLifecycle.finalized = matchEvidenceFinalized;
+	evidenceLifecycle.persisted = matchEvidencePersisted;
+	evidenceLifecycle.mvdRequired = matchEvidence.IsInitialized() &&
+		matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH );
+	evidenceLifecycle.mvdRecording = matchEvidence.IsInitialized() &&
+		networkSystem->ServerIsMVDRecording();
+	const mpMatchEvidenceViewResult_t evidenceView = MPMatchEvidenceBuildView(
+		matchEvidence, evidenceLifecycle, publicState.evidence );
+	if ( !evidenceView.Succeeded() ) {
+		gameLocal.Warning( "could not project match evidence for client %d "
+			"(reason %d)", clientNum, evidenceView.reason );
+		return false;
+	}
+
+	publicState.recipient.participantId = participant.SequencePart();
+	publicState.recipient.slot = static_cast<unsigned char>( clientNum );
+	publicState.recipient.bindingGeneration = generation;
+	publicState.recipient.side = recipient->side;
+	publicState.recipient.competitionSide = ResolveCompetitionSide( participant );
+	publicState.recipient.publicRoleMask = MatchViewPublicRoleMask(
+		recipient->roles );
+	publicState.recipient.active = recipient->active;
+	const mpMatchReadinessPolicy &readinessPolicy =
+		matchSession.GetReadinessPolicy();
+	const bool individualReady = readinessPolicy.policy ==
+		MP_MATCH_READY_INDIVIDUAL || readinessPolicy.policy ==
+		MP_MATCH_READY_INDIVIDUAL_AND_TEAM;
+	publicState.recipient.readyEligible = recipient->connected && recipient->human &&
+		recipient->active && individualReady && !repeaterRecipient;
+	publicState.recipient.ready = publicState.recipient.readyEligible &&
+		recipient->ready;
+	if ( !repeaterRecipient && teamsSnapshotValid && teamsSnapshot.recipientQueued &&
+		teamsSnapshot.recipientQueuePosition >= 0 ) {
+		const mpMatchQueueEntry_t *queueEntry = matchTeams.GetQueueEntry(
+			teamsSnapshot.recipientQueuePosition );
+		publicState.recipient.queueState = queueEntry != NULL &&
+			queueEntry->deferralCount > 0 ? MP_MATCH_VIEW_QUEUE_DEFERRED :
+			MP_MATCH_VIEW_QUEUE_WAITING;
+		publicState.recipient.queueSide = teamsSnapshot.recipientRequestedSide;
+		publicState.recipient.hasQueuePosition = true;
+		publicState.recipient.queuePosition = static_cast<unsigned char>(
+			teamsSnapshot.recipientQueuePosition + 1 );
+	}
+	const unsigned char recipientSideBit = recipient->side >= 0 &&
+		recipient->side < MP_MATCH_SIDE_COUNT ?
+		static_cast<unsigned char>( 1u << recipient->side ) : 0;
+	publicState.recipient.resumeConsented = recipientSideBit != 0 &&
+		( publicState.lifecycle.resumeConsentingSideMask & recipientSideBit ) != 0 &&
+		!repeaterRecipient;
+
+	const mpMatchViewAllowedOperationMask_t coarseAllowed =
+		repeaterRecipient ? 0 : AllowedMatchOperationsFor( participant );
+	for ( int rawOpcode = MP_MATCH_OP_INVALID + 1;
+		rawOpcode < MP_MATCH_OP_COUNT; ++rawOpcode ) {
+		const mpMatchOperationOpcode_t opcode =
+			static_cast<mpMatchOperationOpcode_t>( rawOpcode );
+		const mpMatchOperationDescriptor_t *descriptor =
+			MPMatchOperationDescriptor( opcode );
+		mpMatchProtocolReason_t reason = repeaterRecipient ?
+			MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED : MP_MATCH_PROTOCOL_REASON_OK;
+		if ( repeaterRecipient ) {
+			// Repeaters carry public match state only and cannot originate control.
+		} else if ( descriptor == NULL ) {
+			reason = MP_MATCH_PROTOCOL_REASON_UNKNOWN_OPCODE;
+		} else if ( ( descriptor->legalPhaseMask &
+			( 1u << matchSession.GetPhase() ) ) == 0 ) {
+			reason = MP_MATCH_PROTOCOL_REASON_ILLEGAL_PHASE;
+		} else if ( ( coarseAllowed & MPMatchViewOperationBit( opcode ) ) == 0 ) {
+			reason = MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED;
+		} else {
+			switch ( opcode ) {
+				case MP_MATCH_OP_READY_SET:
+					if ( !publicState.recipient.readyEligible ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_TEAM_READY_SET:
+				case MP_MATCH_OP_TEAM_LOCK_SET:
+					if ( !readinessPolicy.teamMode ||
+						( !localOperator && !refereeRecipient &&
+							( recipient->side < 0 ||
+								recipient->side >= MP_MATCH_SIDE_COUNT ) ) ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_QUEUE_JOIN:
+					if ( !BuildMatchTeamsPolicy().queueEnabled || recipient->active ||
+						( teamsSnapshotValid && teamsSnapshot.recipientQueued ) ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_QUEUE_DEFER:
+				case MP_MATCH_OP_QUEUE_LEAVE:
+					if ( !teamsSnapshotValid || !teamsSnapshot.recipientQueued ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_TIMEOUT_REQUEST:
+					if ( pause.state != MP_MATCH_PAUSE_RUNNING ||
+						( localOperator || refereeRecipient ?
+							( matchSession.GetTimeoutBudget( 0 ).remaining <= 0 &&
+								matchSession.GetTimeoutBudget( 1 ).remaining <= 0 ) :
+							( recipient->side < 0 ||
+								recipient->side >= MP_MATCH_SIDE_COUNT ||
+								matchSession.GetTimeoutBudget(
+									recipient->side ).remaining <= 0 ) ) ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_TECH_PAUSE_REQUEST:
+					if ( pause.state != MP_MATCH_PAUSE_RUNNING ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_RESUME_REQUEST:
+					if ( pause.state != MP_MATCH_PAUSED ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_REF_AUTHENTICATE:
+					if ( refereeRecipient || recipient->active ||
+						matchSession.FindRosterSeat( participant ) >= 0 ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_REF_LOGOUT:
+					if ( !refereeRecipient ) {
+						reason = MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED;
+					}
+					break;
+				case MP_MATCH_OP_RULES_COMMIT:
+				case MP_MATCH_OP_RULES_DISCARD:
+					if ( stagedRules == NULL ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_PROPOSAL_CAST:
+					if ( !publicState.globalProposal.recipientEligible &&
+						( recipient->side < 0 || recipient->side >= MP_MATCH_SIDE_COUNT ||
+							source.proposalCandidateCount == 0 ) ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_ROSTER_ACCEPT:
+					if ( !teamsSnapshotValid || teamsSnapshot.invitationCount == 0 ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_ROSTER_INVITE:
+				case MP_MATCH_OP_ROSTER_REMOVE:
+				case MP_MATCH_OP_ROSTER_SUBSTITUTE:
+					if ( !readinessPolicy.teamMode ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_SERIES_START:
+					if ( matchSeries.GetState() != MP_SERIES_SETUP ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_SERIES_STAGE_PROFILE: {
+					int seriesSlots[ MP_SERIES_SIDE_COUNT ];
+					uint64_t seriesConnections[ MP_SERIES_SIDE_COUNT ];
+					if ( !IsCompetitionSeriesModeSupported() ||
+						!CollectCompetitionSeriesContestants( seriesSlots,
+							seriesConnections ) ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				}
+				case MP_MATCH_OP_SERIES_CANCEL:
+					if ( matchSeries.GetState() == MP_SERIES_DISABLED ||
+						matchSeries.GetState() == MP_SERIES_COMPLETE ||
+						matchSeries.GetState() == MP_SERIES_CANCELLED ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_SERIES_ADVANCE:
+					if ( !( matchSession.GetPhase() == GAMEREVIEW &&
+							matchSeries.GetState() == MP_SERIES_MAP_COMPLETE ) &&
+						!( ( matchSession.GetPhase() == WARMUP ||
+							matchSession.GetPhase() == NEXTGAME ) &&
+							matchSeries.GetState() == MP_SERIES_READY ) ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_SERIES_CONTESTANT_BIND:
+					if ( gameLocal.gameType != GAME_DUEL ||
+						matchSession.GetPhase() != WARMUP ||
+						matchSeries.GetState() == MP_SERIES_DISABLED ||
+						matchSeries.GetState() == MP_SERIES_COMPLETE ||
+						matchSeries.GetState() == MP_SERIES_CANCELLED ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					}
+					break;
+				case MP_MATCH_OP_VETO_SELECT:
+					if ( matchSeries.GetState() != MP_SERIES_VETO ) {
+						reason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+					} else {
+						const int step = matchSeries.GetCurrentVetoStep();
+						const mpSeriesConfiguration &configuration =
+							matchSeries.GetConfiguration();
+						const bool vetoAuthority = localOperator || refereeRecipient ||
+							( matchSession.GetParticipantCapabilities( participant ) &
+								MPMatchCapabilityBit(
+								MP_MATCH_CAP_VETO_CONTROL ) ) != 0;
+						if ( !vetoAuthority && ( step < 0 ||
+							step >= configuration.vetoStepCount ||
+							ResolveCompetitionSide( participant ) !=
+								configuration.vetoSteps[ step ].expectedSide ) ) {
+							reason = MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED;
+						}
+					}
+					break;
+				default:
+					break;
+			}
+		}
+		MPMatchViewSetOperationDecision( publicState, opcode, reason );
+	}
+
+	const mpMatchDisclosurePolicy_t disclosurePolicy =
+		BuildMatchDisclosurePolicy();
+	mpMatchDisclosureGrant_t disclosureGrant;
+	if ( !MPMatchDisclosureBuildGrant( disclosurePolicy, disclosureRecipient,
+		disclosureGrant ) ) {
+		gameLocal.Warning( "could not authorize match disclosure for client %d "
+			"(reason %d)", clientNum, disclosureGrant.reason );
+		return false;
+	}
+
+	mpMatchViewAudience_t itemAudience = MP_MATCH_VIEW_AUDIENCE_PUBLIC;
+	if ( disclosureGrant.principal == MP_MATCH_DISCLOSURE_PRINCIPAL_BROADCASTER ) {
+		itemAudience = MP_MATCH_VIEW_AUDIENCE_BROADCASTER;
+	} else if ( disclosureGrant.principal == MP_MATCH_DISCLOSURE_PRINCIPAL_REFEREE ) {
+		itemAudience = MP_MATCH_VIEW_AUDIENCE_REFEREE;
+	}
+	if ( disclosureGrant.itemTimingAllowed &&
+		itemAudience != MP_MATCH_VIEW_AUDIENCE_PUBLIC ) {
+		for ( int index = 0; index < matchItemTiming.GetObservationCount() &&
+			source.observerCandidateCount < MP_MATCH_VIEW_MAX_OBSERVER_CANDIDATES;
+			++index ) {
+			const mpMatchItemTimingObservation *observation =
+				matchItemTiming.GetObservation( index );
+			if ( observation == NULL ) {
+				continue;
+			}
+			mpMatchViewObserverCandidate_t &candidate =
+				source.observerCandidates[ source.observerCandidateCount ];
+			const mpMatchDisclosureItemResult_t projected =
+				matchItemTiming.ProjectCandidate( observation->sourceId,
+					disclosurePolicy, itemAudience, matchSession.GetMatchTime(),
+					candidate );
+			if ( projected == MP_MATCH_DISCLOSURE_ITEM_READY ) {
+				++source.observerCandidateCount;
+			}
+		}
+	}
+
+	for ( int index = 0; index < MP_MATCH_MAX_PARTICIPANTS; ++index ) {
+		const mpMatchParticipantState *entry = matchSession.GetParticipantByIndex( index );
+		if ( entry == NULL || !entry->connected || entry->slot < 0 ||
+			entry->slot >= MAX_CLIENTS ) {
+			continue;
+		}
+		const int disclosureTargetSide =
+			ResolveMatchDisclosureTargetSide( *entry );
+		if ( disclosureTargetSide < 0 ||
+			disclosureTargetSide >= MP_MATCH_SIDE_COUNT ) {
+			continue;
+		}
+		idEntity *entity = gameLocal.entities[ entry->slot ];
+		if ( entity == NULL || !entity->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+		idPlayer *player = static_cast<idPlayer *>( entity );
+
+		mpMatchViewAudience_t tacticalAudience = MP_MATCH_VIEW_AUDIENCE_PUBLIC;
+		int tacticalAudienceSide = MP_MATCH_VIEW_SIDE_NONE;
+		switch ( disclosureGrant.principal ) {
+			case MP_MATCH_DISCLOSURE_PRINCIPAL_PLAYER:
+			case MP_MATCH_DISCLOSURE_PRINCIPAL_CAPTAIN:
+			case MP_MATCH_DISCLOSURE_PRINCIPAL_COACH:
+				tacticalAudience = MP_MATCH_VIEW_AUDIENCE_OWN_SIDE;
+				tacticalAudienceSide = disclosureTargetSide;
+				break;
+			case MP_MATCH_DISCLOSURE_PRINCIPAL_BROADCASTER:
+				tacticalAudience = MP_MATCH_VIEW_AUDIENCE_BROADCASTER;
+				break;
+			case MP_MATCH_DISCLOSURE_PRINCIPAL_REFEREE:
+				tacticalAudience = MP_MATCH_VIEW_AUDIENCE_REFEREE;
+				break;
+			default:
+				break;
+		}
+		if ( tacticalAudience != MP_MATCH_VIEW_AUDIENCE_PUBLIC &&
+			( disclosureGrant.viewPolicy.observerKinds &
+				MPMatchViewObserverKindBit(
+					MP_MATCH_VIEW_OBSERVER_TEAM_VITAL ) ) != 0 &&
+			source.observerCandidateCount <
+				MP_MATCH_VIEW_MAX_OBSERVER_CANDIDATES ) {
+			mpMatchViewObserverCandidate_t &vital =
+				source.observerCandidates[ source.observerCandidateCount ];
+			if ( vital.SetTeamVital( tacticalAudience, tacticalAudienceSide,
+				entry->id.SequencePart(), disclosureTargetSide,
+				idMath::ClampInt( 0, 999, player->health ),
+				idMath::ClampInt( 0, 999, player->inventory.armor ),
+				player->health > 0 && !player->spectating ) ) {
+				++source.observerCandidateCount;
+			}
+		}
+
+		if ( !MPMatchDisclosureCanFollow( disclosurePolicy,
+			disclosureRecipient, entry->id.SequencePart(), disclosureTargetSide,
+			entry->active ) || source.observerCandidateCount >=
+			MP_MATCH_VIEW_MAX_OBSERVER_CANDIDATES ) {
+			continue;
+		}
+		mpMatchViewAudience_t followAudience = tacticalAudience;
+		int followAudienceSide = tacticalAudienceSide;
+		if ( disclosureGrant.principal ==
+			MP_MATCH_DISCLOSURE_PRINCIPAL_SPECTATOR ) {
+			followAudience = disclosureTargetSide == 0 ?
+				MP_MATCH_VIEW_AUDIENCE_SPECTATOR_SIDE_0 :
+				MP_MATCH_VIEW_AUDIENCE_SPECTATOR_SIDE_1;
+			followAudienceSide = disclosureTargetSide;
+		}
+		mpMatchViewObserverCandidate_t &follow =
+			source.observerCandidates[ source.observerCandidateCount ];
+		if ( follow.SetFollowTarget( followAudience, followAudienceSide,
+			entry->id.SequencePart(), disclosureTargetSide, true ) ) {
+			++source.observerCandidateCount;
+		}
+	}
+
+	mpMatchViewError_t error;
+	mpMatchDisclosureReason_t disclosureReason;
+	if ( !MPMatchDisclosureBuildView( disclosurePolicy, disclosureRecipient,
+		source, view, &disclosureReason, &error ) ) {
+		gameLocal.Warning( "could not build match view for client %d "
+			"(disclosure %d, reason %d, field %u)", clientNum,
+			disclosureReason, error.reason, error.fieldId );
+		return false;
+	}
+	return true;
+}
+
+bool idMultiplayerGame::WriteMatchViewMessage( int clientNum, idBitMsg &msg ) const {
+	mpSessionView view;
+	view.Clear();
+	if ( !BuildMatchView( clientNum, view ) ) {
+		return false;
+	}
+	msg.WriteByte( GAME_RELIABLE_MESSAGE_MATCH_VIEW );
+	mpMatchViewError_t error;
+	if ( !MPMatchViewEncode( msg, view, &error ) ) {
+		gameLocal.Warning( "could not encode match view for client %d (reason %d, field %u)",
+			clientNum, error.reason, error.fieldId );
+		return false;
+	}
+	return true;
+}
+
+void idMultiplayerGame::SendChangedMatchViews( bool force ) {
+	if ( !gameLocal.isServer || matchViewRevision == 0 ) {
+		return;
+	}
+	for ( int clientNum = 0; clientNum < gameLocal.numClients && clientNum < MAX_CLIENTS;
+		++clientNum ) {
+		idEntity *entity = gameLocal.entities[ clientNum ];
+		if ( entity == NULL || !entity->IsType( idPlayer::GetClassType() ) ||
+			static_cast<idPlayer *>( entity )->IsFakeClient() ||
+			( !force && matchViewSentRevision[ clientNum ] == matchViewRevision ) ) {
+			continue;
+		}
+		idBitMsg message;
+		byte buffer[ MAX_GAME_MESSAGE_SIZE ];
+		message.Init( buffer, sizeof( buffer ) );
+		message.BeginWriting();
+		if ( WriteMatchViewMessage( clientNum, message ) ) {
+			networkSystem->ServerSendReliableMessage( clientNum, message );
+			matchViewSentRevision[ clientNum ] = matchViewRevision;
+		}
+	}
+}
+
+mpMatchOperationResult_t idMultiplayerGame::MakeMatchOperationResult(
+		const mpMatchOperationRequest_t &request,
+		const mpOperationExecutionResult_t &execution ) const {
+	mpMatchOperationResult_t result;
+	result.Clear();
+	result.schemaVersion = MP_MATCH_PROTOCOL_SCHEMA_VERSION;
+	result.sessionId = request.sessionId != 0 ? request.sessionId : matchSession.GetSessionId();
+	result.requestId = request.requestId;
+	result.opcode = request.opcode;
+	result.resultingSessionRevision = matchSession.GetSessionRevision();
+	switch ( execution.outcome ) {
+		case MP_OPERATION_APPLIED:
+			result.status = MP_MATCH_RESULT_COMMITTED;
+			result.reason = MP_MATCH_PROTOCOL_REASON_OK;
+			break;
+		case MP_OPERATION_NO_CHANGE:
+			result.status = MP_MATCH_RESULT_NO_CHANGE;
+			result.reason = MP_MATCH_PROTOCOL_REASON_OK;
+			break;
+		case MP_OPERATION_NEEDS_ADAPTER:
+			result.status = MP_MATCH_RESULT_PENDING;
+			result.reason = MP_MATCH_PROTOCOL_REASON_OK;
+			break;
+		default:
+			result.status = MP_MATCH_RESULT_REJECTED;
+			result.reason = MatchOperationProtocolReason( execution );
+			break;
+	}
+	result.localizationId = result.status == MP_MATCH_RESULT_REJECTED ?
+		MPMatchProtocolReasonLocalizationId( result.reason ) :
+		MP_MATCH_LOCALIZATION_NONE;
+	return result;
+}
+
+void idMultiplayerGame::SendMatchOperationResult( int clientNum,
+		const mpMatchOperationResult_t &result ) {
+	if ( !gameLocal.isServer || clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+	// The async server deliberately does not loop reliable messages back to its
+	// local listen client.  Store the same typed result through the client-side
+	// acceptance path so local hosting receives identical pending/rejected/
+	// committed feedback without inventing a second result format.
+	if ( gameLocal.isListenServer && clientNum == gameLocal.localClientNum ) {
+		StoreClientMatchOperationResult( result );
+		return;
+	}
+	idBitMsg message;
+	byte buffer[ MP_MATCH_PROTOCOL_MAX_MESSAGE_BYTES + 1 ];
+	message.Init( buffer, sizeof( buffer ) );
+	message.BeginWriting();
+	message.WriteByte( GAME_RELIABLE_MESSAGE_MATCH_RESULT );
+	mpMatchProtocolError_t error;
+	if ( !MPMatchProtocolEncodeResult( message, result, &error ) ) {
+		gameLocal.Warning( "could not encode match operation result for client %d (reason %d)",
+			clientNum, error.reason );
+		return;
+	}
+	networkSystem->ServerSendReliableMessage( clientNum, message );
+}
+
+bool idMultiplayerGame::StoreClientMatchOperationResult(
+		const mpMatchOperationResult_t &result ) {
+	if ( clientMatchViewValid &&
+		result.sessionId != clientMatchView.publicState.sessionId ) {
+		return false;
+	}
+	if ( clientMatchOperationResultValid &&
+		clientMatchOperationResult.sessionId == result.sessionId &&
+		result.requestId < clientMatchOperationResult.requestId ) {
+		return false;
+	}
+	clientMatchOperationResult = result;
+	clientMatchOperationResultValid = true;
+	clientMatchControlError.Clear();
+	clientMatchControlErrorValid = false;
+	return true;
+}
+
+void idMultiplayerGame::ClearPendingRefereePassword( void ) {
+	MPRefereeAuthSecureZero( pendingRefereePassword,
+		sizeof( pendingRefereePassword ) );
+	pendingRefereePasswordLength = 0;
+	pendingRefereePasswordDeadline = 0;
+}
+
+bool idMultiplayerGame::InitializeRefereeAuthentication( void ) {
+	char configured[ MP_REFEREE_AUTH_MAX_PASSWORD_BYTES + 1 ];
+	memset( configured, 0, sizeof( configured ) );
+	const char *source = g_refPassword.GetString();
+	int length = 0;
+	if ( source != NULL ) {
+		while ( length <= MP_REFEREE_AUTH_MAX_PASSWORD_BYTES &&
+			source[ length ] != '\0' ) {
+			++length;
+		}
+	}
+	const bool oversized = length > MP_REFEREE_AUTH_MAX_PASSWORD_BYTES;
+	if ( oversized ) {
+		gameLocal.Warning( "ignored overlong one-shot referee credential" );
+		g_refPassword.SetString( "" );
+		length = 0;
+	} else if ( length > 0 ) {
+		memcpy( configured, source, static_cast<size_t>( length ) );
+		configured[ length ] = '\0';
+		// The cvar is a one-shot configuration ingress, never the credential
+		// store.  Only the verifier owned by the authentication core survives.
+		g_refPassword.SetString( "" );
+	}
+
+	if ( length > 0 ) {
+		mpRefereeAuthSalt salt;
+		memset( &salt, 0, sizeof( salt ) );
+		const bool randomReady = sys->SecureRandomBytes( salt.bytes,
+			sizeof( salt.bytes ) );
+		const bool installed = randomReady &&
+			matchRefereeAuthentication.InstallCredentialFromPassword(
+				configured, static_cast<size_t>( length ), salt );
+		MPRefereeAuthSecureZero( &salt, sizeof( salt ) );
+		MPRefereeAuthSecureZero( configured, sizeof( configured ) );
+		if ( !installed ) {
+			gameLocal.Warning( "could not install the referee credential securely" );
+			return false;
+		}
+		matchRefereeCredentialInitialized = true;
+		matchRefereeCredentialIsReal = true;
+	} else {
+		MPRefereeAuthSecureZero( configured, sizeof( configured ) );
+	}
+
+	if ( !matchRefereeCredentialInitialized ) {
+		// A server without configured referee access still installs a random,
+		// unknowable credential.  Challenge timing and wire shape therefore do
+		// not disclose whether a real credential exists.
+		mpRefereeAuthSalt salt;
+		mpRefereeAuthVerifier verifier;
+		memset( &salt, 0, sizeof( salt ) );
+		memset( &verifier, 0, sizeof( verifier ) );
+		const bool randomReady = sys->SecureRandomBytes( salt.bytes,
+			sizeof( salt.bytes ) ) && sys->SecureRandomBytes( verifier.bytes,
+			sizeof( verifier.bytes ) );
+		const bool installed = randomReady &&
+			matchRefereeAuthentication.InstallCredentialVerifier( salt, verifier );
+		MPRefereeAuthSecureZero( &salt, sizeof( salt ) );
+		MPRefereeAuthSecureZero( &verifier, sizeof( verifier ) );
+		if ( !installed ) {
+			gameLocal.Warning( "could not initialize opaque referee authentication" );
+			return false;
+		}
+		matchRefereeCredentialInitialized = true;
+		matchRefereeCredentialIsReal = false;
+	}
+
+	return matchRefereeAuthentication.BeginSession( matchSession.GetSessionId(),
+		Max( 0, gameLocal.time ) );
+}
+
+bool idMultiplayerGame::SendRefereeAuthChallenge( int clientNum,
+		const mpRefereeAuthChallenge &challenge ) {
+	if ( !gameLocal.isServer || clientNum < 0 || clientNum >= gameLocal.numClients ) {
+		return false;
+	}
+	if ( gameLocal.isListenServer && clientNum == gameLocal.localClientNum ) {
+		pendingRefereeChallenge.Clear();
+		pendingRefereeChallenge = challenge;
+		pendingRefereeChallengeValid = true;
+		return true;
+	}
+	byte encoded[ MP_REFEREE_AUTH_CHALLENGE_WIRE_BYTES ];
+	if ( !MPRefereeAuthEncodeChallenge( challenge, encoded, sizeof( encoded ) ) ) {
+		return false;
+	}
+	idBitMsg message;
+	byte messageBytes[ MP_REFEREE_AUTH_CHALLENGE_WIRE_BYTES + 1 ];
+	message.Init( messageBytes, sizeof( messageBytes ) );
+	message.BeginWriting();
+	message.WriteByte( GAME_RELIABLE_MESSAGE_MATCH_AUTH_CHALLENGE );
+	message.WriteData( encoded, sizeof( encoded ) );
+	MPRefereeAuthSecureZero( encoded, sizeof( encoded ) );
+	if ( message.IsOverflowed() ) {
+		MPRefereeAuthSecureZero( messageBytes, sizeof( messageBytes ) );
+		return false;
+	}
+	networkSystem->ServerSendReliableMessage( clientNum, message );
+	MPRefereeAuthSecureZero( messageBytes, sizeof( messageBytes ) );
+	return true;
+}
+
+void idMultiplayerGame::ClientReceiveRefereeAuthChallenge( const idBitMsg &msg ) {
+	if ( !gameLocal.isClient ||
+		msg.GetRemainingReadBits() != MP_REFEREE_AUTH_CHALLENGE_WIRE_BYTES * 8 ) {
+		return;
+	}
+	byte encoded[ MP_REFEREE_AUTH_CHALLENGE_WIRE_BYTES ];
+	if ( msg.ReadData( encoded, sizeof( encoded ) ) != sizeof( encoded ) ) {
+		MPRefereeAuthSecureZero( encoded, sizeof( encoded ) );
+		return;
+	}
+	mpRefereeAuthChallenge challenge;
+	challenge.Clear();
+	const bool decoded = MPRefereeAuthDecodeChallenge( encoded, sizeof( encoded ),
+		challenge );
+	MPRefereeAuthSecureZero( encoded, sizeof( encoded ) );
+	if ( !decoded || !clientMatchViewValid ||
+		challenge.binding.sessionId != clientMatchView.publicState.sessionId ||
+		challenge.binding.participantSequence !=
+			clientMatchView.publicState.recipient.participantId ||
+		challenge.binding.slot != clientMatchView.publicState.recipient.slot ||
+		challenge.binding.slotGeneration !=
+			clientMatchView.publicState.recipient.bindingGeneration ) {
+		challenge.Clear();
+		return;
+	}
+	pendingRefereeChallenge.Clear();
+	pendingRefereeChallenge = challenge;
+	pendingRefereeChallengeValid = true;
+	challenge.Clear();
+}
+
+bool idMultiplayerGame::CompleteRefereeAuthChallenge(
+		const mpRefereeAuthChallenge &challenge ) {
+	if ( pendingRefereePasswordLength <= 0 || !clientMatchViewValid ||
+		gameLocal.time > pendingRefereePasswordDeadline ||
+		challenge.expiresAtEngineMsec <= gameLocal.time ||
+		challenge.binding.sessionId != clientMatchView.publicState.sessionId ||
+		challenge.binding.participantSequence !=
+			clientMatchView.publicState.recipient.participantId ||
+		challenge.binding.slot != clientMatchView.publicState.recipient.slot ||
+		challenge.binding.slotGeneration !=
+			clientMatchView.publicState.recipient.bindingGeneration ) {
+		ClearPendingRefereePassword();
+		return false;
+	}
+
+	mpRefereeAuthProof proof;
+	MPRefereeAuthSecureZero( proof.bytes, sizeof( proof.bytes ) );
+	const bool proofReady = MPRefereeAuthBuildProofFromPassword( challenge,
+		pendingRefereePassword, static_cast<size_t>( pendingRefereePasswordLength ), proof );
+	ClearPendingRefereePassword();
+	if ( !proofReady ) {
+		MPRefereeAuthSecureZero( proof.bytes, sizeof( proof.bytes ) );
+		return false;
+	}
+	char credential[ MP_MATCH_PROTOCOL_MAX_STRING_BYTES + 1 ];
+	const bool credentialReady = BuildMatchAuthProofCredential(
+		challenge.challengeGeneration, proof, credential );
+	MPRefereeAuthSecureZero( proof.bytes, sizeof( proof.bytes ) );
+	if ( !credentialReady ) {
+		MPRefereeAuthSecureZero( credential, sizeof( credential ) );
+		return false;
+	}
+
+	mpMatchOperationRequest_t request;
+	request.Clear();
+	request.opcode = MP_MATCH_OP_REF_AUTHENTICATE;
+	request.argumentCount = 1;
+	request.arguments[ 0 ].fieldId = MP_MATCH_ARG_CREDENTIAL;
+	const bool requestReady = request.arguments[ 0 ].value.SetString( credential,
+		MP_REFEREE_AUTH_PROOF_CREDENTIAL_BYTES );
+	MPRefereeAuthSecureZero( credential, sizeof( credential ) );
+	const bool submitted = requestReady && SubmitMatchOperation( request );
+	ClearMatchOperationSensitiveArguments( request );
+	return submitted;
+}
+
+bool idMultiplayerGame::RequestRefereeAuthentication( const char *password ) {
+	if ( password == NULL ) {
+		return false;
+	}
+	int length = 0;
+	while ( length <= MP_REFEREE_AUTH_MAX_PASSWORD_BYTES && password[ length ] != '\0' ) {
+		++length;
+	}
+	if ( length <= 0 || length > MP_REFEREE_AUTH_MAX_PASSWORD_BYTES ) {
+		return false;
+	}
+	ClearPendingRefereePassword();
+	memcpy( pendingRefereePassword, password, static_cast<size_t>( length ) );
+	pendingRefereePasswordLength = length;
+	const int now = Max( 0, gameLocal.time );
+	const int lifetime = static_cast<int>( MP_REFEREE_AUTH_CHALLENGE_LIFETIME_MSEC ) + 5000;
+	pendingRefereePasswordDeadline = now > 0x7fffffff - lifetime ?
+		0x7fffffff : now + lifetime;
+	pendingRefereeChallenge.Clear();
+	pendingRefereeChallengeValid = false;
+
+	mpMatchOperationRequest_t request;
+	request.Clear();
+	request.opcode = MP_MATCH_OP_REF_AUTHENTICATE;
+	request.argumentCount = 1;
+	request.arguments[ 0 ].fieldId = MP_MATCH_ARG_CREDENTIAL;
+	if ( !request.arguments[ 0 ].value.SetString( MP_REFEREE_AUTH_REQUEST_TOKEN,
+		MP_REFEREE_AUTH_REQUEST_BYTES ) ) {
+		ClearPendingRefereePassword();
+		return false;
+	}
+	const bool submitted = SubmitMatchOperation( request );
+	ClearMatchOperationSensitiveArguments( request );
+	if ( !submitted ) {
+		ClearPendingRefereePassword();
+	}
+	return submitted;
+}
+
+mpMatchRulesValidationContext_t
+idMultiplayerGame::BuildCompetitiveRuleValidationContext( void ) const {
+	mpMatchRulesValidationContext_t context;
+	context.maxClients = MAX_CLIENTS;
+	context.maxTeamSize = MAX_CLIENTS;
+	context.maxRosterSizePerTeam = MP_MATCH_MAX_ROSTER_SEATS / MP_MATCH_SIDE_COUNT;
+	context.requireMapSupport = true;
+	context.mapSupportCheckedGameType = gameLocal.gameType;
+	const idDict *mapDecl = MultiplayerResolveMapDecl(
+		gameLocal.serverInfo.GetString( "si_map" ) );
+	context.mapSupportsCheckedGameType = MPMapSupportsGameType(
+		mapDecl, gameLocal.gameType );
+	return context;
+}
+
+bool idMultiplayerGame::IsCompetitionSeriesModeSupported( void ) const {
+	return gameLocal.gameType == GAME_DUEL || gameLocal.IsTeamGame();
+}
+
+bool idMultiplayerGame::CollectCompetitionSeriesContestants(
+		int slots[ MP_SERIES_SIDE_COUNT ],
+		uint64_t connections[ MP_SERIES_SIDE_COUNT ] ) const {
+	for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+		slots[ side ] = -1;
+		connections[ side ] = 0;
+	}
+	if ( !IsCompetitionSeriesModeSupported() ) {
+		return false;
+	}
+
+	if ( gameLocal.IsTeamGame() ) {
+		bool occupied[ MP_SERIES_SIDE_COUNT ] = { false, false };
+		for ( int index = 0; index < MP_MATCH_MAX_PARTICIPANTS; ++index ) {
+			const mpMatchParticipantState *participant =
+				matchSession.GetParticipantByIndex( index );
+			if ( participant == NULL || !participant->connected ||
+				!participant->human || !participant->active || participant->side < 0 ||
+				participant->side >= MP_SERIES_SIDE_COUNT || participant->slot < 0 ||
+				participant->slot >= MAX_CLIENTS ||
+				matchConnectionId[ participant->slot ] == 0 ) {
+				continue;
+			}
+			occupied[ participant->side ] = true;
+		}
+		return occupied[ 0 ] && occupied[ 1 ];
+	}
+
+	// Duel has no gameplay team.  Bind its two active humans to stable abstract
+	// competition sides in slot order for this connection lifetime.
+	int count = 0;
+	for ( int index = 0; index < MP_MATCH_MAX_PARTICIPANTS; ++index ) {
+		const mpMatchParticipantState *participant =
+			matchSession.GetParticipantByIndex( index );
+		if ( participant == NULL || !participant->connected ||
+			!participant->human || !participant->active || participant->slot < 0 ||
+			participant->slot >= MAX_CLIENTS ||
+			matchConnectionId[ participant->slot ] == 0 ) {
+			continue;
+		}
+		if ( count >= MP_SERIES_SIDE_COUNT ) {
+			return false;
+		}
+		int insertion = count;
+		while ( insertion > 0 && slots[ insertion - 1 ] > participant->slot ) {
+			slots[ insertion ] = slots[ insertion - 1 ];
+			connections[ insertion ] = connections[ insertion - 1 ];
+			--insertion;
+		}
+		slots[ insertion ] = participant->slot;
+		connections[ insertion ] = matchConnectionId[ participant->slot ];
+		++count;
+	}
+	return count == MP_SERIES_SIDE_COUNT;
+}
+
+int idMultiplayerGame::ResolveCompetitionSide( mpParticipantId participant ) const {
+	const mpMatchParticipantState *state = matchSession.FindParticipant( participant );
+	if ( state == NULL || !state->connected || !state->human || !state->active ||
+		state->slot < 0 || state->slot >= MAX_CLIENTS ) {
+		return MP_SERIES_SIDE_NONE;
+	}
+	const int slot = state->slot;
+	if ( matchConnectionId[ slot ] != 0 &&
+		matchSeriesCompetitionConnection[ slot ] == matchConnectionId[ slot ] &&
+		matchSeriesCompetitionSide[ slot ] >= 0 &&
+		matchSeriesCompetitionSide[ slot ] < MP_SERIES_SIDE_COUNT ) {
+		return matchSeriesCompetitionSide[ slot ];
+	}
+
+	const mpSeriesState_t seriesState = matchSeries.GetState();
+	const bool liveSeries = seriesState != MP_SERIES_DISABLED &&
+		seriesState != MP_SERIES_COMPLETE && seriesState != MP_SERIES_CANCELLED;
+	if ( liveSeries ) {
+		if ( gameLocal.IsTeamGame() && state->side >= 0 &&
+			state->side < MP_SERIES_SIDE_COUNT ) {
+			for ( int competitionSide = 0;
+				competitionSide < MP_SERIES_SIDE_COUNT; ++competitionSide ) {
+				if ( matchSeriesGameSideForCompetition[ competitionSide ] ==
+					state->side ) {
+					return competitionSide;
+				}
+			}
+		}
+		return MP_SERIES_SIDE_NONE;
+	}
+	if ( gameLocal.IsTeamGame() ) {
+		return state->side >= 0 && state->side < MP_SERIES_SIDE_COUNT ?
+			state->side : MP_SERIES_SIDE_NONE;
+	}
+	if ( gameLocal.gameType == GAME_DUEL ) {
+		int slots[ MP_SERIES_SIDE_COUNT ];
+		uint64_t connections[ MP_SERIES_SIDE_COUNT ];
+		if ( CollectCompetitionSeriesContestants( slots, connections ) ) {
+			for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+				if ( slots[ side ] == slot && connections[ side ] ==
+					matchConnectionId[ slot ] ) {
+					return side;
+				}
+			}
+		}
+	}
+	return MP_SERIES_SIDE_NONE;
+}
+
+bool idMultiplayerGame::BuildCompetitionSeriesMapPool(
+		const mpSeriesProfileDescriptor &profile,
+		char storage[ MP_SERIES_MAX_MAP_POOL ][ MP_SERIES_MAP_TOKEN_BYTES ],
+		const char *tokens[ MP_SERIES_MAX_MAP_POOL ], int &count,
+		mpSeriesReason_t &reason ) const {
+	memset( storage, 0,
+		MP_SERIES_MAX_MAP_POOL * MP_SERIES_MAP_TOKEN_BYTES * sizeof( char ) );
+	memset( tokens, 0, MP_SERIES_MAX_MAP_POOL * sizeof( tokens[ 0 ] ) );
+	count = 0;
+	reason = MP_SERIES_REASON_NONE;
+
+	const char *cycle = si_mapCycle.GetString();
+	int cycleLength = 0;
+	while ( cycle != NULL && cycleLength <= 4096 && cycle[ cycleLength ] != '\0' ) {
+		++cycleLength;
+	}
+	if ( cycle != NULL && cycle[ 0 ] != '\0' ) {
+		if ( cycleLength > 4096 ) {
+			reason = MP_SERIES_REASON_INVALID_MAP_TOKEN;
+			return false;
+		}
+		int segmentStart = 0;
+		for ( int cursor = 0; cursor <= cycleLength; ++cursor ) {
+			if ( cursor < cycleLength && cycle[ cursor ] != ';' ) {
+				continue;
+			}
+			int first = segmentStart;
+			int last = cursor;
+			while ( first < last && ( cycle[ first ] == ' ' || cycle[ first ] == '\t' ||
+				cycle[ first ] == '\r' || cycle[ first ] == '\n' ) ) {
+				++first;
+			}
+			while ( last > first && ( cycle[ last - 1 ] == ' ' ||
+				cycle[ last - 1 ] == '\t' || cycle[ last - 1 ] == '\r' ||
+				cycle[ last - 1 ] == '\n' ) ) {
+				--last;
+			}
+			const int length = last - first;
+			if ( length <= 0 || length >= MP_SERIES_MAP_TOKEN_BYTES ) {
+				reason = MP_SERIES_REASON_INVALID_MAP_TOKEN;
+				return false;
+			}
+			char rawToken[ MP_SERIES_MAP_TOKEN_BYTES ];
+			memcpy( rawToken, cycle + first, static_cast<size_t>( length ) );
+			rawToken[ length ] = '\0';
+			idStr normalized;
+			NormalizeMapDeclPath( rawToken, normalized );
+			const idDict *mapDecl = MultiplayerResolveMapDecl( normalized.c_str() );
+			if ( !mpCompetitionSeries::IsSafeMapToken( normalized.c_str() ) ||
+				mapDecl == NULL || !MPMapSupportsGameType( mapDecl, gameLocal.gameType ) ) {
+				reason = MP_SERIES_REASON_INVALID_MAP_TOKEN;
+				return false;
+			}
+			if ( CompetitionSeriesFindToken( storage, count, normalized.c_str() ) >= 0 ) {
+				reason = MP_SERIES_REASON_DUPLICATE_MAP;
+				return false;
+			}
+			if ( !CompetitionSeriesAppendToken( storage, count,
+				normalized.c_str() ) ) {
+				reason = MP_SERIES_REASON_INVALID_VETO_PATTERN;
+				return false;
+			}
+			segmentStart = cursor + 1;
+		}
+	} else {
+		const int implicitCapacity = Min( profile.maximumMapPool,
+			Max( profile.minimumMapPool, 7 ) );
+		for ( int index = 0; index < fileSystem->GetNumMaps(); ++index ) {
+			const idDict *mapDecl = fileSystem->GetMapDecl( index );
+			if ( mapDecl == NULL ||
+				!MPMapSupportsGameType( mapDecl, gameLocal.gameType ) ) {
+				continue;
+			}
+			idStr normalized;
+			NormalizeMapDeclPath( mapDecl->GetString( "path" ), normalized );
+			CompetitionSeriesInsertSortedToken( storage, count, implicitCapacity,
+				normalized.c_str() );
+		}
+	}
+
+	if ( count < profile.minimumMapPool || count > profile.maximumMapPool ) {
+		reason = MP_SERIES_REASON_INVALID_VETO_PATTERN;
+		return false;
+	}
+	for ( int index = 0; index < count; ++index ) {
+		tokens[ index ] = storage[ index ];
+	}
+	return true;
+}
+
+static void MatchArtifactDisplayName( const char *source, uint32_t fallbackSequence,
+		char *destination, int maximumBytes ) {
+	if ( destination == NULL || maximumBytes < 1 ) {
+		return;
+	}
+	destination[ 0 ] = '\0';
+	int output = 0;
+	if ( source != NULL ) {
+		for ( int input = 0; source[ input ] != '\0' && output < maximumBytes; ) {
+			const unsigned char first = static_cast<unsigned char>( source[ input ] );
+			if ( first < 0x80 ) {
+				destination[ output++ ] = first >= 0x20 ?
+					static_cast<char>( first ) : '_';
+				++input;
+				continue;
+			}
+			const int bytes = first >= 0xC2 && first <= 0xDF ? 2 :
+				( first >= 0xE0 && first <= 0xEF ? 3 :
+					( first >= 0xF0 && first <= 0xF4 ? 4 : 0 ) );
+			bool valid = bytes > 0 && output + bytes <= maximumBytes;
+			for ( int continuation = 1; valid && continuation < bytes;
+					++continuation ) {
+				const unsigned char value = static_cast<unsigned char>(
+					source[ input + continuation ] );
+				valid = value != 0 && ( value & 0xC0 ) == 0x80;
+			}
+			if ( !valid ) {
+				destination[ output++ ] = '_';
+				++input;
+				continue;
+			}
+			for ( int byteIndex = 0; byteIndex < bytes; ++byteIndex ) {
+				destination[ output++ ] = source[ input++ ];
+			}
+		}
+	}
+	destination[ output ] = '\0';
+	if ( output == 0 ) {
+		idStr::snPrintf( destination, maximumBytes + 1, "player-%u",
+			fallbackSequence );
+	}
+}
+
+static void MatchEvidenceOutputFailureOnce( mpMatchEvidence &evidence,
+		const mpEvidenceCommittedStamp &stamp, mpEvidenceOutputKind_t output,
+		uint16_t reason ) {
+	if ( !evidence.IsInitialized() || reason == 0 ) {
+		return;
+	}
+	for ( int index = 0; index < evidence.GetEventCount(); ++index ) {
+		const mpEvidenceEvent *event = evidence.GetEvent( index );
+		if ( event != NULL && event->kind == MP_EVIDENCE_EVENT_OUTPUT_FAILURE &&
+			event->data.outputFailure.output == output &&
+			event->data.outputFailure.reason == reason ) {
+			return;
+		}
+	}
+	mpEvidenceOutputFailure failure;
+	failure.output = output;
+	failure.reason = reason;
+	evidence.AppendOutputFailure( stamp, failure );
+}
+
+enum {
+	MATCH_MVD_REPORT_REASON_RESULT_UNAVAILABLE = 1,
+	MATCH_MVD_REPORT_REASON_RESULT_MISMATCH = 2,
+	MATCH_MVD_REPORT_REASON_AUTOMATIC_STILL_PENDING = 3,
+	MATCH_MVD_REPORT_REASON_OPERATOR_OWNED_PENDING = 4,
+	MATCH_MVD_REPORT_REASON_OPERATOR_OWNED_AT_SEAL = 5,
+	MATCH_MVD_REPORT_REASON_ENGINE_FAILURE_BASE = 256
+};
+
+static uint16_t MatchMVDEngineFailureReason(
+		serverMVDResultReason_t reason ) {
+	return reason > SERVER_MVD_REASON_NONE && reason < SERVER_MVD_REASON_COUNT ?
+		static_cast<uint16_t>( MATCH_MVD_REPORT_REASON_ENGINE_FAILURE_BASE +
+			static_cast<int>( reason ) ) :
+		static_cast<uint16_t>( MATCH_MVD_REPORT_REASON_RESULT_UNAVAILABLE );
+}
+
+static bool MatchMVDPartialQPathForFinal( const char *partialQPath,
+		const char *finalQPath ) {
+	if ( partialQPath == NULL || finalQPath == NULL ||
+		!MPMatchSeriesReportIsSafeArtifactQPath(
+			MP_SERIES_REPORT_ARTIFACT_MVD, finalQPath ) ) {
+		return false;
+	}
+	const int finalLength = static_cast<int>( strlen( finalQPath ) );
+	const int partialLength = static_cast<int>( strlen( partialQPath ) );
+	return partialLength == finalLength + 5 &&
+		memcmp( partialQPath, finalQPath,
+			static_cast<size_t>( finalLength ) ) == 0 &&
+		strcmp( partialQPath + finalLength, ".part" ) == 0;
+}
+
+static bool MatchMVDResultForFinalQPath(
+		const serverMVDRecordingResult_t &result, const char *finalQPath ) {
+	if ( finalQPath == NULL || finalQPath[ 0 ] == '\0' ||
+		result.state < SERVER_MVD_RESULT_PENDING ||
+		result.state >= SERVER_MVD_RESULT_STATE_COUNT ) {
+		return false;
+	}
+	if ( result.state == SERVER_MVD_RESULT_PENDING ) {
+		return result.reason == SERVER_MVD_REASON_NONE &&
+			result.finalQPath[ 0 ] == '\0' &&
+			MatchMVDPartialQPathForFinal( result.partialQPath, finalQPath );
+	}
+	if ( result.state == SERVER_MVD_RESULT_COMMITTED ) {
+		return result.reason == SERVER_MVD_REASON_NONE &&
+			result.partialQPath[ 0 ] == '\0' &&
+			idStr::Cmp( result.finalQPath, finalQPath ) == 0;
+	}
+	return result.reason > SERVER_MVD_REASON_NONE &&
+		result.reason < SERVER_MVD_REASON_COUNT &&
+		result.finalQPath[ 0 ] == '\0' &&
+		MatchMVDPartialQPathForFinal( result.partialQPath, finalQPath );
+}
+
+void idMultiplayerGame::ProjectMatchMVDReportArtifact(
+		mpSeriesReportArtifactInput &artifact ) const {
+	memset( &artifact, 0, sizeof( artifact ) );
+	artifact.qpath = "";
+	if ( !matchMVDAttemptedBySession ) {
+		artifact.status = MP_SERIES_REPORT_ARTIFACT_NOT_REQUESTED;
+		return;
+	}
+	if ( !MPMatchSeriesReportIsSafeArtifactQPath(
+			MP_SERIES_REPORT_ARTIFACT_MVD, matchMVDQPath ) ) {
+		artifact.status = MP_SERIES_REPORT_ARTIFACT_FAILED;
+		artifact.reason = MATCH_MVD_REPORT_REASON_RESULT_UNAVAILABLE;
+		return;
+	}
+	serverMVDRecordingResult_t result;
+	memset( &result, 0, sizeof( result ) );
+	if ( !networkSystem->ServerCopyMVDRecordingResult( result ) ) {
+		artifact.status = MP_SERIES_REPORT_ARTIFACT_FAILED;
+		artifact.reason = MATCH_MVD_REPORT_REASON_RESULT_UNAVAILABLE;
+		return;
+	}
+	if ( !MatchMVDResultForFinalQPath( result, matchMVDQPath ) ) {
+		artifact.status = MP_SERIES_REPORT_ARTIFACT_FAILED;
+		artifact.reason = MATCH_MVD_REPORT_REASON_RESULT_MISMATCH;
+		return;
+	}
+	if ( result.state == SERVER_MVD_RESULT_COMMITTED ) {
+		artifact.status = MP_SERIES_REPORT_ARTIFACT_AVAILABLE;
+		artifact.qpath = result.finalQPath;
+	} else if ( result.state == SERVER_MVD_RESULT_PENDING &&
+		matchMVDOperatorOwnedBySession ) {
+		artifact.status = MP_SERIES_REPORT_ARTIFACT_PENDING;
+		artifact.reason = MATCH_MVD_REPORT_REASON_OPERATOR_OWNED_PENDING;
+		artifact.qpath = result.partialQPath;
+	} else {
+		artifact.status = MP_SERIES_REPORT_ARTIFACT_FAILED;
+		artifact.reason = result.state == SERVER_MVD_RESULT_FAILED ?
+			MatchMVDEngineFailureReason( result.reason ) :
+			MATCH_MVD_REPORT_REASON_AUTOMATIC_STILL_PENDING;
+		artifact.qpath = result.partialQPath;
+	}
+}
+
+bool idMultiplayerGame::ReconcileCompetitionSeriesMVDResults(
+		mpCompetitionSeriesReport &report, bool sealing ) {
+	if ( !report.IsInitialized() || report.IsFinalized() ) {
+		return false;
+	}
+	serverMVDRecordingResult_t result;
+	memset( &result, 0, sizeof( result ) );
+	const bool haveResult = networkSystem->ServerCopyMVDRecordingResult( result );
+	bool changed = false;
+	for ( int index = 0; index < report.GetMapResultCount(); ++index ) {
+		const mpSeriesReportMapResult *map = report.GetMapResult( index );
+		if ( map == NULL ||
+			map->artifacts[ MP_SERIES_REPORT_ARTIFACT_MVD ].status !=
+				MP_SERIES_REPORT_ARTIFACT_PENDING ) {
+			continue;
+		}
+		const mpSeriesReportArtifact &stored =
+			map->artifacts[ MP_SERIES_REPORT_ARTIFACT_MVD ];
+		mpSeriesReportArtifactInput candidate;
+		memset( &candidate, 0, sizeof( candidate ) );
+		bool reconcile = false;
+		if ( haveResult && result.state == SERVER_MVD_RESULT_COMMITTED &&
+			MatchMVDPartialQPathForFinal( stored.qpath, result.finalQPath ) &&
+			result.reason == SERVER_MVD_REASON_NONE &&
+			result.partialQPath[ 0 ] == '\0' ) {
+			candidate.status = MP_SERIES_REPORT_ARTIFACT_AVAILABLE;
+			candidate.qpath = result.finalQPath;
+			reconcile = true;
+		} else if ( haveResult && result.state == SERVER_MVD_RESULT_FAILED &&
+			result.reason > SERVER_MVD_REASON_NONE &&
+			result.reason < SERVER_MVD_REASON_COUNT &&
+			result.finalQPath[ 0 ] == '\0' &&
+			idStr::Cmp( stored.qpath, result.partialQPath ) == 0 ) {
+			candidate.status = MP_SERIES_REPORT_ARTIFACT_FAILED;
+			candidate.reason = MatchMVDEngineFailureReason( result.reason );
+			candidate.qpath = result.partialQPath;
+			reconcile = true;
+		} else if ( sealing ) {
+			candidate.status = MP_SERIES_REPORT_ARTIFACT_PENDING;
+			candidate.reason = MATCH_MVD_REPORT_REASON_OPERATOR_OWNED_AT_SEAL;
+			candidate.qpath = stored.qpath;
+			reconcile = true;
+		}
+		if ( !reconcile ) {
+			continue;
+		}
+		const mpSeriesReportWriteResult reconciled =
+			report.ReconcileMapArtifact( map->attempt,
+				MP_SERIES_REPORT_ARTIFACT_MVD, candidate );
+		if ( reconciled.code == MP_SERIES_REPORT_WRITE_ACCEPTED ) {
+			changed = true;
+		} else if ( reconciled.code == MP_SERIES_REPORT_WRITE_REJECTED ) {
+			gameLocal.Warning( "competition report rejected MVD reconciliation "
+				"for attempt %u (reason %d)", map->attempt,
+				reconciled.reason );
+		}
+	}
+	return changed;
+}
+
+bool idMultiplayerGame::InitializeCompetitionSeriesReport(
+		const mpCompetitionSeries &series, uint64_t seriesId,
+		const int contestantSlots[ MP_SERIES_SIDE_COUNT ],
+		mpCompetitionSeriesReport &report ) const {
+	const mpSeriesConfiguration &configuration = series.GetConfiguration();
+	const mpSeriesProfileDescriptor *profile = MPSeriesProfileDescriptorForId(
+		configuration.sourceProfile );
+	const mpGameTypeInfo_t *mode = MPGameType( configuration.gameType );
+	if ( seriesId == 0 || profile == NULL || mode == NULL || mode->abbrev == NULL ||
+		contestantSlots == NULL ) {
+		return false;
+	}
+
+	mpSeriesReportIdentityInput input;
+	memset( &input, 0, sizeof( input ) );
+	input.seriesId = seriesId;
+	input.profile = configuration.sourceProfile;
+	input.profileKey = profile->key;
+	input.bestOf = configuration.bestOf;
+	input.rulesSchema = matchRules.Committed().SchemaVersion();
+	input.rulesRevision = matchRules.Committed().Revision();
+	input.rulesDigest = matchRules.Committed().Digest();
+	input.gameType = configuration.gameType;
+	input.modeToken = mode->abbrev;
+
+	char labels[ MP_SERIES_SIDE_COUNT ][ MP_SERIES_REPORT_DISPLAY_NAME_BYTES + 1 ];
+	memset( labels, 0, sizeof( labels ) );
+	for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+		if ( configuration.gameType == GAME_DUEL ) {
+			const int slot = contestantSlots[ side ];
+			if ( slot < 0 || slot >= gameLocal.numClients || slot >= MAX_CLIENTS ) {
+				return false;
+			}
+			// The report identity is series-scoped.  A/B remain stable across map
+			// sessions and explicit recovery rebindings; transport slots and the
+			// session-local participant sequence never become cross-map identity.
+			MatchArtifactDisplayName( gameLocal.userInfo[ slot ].GetString( "ui_name" ),
+				static_cast<uint32_t>( side + 1 ), labels[ side ],
+				MP_SERIES_REPORT_DISPLAY_NAME_BYTES - 2 );
+			const int length = static_cast<int>( strlen( labels[ side ] ) );
+			labels[ side ][ length ] = '-';
+			labels[ side ][ length + 1 ] = static_cast<char>( 'A' + side );
+			labels[ side ][ length + 2 ] = '\0';
+			input.contestants[ side ].kind =
+				MP_SERIES_REPORT_CONTESTANT_PARTICIPANT;
+			input.contestants[ side ].participantSequence =
+				static_cast<uint32_t>( side + 1 );
+		} else {
+			idStr::Copynz( labels[ side ], side == 0 ? "side-a" : "side-b",
+				sizeof( labels[ side ] ) );
+			input.contestants[ side ].kind = MP_SERIES_REPORT_CONTESTANT_SIDE;
+			input.contestants[ side ].participantSequence = 0;
+		}
+		input.contestants[ side ].label = labels[ side ];
+	}
+
+	mpCompetitionSeriesReport candidate;
+	const mpSeriesReportWriteResult initialized = candidate.Initialize( input );
+	if ( initialized.code != MP_SERIES_REPORT_WRITE_ACCEPTED ||
+		!candidate.ValidateInvariants() ) {
+		gameLocal.Warning( "could not initialize competition series report (reason %d)",
+			initialized.reason );
+		return false;
+	}
+	report = candidate;
+	return true;
+}
+
+bool idMultiplayerGame::PersistCompetitionSeriesCandidate(
+		const mpCompetitionSeries &series,
+		const mpCompetitionSeriesReport &report, uint64_t seriesId,
+		uint64_t linkedSessionId ) {
+	if ( seriesId == 0 || linkedSessionId == 0 ||
+		series.GetState() == MP_SERIES_DISABLED || !report.IsInitialized() ) {
+		return false;
+	}
+	mpSeriesRecoveryRecord record;
+	record.Clear();
+	mpSeriesRecoveryReason_t captureReason = MP_SERIES_RECOVERY_REASON_NONE;
+	if ( !MPMatchSeriesRecoveryCapture( series, report, seriesId, linkedSessionId,
+		record, &captureReason ) ) {
+		gameLocal.Warning( "could not capture competition series recovery (reason %d)",
+			captureReason );
+		return false;
+	}
+	mpMatchSeriesRecoveryFileSystemWriter writer( fileSystem );
+	const mpSeriesRecoveryStorageResult stored = MPMatchSeriesRecoveryPersist(
+		record, writer, matchSeriesRecoveryWorkspace );
+	if ( !stored.Succeeded() ) {
+		gameLocal.Warning( "could not persist competition series %llu "
+			"(reason %d, cleanup %d)",
+			static_cast<unsigned long long>( seriesId ), stored.reason,
+			stored.cleanupReason );
+		return false;
+	}
+	if ( series.GetState() == MP_SERIES_COMPLETE ||
+		series.GetState() == MP_SERIES_CANCELLED ) {
+		g_matchSeriesRecoveryId.SetString( "0" );
+	} else {
+		char identity[ 17 ];
+		idStr::snPrintf( identity, sizeof( identity ), "%016llx",
+			static_cast<unsigned long long>( seriesId ) );
+		g_matchSeriesRecoveryId.SetString( identity );
+	}
+	return true;
+}
+
+bool idMultiplayerGame::PersistCompetitionSeries( void ) {
+	const uint64_t linkedSession = matchSeriesLinkedSessionId != 0 ?
+		matchSeriesLinkedSessionId : matchSession.GetSessionId();
+	return PersistCompetitionSeriesCandidate( matchSeries, matchSeriesReport,
+		matchSeriesId, linkedSession );
+}
+
+bool idMultiplayerGame::FinalizeCompetitionSeriesReport(
+		mpCompetitionSeries &series, mpCompetitionSeriesReport &report,
+		mpParticipantId authorizer ) {
+	if ( ( series.GetState() != MP_SERIES_COMPLETE &&
+		series.GetState() != MP_SERIES_CANCELLED ) || !report.IsInitialized() ) {
+		return false;
+	}
+	// Resolve any operator-owned stream that finished since its map row was
+	// appended.  Rows still pending are sealed explicitly as such; final JSON is
+	// immutable and is never rewritten by a later recording result.
+	ReconcileCompetitionSeriesMVDResults( report, true );
+
+	mpSeriesReportFinalInput finalInput;
+	memset( &finalInput, 0, sizeof( finalInput ) );
+	if ( authorizer.IsValid() ) {
+		finalInput.authorizer = MPSeriesReportParticipantAuthorizer(
+			authorizer.SequencePart() );
+	} else {
+		finalInput.authorizer = MPSeriesReportServerOperatorAuthorizer();
+	}
+	if ( series.GetState() == MP_SERIES_COMPLETE ) {
+		finalInput.outcome = MP_SERIES_REPORT_FINAL_COMPLETE;
+		finalInput.reason = static_cast<uint16_t>( MP_SERIES_REASON_SERIES_DECIDED );
+		finalInput.winnerContestant = series.GetWins( 0 ) > series.GetWins( 1 ) ? 0 : 1;
+	} else {
+		finalInput.outcome = MP_SERIES_REPORT_FINAL_CANCELLED;
+		finalInput.reason = static_cast<uint16_t>( MP_MATCH_OP_SERIES_CANCEL + 1 );
+		finalInput.winnerContestant = MP_SERIES_REPORT_CONTESTANT_NONE;
+	}
+	const mpSeriesReportWriteResult finalized = report.Finalize( finalInput );
+	if ( finalized.code != MP_SERIES_REPORT_WRITE_ACCEPTED &&
+		finalized.code != MP_SERIES_REPORT_WRITE_NO_CHANGE ) {
+		gameLocal.Warning( "could not finalize competition series report (reason %d)",
+			finalized.reason );
+		return false;
+	}
+
+	mpMatchSeriesReportFileSystemWriter reportWriter( fileSystem );
+	const mpSeriesReportStorageResult stored = MPMatchSeriesReportStoragePersist(
+		report, reportWriter, matchSeriesReportWorkspace );
+	if ( !stored.Succeeded() ) {
+		MatchEvidenceOutputFailureOnce( matchEvidence, BuildMatchEvidenceStamp(),
+			MP_EVIDENCE_OUTPUT_SERIES_REPORT,
+			static_cast<uint16_t>( stored.reason !=
+				MP_SERIES_REPORT_STORAGE_REASON_NONE ? stored.reason :
+				MP_SERIES_REPORT_STORAGE_REASON_TEMP_WRITE_FAILED ) );
+		if ( matchEvidenceMode > 0 ) {
+			PersistMatchEvidence();
+		}
+		gameLocal.Warning( "could not persist final competition series report "
+			"(reason %d, cleanup %d)", stored.reason, stored.cleanupReason );
+		return false;
+	}
+	if ( !PersistCompetitionSeriesCandidate( series, report, matchSeriesId,
+		matchSeriesLinkedSessionId != 0 ? matchSeriesLinkedSessionId :
+			matchSession.GetSessionId() ) ) {
+		MatchEvidenceOutputFailureOnce( matchEvidence, BuildMatchEvidenceStamp(),
+			MP_EVIDENCE_OUTPUT_SERIES_RECOVERY, 1 );
+		if ( matchEvidenceMode > 0 ) {
+			PersistMatchEvidence();
+		}
+		return false;
+	}
+	gameLocal.Printf( "stored final competition series report '%s'\n",
+		stored.paths.finalQPath );
+	return true;
+}
+
+bool idMultiplayerGame::RestoreCompetitionSeriesIfRequested( void ) {
+	if ( !gameLocal.isServer || matchSeries.GetState() != MP_SERIES_DISABLED ) {
+		return true;
+	}
+	uint64_t requestedId = 0;
+	if ( !ParseCompetitionSeriesId( g_matchSeriesRecoveryId.GetString(),
+		requestedId ) ) {
+		return idStr::Cmp( g_matchSeriesRecoveryId.GetString(), "0" ) == 0;
+	}
+	mpSeriesRecoveryRecord record;
+	record.Clear();
+	const mpSeriesRecoveryLoadResult loaded =
+		MPMatchSeriesRecoveryLoadFileSystem( fileSystem, requestedId,
+			matchSeriesRecoveryWorkspace, record );
+	if ( !loaded.Succeeded() ) {
+		gameLocal.Warning( "could not load competition series %llu "
+			"(reason %d, decode %d)",
+			static_cast<unsigned long long>( requestedId ), loaded.reason,
+			loaded.decodeReason );
+		return false;
+	}
+	if ( !IsCompetitionSeriesModeSupported() ||
+		record.series.configuration.gameType != gameLocal.gameType ||
+		record.series.state == MP_SERIES_DISABLED ||
+		record.series.state == MP_SERIES_COMPLETE ||
+		record.series.state == MP_SERIES_CANCELLED ) {
+		gameLocal.Warning( "competition series %llu does not match this active mode",
+			static_cast<unsigned long long>( requestedId ) );
+		return false;
+	}
+	for ( int index = 0; index < record.series.configuration.mapPoolCount; ++index ) {
+		const char *mapToken = record.series.configuration.mapPool[ index ];
+		const idDict *mapDecl = MultiplayerResolveMapDecl( mapToken );
+		if ( mapDecl == NULL ||
+			!MPMapSupportsGameType( mapDecl, gameLocal.gameType ) ) {
+			gameLocal.Warning( "competition series %llu references unavailable map '%s'",
+				static_cast<unsigned long long>( requestedId ), mapToken );
+			return false;
+		}
+	}
+	if ( record.series.state == MP_SERIES_MAP_ACTIVE ||
+		record.series.state == MP_SERIES_MAP_COMPLETE ) {
+		if ( record.series.currentSelectionIndex < 0 ||
+			record.series.currentSelectionIndex >= record.series.selectedMapCount ) {
+			gameLocal.Warning( "competition series %llu has no recoverable active map",
+				static_cast<unsigned long long>( requestedId ) );
+			return false;
+		}
+		const mpSeriesSelectedMap &selection = record.series.selectedMaps[
+			record.series.currentSelectionIndex ];
+		if ( selection.poolIndex < 0 ||
+			selection.poolIndex >= record.series.configuration.mapPoolCount ) {
+			gameLocal.Warning( "competition series %llu has an invalid selected map '%s'",
+				static_cast<unsigned long long>( requestedId ),
+				selection.poolIndex >= 0 && selection.poolIndex <
+					record.series.configuration.mapPoolCount ?
+					record.series.configuration.mapPool[ selection.poolIndex ] : "<invalid>" );
+			return false;
+		}
+	}
+	if ( !record.hasReport ) {
+		gameLocal.Warning( "competition series %llu uses legacy recovery without "
+			"a verifiable report and cannot be resumed",
+			static_cast<unsigned long long>( requestedId ) );
+		return false;
+	}
+	mpCompetitionSeries candidate;
+	mpCompetitionSeriesReport reportCandidate;
+	mpSeriesRecoveryReason_t restoreReason = MP_SERIES_RECOVERY_REASON_NONE;
+	if ( !MPMatchSeriesRecoveryRestoreCores( record, candidate, reportCandidate,
+		&restoreReason ) ) {
+		gameLocal.Warning( "competition series %llu failed transactional restore",
+			static_cast<unsigned long long>( requestedId ) );
+		return false;
+	}
+	if ( ( candidate.GetState() == MP_SERIES_MAP_ACTIVE ||
+		candidate.GetState() == MP_SERIES_MAP_COMPLETE ) &&
+		!CompetitionSeriesMapMatchesRuntime( candidate, gameLocal.gameType,
+			gameLocal.GetMapName() ) ) {
+		gameLocal.Warning( "competition series %llu does not belong to loaded map '%s'",
+			static_cast<unsigned long long>( requestedId ), gameLocal.GetMapName() );
+		return false;
+	}
+	if ( reportCandidate.GetIdentity().rulesDigest !=
+		matchRules.Committed().Digest() ) {
+		gameLocal.Warning( "competition series %llu rules identity does not match "
+			"the active competitive profile",
+			static_cast<unsigned long long>( requestedId ) );
+		return false;
+	}
+	matchSeries = candidate;
+	matchSeriesReport = reportCandidate;
+	matchSeriesId = record.seriesId;
+	matchSeriesLinkedSessionId = record.linkedSessionId;
+	matchSeriesNeedsBindingRecovery = true;
+	// MAP_ACTIVE recovery describes a map selected durably before the runtime
+	// session was rebuilt.  Do not let BeginMatchSession finalize the empty
+	// pre-bind journal as that map's result.
+	matchSeriesAwaitingMapSession =
+		matchSeries.GetState() == MP_SERIES_MAP_ACTIVE;
+	memset( matchSeriesCompetitionConnection, 0,
+		sizeof( matchSeriesCompetitionConnection ) );
+	for ( int slot = 0; slot < MAX_CLIENTS; ++slot ) {
+		matchSeriesCompetitionSide[ slot ] = MP_SERIES_SIDE_NONE;
+	}
+	for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+		matchSeriesContestantSlot[ side ] = -1;
+		matchSeriesContestantConnection[ side ] = 0;
+		matchSeriesGameSideForCompetition[ side ] = side;
+	}
+	if ( matchSeries.GetState() == MP_SERIES_MAP_ACTIVE ||
+		matchSeries.GetState() == MP_SERIES_MAP_COMPLETE ) {
+		const mpSeriesSelectedMap *selection = matchSeries.GetSelectedMap(
+			matchSeries.GetCurrentSelectionIndex() );
+		if ( selection != NULL && selection->hasStartingGameSide ) {
+			matchSeriesGameSideForCompetition[ selection->gameSideChosenBy ] =
+				selection->startingGameSide;
+			matchSeriesGameSideForCompetition[ 1 - selection->gameSideChosenBy ] =
+				1 - selection->startingGameSide;
+		}
+	}
+	gameLocal.Printf( "restored competition series %llu at revision %llu\n",
+		static_cast<unsigned long long>( matchSeriesId ),
+		static_cast<unsigned long long>( matchSeries.GetRevision() ) );
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::BindCompetitionSeriesContestant
+
+Duel recovery cannot infer person identity.  This trusted local operation binds
+one explicit current connection to one abstract series side.  The binding is
+not persisted and dies with the connection, so neither a reused slot nor a
+matching name/address can inherit veto or forfeit authority.
+================
+*/
+bool idMultiplayerGame::BindCompetitionSeriesContestant( int competitionSide,
+		int clientNum ) {
+	if ( !gameLocal.isServer || gameLocal.isClient || !matchSessionOperational ||
+		gameLocal.gameType != GAME_DUEL ||
+		competitionSide < 0 || competitionSide >= MP_SERIES_SIDE_COUNT ||
+		clientNum < 0 || clientNum >= gameLocal.numClients ||
+		clientNum >= MAX_CLIENTS || matchSession.GetPhase() != WARMUP ) {
+		return false;
+	}
+	const mpSeriesState_t state = matchSeries.GetState();
+	if ( state == MP_SERIES_DISABLED || state == MP_SERIES_COMPLETE ||
+		state == MP_SERIES_CANCELLED ) {
+		return false;
+	}
+	idEntity *entity = gameLocal.entities[ clientNum ];
+	if ( entity == NULL || !entity->IsType( idPlayer::GetClassType() ) ||
+		static_cast<idPlayer *>( entity )->IsFakeClient() ||
+		matchConnectionId[ clientNum ] == 0 ) {
+		return false;
+	}
+	uint32_t generation = 0;
+	mpParticipantId participant;
+	if ( !matchSession.GetSlotGeneration( clientNum, generation ) ||
+		!matchSession.ResolveSlotBinding( clientNum, generation, participant ) ) {
+		return false;
+	}
+	const mpMatchParticipantState *participantState =
+		matchSession.FindParticipant( participant );
+	if ( participantState == NULL || !participantState->connected ||
+		!participantState->human || !participantState->active ) {
+		return false;
+	}
+	if ( matchControlRevision == ~static_cast<uint64_t>( 0 ) ||
+		matchViewRevision == ~static_cast<uint64_t>( 0 ) ) {
+		gameLocal.Warning( "competition series binding revision exhausted" );
+		return false;
+	}
+
+	for ( int slot = 0; slot < MAX_CLIENTS; ++slot ) {
+		if ( matchSeriesCompetitionSide[ slot ] == competitionSide ||
+			slot == clientNum ) {
+			matchSeriesCompetitionSide[ slot ] = MP_SERIES_SIDE_NONE;
+			matchSeriesCompetitionConnection[ slot ] = 0;
+		}
+	}
+	for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+		if ( matchSeriesContestantSlot[ side ] == clientNum ||
+			side == competitionSide ) {
+			matchSeriesContestantSlot[ side ] = -1;
+			matchSeriesContestantConnection[ side ] = 0;
+		}
+	}
+	matchSeriesCompetitionSide[ clientNum ] = competitionSide;
+	matchSeriesCompetitionConnection[ clientNum ] =
+		matchConnectionId[ clientNum ];
+	matchSeriesContestantSlot[ competitionSide ] = clientNum;
+	matchSeriesContestantConnection[ competitionSide ] =
+		matchConnectionId[ clientNum ];
+
+	matchSeriesNeedsBindingRecovery = false;
+	for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+		const int slot = matchSeriesContestantSlot[ side ];
+		if ( slot < 0 || slot >= MAX_CLIENTS ||
+			matchSeriesContestantConnection[ side ] == 0 ||
+			matchSeriesContestantConnection[ side ] != matchConnectionId[ slot ] ) {
+			matchSeriesNeedsBindingRecovery = true;
+			break;
+		}
+	}
+	++matchControlRevision;
+	++matchViewRevision;
+	SendChangedMatchViews( true );
+	gameLocal.Printf( "bound duel series side %d to current client %d%s\n",
+		competitionSide, clientNum,
+		matchSeriesNeedsBindingRecovery ? " (other side still required)" : "" );
+	return true;
+}
+
+bool idMultiplayerGame::ScheduleCompetitionSeriesMap(
+		mpCompetitionSeries &candidate, const char *mapToken,
+		mpOperationExecutionResult_t &execution ) {
+	const char *expectedMap = candidate.GetNextMapToken();
+	if ( candidate.GetState() != MP_SERIES_READY || expectedMap == NULL ||
+		mapToken == NULL || idStr::Icmp( expectedMap, mapToken ) != 0 ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_SERIES_STATE;
+		execution.seriesReason = MP_SERIES_REASON_WRONG_MAP;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+		execution.continuation.Clear();
+		return false;
+	}
+	if ( gameLocal.sessionCommand.Length() != 0 ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+		execution.continuation.Clear();
+		return false;
+	}
+	const idDict *mapDecl = MultiplayerResolveMapDecl( mapToken );
+	if ( mapDecl == NULL || !MPMapSupportsGameType( mapDecl, gameLocal.gameType ) ) {
+		const mpSeriesMutationResult failed = candidate.ReportMapLoadFailure(
+			mapToken, candidate.GetRevision() );
+		if ( failed.WasApplied() && PersistCompetitionSeriesCandidate( candidate,
+			matchSeriesReport, matchSeriesId, matchSeriesLinkedSessionId != 0 ?
+				matchSeriesLinkedSessionId : matchSession.GetSessionId() ) ) {
+			matchSeries = candidate;
+			execution.outcome = MP_OPERATION_APPLIED;
+			execution.reason = MP_OPERATION_REASON_NONE;
+			execution.seriesReason = MP_SERIES_REASON_INVALID_MAP_TOKEN;
+			execution.resultingSeriesRevision = matchSeries.GetRevision();
+			execution.continuation.Clear();
+		} else if ( failed.WasApplied() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+			execution.continuation.Clear();
+		}
+		gameLocal.Warning( "competition series map '%s' is no longer available "
+			"for mode %s", mapToken, MPGameTypeName( gameLocal.gameType ) );
+		return execution.outcome == MP_OPERATION_APPLIED;
+	}
+
+	const int selectionIndex = candidate.GetNextSelectionIndex();
+	const mpSeriesSelectedMap *selection = candidate.GetSelectedMap( selectionIndex );
+	if ( selection == NULL || ( candidate.GetConfiguration().requireStartingGameSide &&
+		( !selection->hasStartingGameSide || selection->gameSideChosenBy < 0 ||
+			selection->gameSideChosenBy >= MP_SERIES_SIDE_COUNT ||
+			selection->startingGameSide < 0 ||
+			selection->startingGameSide >= MP_SERIES_SIDE_COUNT ) ) ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_INVARIANT;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+		execution.continuation.Clear();
+		return false;
+	}
+	int nextGameSide[ MP_SERIES_SIDE_COUNT ] = { 0, 1 };
+	if ( selection->hasStartingGameSide ) {
+		nextGameSide[ selection->gameSideChosenBy ] = selection->startingGameSide;
+		nextGameSide[ 1 - selection->gameSideChosenBy ] =
+			1 - selection->startingGameSide;
+	}
+	const mpSeriesMutationResult begun = candidate.BeginMap( mapToken,
+		candidate.GetRevision() );
+	if ( begun.WasRejected() || !candidate.ValidateInvariants() ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+		execution.seriesReason = begun.reason;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+		execution.continuation.Clear();
+		return false;
+	}
+	if ( !PersistCompetitionSeriesCandidate( candidate, matchSeriesReport,
+		matchSeriesId, matchSession.GetSessionId() ) ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+		execution.continuation.Clear();
+		return false;
+	}
+
+	matchSeries = candidate;
+	matchSeriesLinkedSessionId = matchSession.GetSessionId();
+	// BeginMap is checkpointed before the map handoff.  Until the next runtime
+	// session binds that checkpoint, the current journal still belongs to the
+	// lobby/previous map and must never be published as this selection's result.
+	matchSeriesAwaitingMapSession = true;
+	for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+		matchSeriesGameSideForCompetition[ side ] = nextGameSide[ side ];
+	}
+	if ( gameLocal.IsTeamGame() ) {
+		for ( int slot = 0; slot < gameLocal.numClients && slot < MAX_CLIENTS; ++slot ) {
+			const int competitionSide = matchSeriesCompetitionSide[ slot ];
+			if ( competitionSide < 0 || competitionSide >= MP_SERIES_SIDE_COUNT ||
+				matchSeriesCompetitionConnection[ slot ] == 0 ||
+				matchSeriesCompetitionConnection[ slot ] != matchConnectionId[ slot ] ||
+				gameLocal.entities[ slot ] == NULL ||
+				!gameLocal.entities[ slot ]->IsType( idPlayer::GetClassType() ) ) {
+				continue;
+			}
+			idDict updated = gameLocal.userInfo[ slot ];
+			updated.Set( "ui_team", teamNames[ nextGameSide[ competitionSide ] ] );
+			updated.Set( "ui_spectate", "Play" );
+			gameLocal.SetUserInfo( slot, updated, false );
+		}
+	}
+	si_map.SetString( mapToken );
+	gameLocal.serverInfo.Set( "si_map", mapToken );
+	gameLocal.sessionCommand = "nextMap";
+	execution.outcome = MP_OPERATION_APPLIED;
+	execution.reason = MP_OPERATION_REASON_NONE;
+	execution.seriesReason = MP_SERIES_REASON_NONE;
+	execution.resultingSeriesRevision = matchSeries.GetRevision();
+	execution.continuation.Clear();
+	return true;
+}
+
+void idMultiplayerGame::BuildMatchOperationContext( int clientNum,
+		mpMatchOperationOpcode_t opcode, bool enforceTransportCooldown,
+		mpOperationAdapterContext_t &context ) {
+	context = mpOperationAdapterContext_t();
+	context.trustedTransportSlot = clientNum;
+	context.localOperator = gameLocal.isListenServer &&
+		clientNum == gameLocal.localClientNum;
+	context.sessionOperational = matchSessionOperational;
+	context.countdownPrerequisitesSatisfied = CanEnterMatchCountdown();
+	uint32_t generation = 0;
+	mpParticipantId participant;
+	if ( clientNum >= 0 && clientNum < MAX_CLIENTS &&
+		matchSession.GetSlotGeneration( clientNum, generation ) &&
+		matchSession.ResolveSlotBinding( clientNum, generation, participant ) ) {
+		const mpMatchParticipantState *state = matchSession.FindParticipant( participant );
+		context.preauthenticatedRefereeGrant = state != NULL &&
+			( state->roles & MPMatchRoleBit( MP_MATCH_ROLE_REFEREE ) ) != 0;
+		const int competitionSide = ResolveCompetitionSide( participant );
+		context.actorCompetitionContestant = gameLocal.gameType == GAME_DUEL &&
+			competitionSide >= 0 && competitionSide < MP_SERIES_SIDE_COUNT;
+		context.actorCompetitionSide = context.actorCompetitionContestant ?
+			competitionSide : MP_SERIES_SIDE_NONE;
+	}
+	const mpMatchOperationDescriptor_t *descriptor =
+		MPMatchOperationDescriptor( opcode );
+	context.cooldownPolicyAccepted = descriptor != NULL &&
+		( !enforceTransportCooldown || opcode == MP_MATCH_OP_REF_AUTHENTICATE ||
+			MatchOperationRateLimitAccepted( clientNum, *descriptor ) );
+	context.engineTime = mpMatchEngineTime::FromMilliseconds(
+		Max( 0, gameLocal.time ) );
+	context.ruleGameType = gameLocal.gameType;
+	context.ruleBoundary = matchSession.HasFrozenRules() ?
+		MP_RULES_FROZEN_FOR_MAP : MP_RULES_OPEN_FOR_COMMIT;
+	context.validatedRuleContext = BuildCompetitiveRuleValidationContext();
+	context.expectedRulesRevision = matchRules.Committed().Revision();
+	context.expectedRulesDigest = matchRules.Committed().Digest();
+	context.expectedStagedRules = matchRules.HasStagedSnapshot();
+	context.expectedStagedRulesDigest = context.expectedStagedRules ?
+		matchRules.StagedSnapshot()->Digest() : 0;
+	context.expectedProposalRevision = matchProposals.GetRevision();
+	context.expectedSeriesRevision = matchSeries.GetRevision();
+}
+
+void idMultiplayerGame::ProcessPassedMatchProposals( void ) {
+	static const mpProposalScope_t scopes[ MP_PROPOSAL_SCOPE_COUNT ] = {
+		MP_PROPOSAL_SCOPE_GLOBAL,
+		MP_PROPOSAL_SCOPE_TEAM_A,
+		MP_PROPOSAL_SCOPE_TEAM_B
+	};
+	for ( int index = 0; index < MP_PROPOSAL_SCOPE_COUNT; ++index ) {
+		const mpProposalRecord_t *record = matchProposals.GetProposal( scopes[ index ] );
+		if ( record == NULL || record->status != MP_PROPOSAL_STATUS_PASSED ) {
+			continue;
+		}
+		const mpProposalId_t proposalId = record->proposalId;
+		mpMatchOperationRequest_t request = record->operation;
+		const int actorSlot = request.actorSlot;
+		mpParticipantId evidenceActor = mpParticipantId::Invalid();
+		matchSession.ResolveSlotBinding( actorSlot,
+			request.actorBindingGeneration, evidenceActor );
+		ObserveMatchEvidence( evidenceActor );
+		mpOperationAdapterContext_t context;
+		BuildMatchOperationContext( actorSlot, request.opcode, false, context );
+		const mpCompetitionSeries seriesBeforeExecution = matchSeries;
+		const mpCompetitionSeriesReport reportBeforeExecution = matchSeriesReport;
+		const uint64_t seriesIdBeforeExecution = matchSeriesId;
+		const uint64_t linkedSessionBeforeExecution = matchSeriesLinkedSessionId;
+		const bool awaitingMapSessionBeforeExecution =
+			matchSeriesAwaitingMapSession;
+		mpOperationExecutionResult_t execution =
+			matchOperationExecutor.ExecutePassedProposal( scopes[ index ], proposalId,
+				context, matchSession, matchRules, matchProposals, matchSeries );
+
+		if ( execution.continuation.kind != MP_OPERATION_CONTINUATION_NONE &&
+			execution.continuation.kind !=
+				MP_OPERATION_CONTINUATION_PROPOSAL_ACKNOWLEDGE ) {
+			ApplyMatchOperationContinuation( actorSlot, request, execution );
+		}
+		if ( execution.outcome == MP_OPERATION_REJECTED ) {
+			matchSeries = seriesBeforeExecution;
+			matchSeriesReport = reportBeforeExecution;
+			matchSeriesId = seriesIdBeforeExecution;
+			matchSeriesLinkedSessionId = linkedSessionBeforeExecution;
+			matchSeriesAwaitingMapSession = awaitingMapSessionBeforeExecution;
+		}
+		ApplyMatchOperationLegacyMirror( actorSlot, request, execution );
+		ObserveMatchEvidence( evidenceActor, context.localOperator );
+		if ( execution.outcome == MP_OPERATION_APPLIED &&
+			matchSession.GetPhase() == COUNTDOWN ) {
+			StartMatchMVDIfRequired();
+		}
+		if ( execution.outcome == MP_OPERATION_APPLIED &&
+			matchSession.GetPhase() == GAMEREVIEW ) {
+			const mpMatchTransitionView &transition = matchSession.GetLastTransition();
+			int forfeitingSide = MP_MATCH_SIDE_NONE;
+			if ( request.hasTeamTarget ) {
+				MPOperationMapProtocolTeam( request.teamTarget, forfeitingSide );
+			}
+			RecordMatchEvidenceResult( transition.reason, transition.authorizer,
+				forfeitingSide );
+		}
+
+		// Terminal proposals are consumed only after their operation and any
+		// adapter/persistence work reaches a definitive result.  Rejections are
+		// definitive too; retaining them would retry a stale destructive action
+		// every frame.
+		mpOperationAdapterContext_t acknowledgeContext;
+		BuildMatchOperationContext( actorSlot, request.opcode, false,
+			acknowledgeContext );
+		acknowledgeContext.expectedProposalRevision = matchProposals.GetRevision();
+		const mpOperationExecutionResult_t acknowledged =
+			matchOperationExecutor.AcknowledgePassedProposal( scopes[ index ],
+				proposalId, acknowledgeContext, matchSession, matchRules,
+				matchProposals, matchSeries );
+		if ( acknowledged.outcome == MP_OPERATION_REJECTED ) {
+			gameLocal.Warning( "could not consume proposal %llu after execution (reason %d)",
+				static_cast<unsigned long long>( proposalId ), acknowledged.reason );
+		}
+		ObserveMatchEvidence( evidenceActor, context.localOperator );
+		ClearMatchOperationSensitiveArguments( request );
+	}
+}
+
+bool idMultiplayerGame::MatchOperationRateLimitAccepted( int clientNum,
+		const mpMatchOperationDescriptor_t &descriptor ) {
+	if ( descriptor.cooldownClass == MP_MATCH_COOLDOWN_NONE ) {
+		return true;
+	}
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ||
+		descriptor.cooldownClass <= MP_MATCH_COOLDOWN_NONE ||
+		descriptor.cooldownClass >= MP_MATCH_COOLDOWN_COUNT ) {
+		return false;
+	}
+	const int now = Max( 0, gameLocal.time );
+	int &deadline = matchOperationNextAllowedTime[ clientNum ][ descriptor.cooldownClass ];
+	if ( now < deadline ) {
+		return false;
+	}
+	static const int delays[ MP_MATCH_COOLDOWN_COUNT ] = { 0, 250, 1000, 2000 };
+	deadline = now > 0x7fffffff - delays[ descriptor.cooldownClass ] ?
+		0x7fffffff : now + delays[ descriptor.cooldownClass ];
+	return true;
+}
+
+void idMultiplayerGame::ClearMatchOperationTransportSlot( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+	lastMatchRequestId[ clientNum ] = 0;
+	lastMatchRequestResult[ clientNum ].Clear();
+	lastMatchRequestResultValid[ clientNum ] = false;
+	memset( matchOperationNextAllowedTime[ clientNum ], 0,
+		sizeof( matchOperationNextAllowedTime[ clientNum ] ) );
+	// A slot's authentication exchange and view delivery cursor belong to its
+	// network connection, never to the numeric slot.  Reset them even when a
+	// disconnect raced participant binding so the next occupant cannot inherit
+	// a privileged result, cooldown, challenge, or suppressed initial view.
+	matchRefereeAuthentication.InvalidateSlot( clientNum );
+	matchViewSentRevision[ clientNum ] = 0;
+}
+
+bool idMultiplayerGame::ApplyMatchOperationContinuation( int clientNum,
+		const mpMatchOperationRequest_t &request,
+		mpOperationExecutionResult_t &execution ) {
+	const mpOperationContinuationKind_t kind = execution.continuation.kind;
+	if ( kind == MP_OPERATION_CONTINUATION_NONE ) {
+		return true;
+	}
+	if ( kind == MP_OPERATION_CONTINUATION_POLICY_RATE_LIMIT ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_COOLDOWN;
+		return false;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_REFEREE_AUTHENTICATE ) {
+		const mpMatchParticipantState *actor =
+			matchSession.FindParticipant( execution.continuation.actor );
+		const mpMatchOperationArgument_t *credential = MatchOperationArgument(
+			request, MP_MATCH_ARG_CREDENTIAL );
+		if ( actor == NULL || actor->slot != clientNum ||
+			actor->slotGeneration != request.actorBindingGeneration ||
+			!actor->human || actor->active ||
+			matchSession.FindRosterSeat( actor->id ) >= 0 || credential == NULL ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_NOT_AUTHORIZED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED;
+			execution.continuation.Clear();
+			return false;
+		}
+
+		mpRefereeAuthBinding binding;
+		binding.sessionId = matchSession.GetSessionId();
+		binding.participantSequence = actor->id.SequencePart();
+		binding.slot = clientNum;
+		binding.slotGeneration = actor->slotGeneration;
+		const int64_t now = Max( 0, gameLocal.time );
+
+		if ( MatchAuthIsChallengeRequest( credential ) ) {
+			mpRefereeAuthNonce nonce;
+			memset( &nonce, 0, sizeof( nonce ) );
+			if ( !sys->SecureRandomBytes( nonce.bytes, sizeof( nonce.bytes ) ) ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_INVARIANT;
+				execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+				execution.continuation.Clear();
+				return false;
+			}
+			mpRefereeAuthChallenge challenge;
+			challenge.Clear();
+			const mpRefereeAuthChallengeResult_t issued =
+				matchRefereeAuthentication.IssueChallenge( binding, now, nonce,
+					challenge );
+			MPRefereeAuthSecureZero( &nonce, sizeof( nonce ) );
+			if ( issued == MP_REFEREE_AUTH_CHALLENGE_ISSUED &&
+				SendRefereeAuthChallenge( clientNum, challenge ) ) {
+				challenge.Clear();
+				execution.continuation.Clear();
+				// NEEDS_ADAPTER intentionally maps to a non-authorizing pending
+				// result while the client computes the proof.
+				return true;
+			}
+			challenge.Clear();
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_NOT_AUTHORIZED;
+			execution.protocolReason = issued == MP_REFEREE_AUTH_CHALLENGE_THROTTLED ?
+				MP_MATCH_PROTOCOL_REASON_COOLDOWN :
+				MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED;
+			execution.continuation.Clear();
+			return false;
+		}
+
+		uint64_t challengeGeneration = 0;
+		mpRefereeAuthProof proof;
+		MPRefereeAuthSecureZero( proof.bytes, sizeof( proof.bytes ) );
+		const bool parsed = ParseMatchAuthProofCredential( credential,
+			challengeGeneration, proof );
+		const mpRefereeAuthVerifyResult_t verified =
+			matchRefereeAuthentication.VerifyProof( binding, now,
+				parsed ? challengeGeneration : 0, proof );
+		MPRefereeAuthSecureZero( proof.bytes, sizeof( proof.bytes ) );
+		challengeGeneration = 0;
+		if ( verified != MP_REFEREE_AUTH_VERIFY_AUTHENTICATED ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_NOT_AUTHORIZED;
+			execution.protocolReason = verified == MP_REFEREE_AUTH_VERIFY_THROTTLED ?
+				MP_MATCH_PROTOCOL_REASON_COOLDOWN :
+				MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED;
+			execution.continuation.Clear();
+			return false;
+		}
+
+		// Referee observation is deliberately exclusive with a playing, captain,
+		// coach or substitute identity.  This prevents an authenticated observer
+		// from retaining a second tactical audience through an old role bundle.
+		const mpMatchRoleMask_t refereeRoles =
+			( actor->roles & ~MPMatchRosterPrincipalRoleMask() &
+				~MPMatchRoleBit( MP_MATCH_ROLE_BROADCASTER ) ) |
+			MPMatchRoleBit( MP_MATCH_ROLE_REFEREE );
+		const mpMatchMutationResult mutation = matchSession.SetParticipantRoles(
+			actor->id, refereeRoles,
+			matchSession.GetSessionRevision() );
+		if ( mutation.WasRejected() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.sessionReason = mutation.reason;
+		} else {
+			execution.outcome = mutation.WasApplied() ?
+				MP_OPERATION_APPLIED : MP_OPERATION_NO_CHANGE;
+			execution.reason = MP_OPERATION_REASON_NONE;
+			execution.resultingSessionRevision = matchSession.GetSessionRevision();
+		}
+		execution.continuation.Clear();
+		return !mutation.WasRejected();
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_REFEREE_LOGOUT ) {
+		const mpMatchParticipantState *actor =
+			matchSession.FindParticipant( execution.continuation.actor );
+		if ( actor == NULL || actor->slot != clientNum ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_PARTICIPANT_UNKNOWN;
+			execution.continuation.Clear();
+			return false;
+		}
+		const mpMatchRoleMask_t playerRoles =
+			( actor->roles & ~MPMatchRoleBit( MP_MATCH_ROLE_REFEREE ) ) |
+			MPMatchRoleBit( MP_MATCH_ROLE_PLAYER );
+		const mpMatchMutationResult mutation = matchSession.SetParticipantRoles(
+			actor->id, playerRoles,
+			matchSession.GetSessionRevision() );
+		matchRefereeAuthentication.InvalidateSlot( clientNum );
+		if ( mutation.WasRejected() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.sessionReason = mutation.reason;
+		} else {
+			execution.outcome = mutation.WasApplied() ?
+				MP_OPERATION_APPLIED : MP_OPERATION_NO_CHANGE;
+			execution.reason = MP_OPERATION_REASON_NONE;
+			execution.resultingSessionRevision = matchSession.GetSessionRevision();
+		}
+		execution.continuation.Clear();
+		return !mutation.WasRejected();
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_TEAM_CHANGE ) {
+		if ( clientNum < 0 || clientNum >= gameLocal.numClients ||
+			!execution.continuation.participant.IsValid() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_TARGET_ALIGNMENT;
+			execution.continuation.Clear();
+			return false;
+		}
+		if ( execution.continuation.side == MP_MATCH_SIDE_NONE ) {
+			const mpParticipantId spectator = execution.continuation.participant;
+			if ( !ApplyMatchSpectatorTransition( spectator, execution ) ) {
+				return false;
+			}
+			mpMatchTeamsTransactionPlan_t legacyPlan;
+			legacyPlan.Clear();
+			legacyPlan.incomingParticipant = spectator;
+			ApplyMatchTeamsPlanToLegacy( legacyPlan );
+			return true;
+		}
+		const mpMatchTeamsPolicy_t policy = BuildMatchTeamsPolicy();
+		const mpMatchTeamsJoinDecision_t decision = matchTeams.EvaluateJoin(
+			matchSession, execution.continuation.participant,
+			execution.continuation.side, 0, policy,
+			mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ) );
+		if ( decision.disposition == MP_MATCH_TEAMS_JOIN_NO_CHANGE ) {
+			execution.outcome = MP_OPERATION_NO_CHANGE;
+			execution.reason = MP_OPERATION_REASON_NONE;
+			execution.continuation.Clear();
+			return true;
+		}
+		if ( decision.disposition == MP_MATCH_TEAMS_JOIN_QUEUE ) {
+			const mpMatchTeamsMutationResult_t queued = matchTeams.JoinQueue(
+				matchSession, execution.continuation.participant,
+				execution.continuation.side, policy,
+				mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+				matchTeams.GetRevision() );
+			execution.outcome = queued.WasRejected() ?
+				MP_OPERATION_REJECTED : ( queued.WasApplied() ?
+					MP_OPERATION_APPLIED : MP_OPERATION_NO_CHANGE );
+			execution.reason = queued.WasRejected() ?
+				MP_OPERATION_REASON_CORE_REJECTED : MP_OPERATION_REASON_NONE;
+			execution.protocolReason = queued.WasRejected() ?
+				MP_MATCH_PROTOCOL_REASON_CONFLICT : MP_MATCH_PROTOCOL_REASON_OK;
+			execution.continuation.Clear();
+			return !queued.WasRejected();
+		}
+		if ( !ApplyMatchTeamsTransaction( decision, execution ) ) {
+			return false;
+		}
+		ApplyMatchTeamsPlanToLegacy( decision.plan );
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_TEAM_LOCK ) {
+		const mpMatchOperationArgument_t *enabled = MatchOperationArgument(
+			request, MP_MATCH_ARG_ENABLED );
+		if ( enabled == NULL ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_INVARIANT;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+			execution.continuation.Clear();
+			return false;
+		}
+		const mpMatchTeamsMutationResult_t mutation = matchTeams.SetSideLocked(
+			matchSession, execution.continuation.side,
+			enabled->value.unsignedValue != 0, matchTeams.GetRevision() );
+		if ( mutation.WasRejected() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+		execution.outcome = mutation.WasApplied() ?
+			MP_OPERATION_APPLIED : MP_OPERATION_NO_CHANGE;
+		execution.reason = MP_OPERATION_REASON_NONE;
+		if ( mutation.WasApplied() && matchEvidence.IsInitialized() ) {
+			mpEvidenceRosterEvent event;
+			memset( &event, 0, sizeof( event ) );
+			event.action = MP_EVIDENCE_ROSTER_LOCK_CHANGED;
+			event.seat = MP_MATCH_EVIDENCE_NO_ROSTER_SEAT;
+			event.side = static_cast<int8_t>( execution.continuation.side );
+			event.role = MP_EVIDENCE_ROSTER_PLAYER;
+			event.locked = enabled->value.unsignedValue != 0;
+			event.authorizer = MatchEvidenceActor( execution.continuation.actor );
+			matchEvidence.AppendRosterChange( BuildMatchEvidenceStamp(), event );
+		}
+		execution.continuation.Clear();
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_QUEUE_JOIN ||
+		kind == MP_OPERATION_CONTINUATION_QUEUE_DEFER ||
+		kind == MP_OPERATION_CONTINUATION_QUEUE_LEAVE ) {
+		const mpParticipantId participant = execution.continuation.participant;
+		mpMatchTeamsMutationResult_t mutation;
+		if ( kind == MP_OPERATION_CONTINUATION_QUEUE_JOIN ) {
+			mutation = matchTeams.JoinQueue( matchSession, participant,
+				MP_MATCH_SIDE_NONE, BuildMatchTeamsPolicy(),
+				mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+				matchTeams.GetRevision() );
+		} else {
+			const int position = matchTeams.FindQueuePosition( participant );
+			const mpMatchQueueEntry_t *entry = position >= 0 ?
+				matchTeams.GetQueueEntry( position ) : NULL;
+			if ( entry == NULL ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+				execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+				execution.continuation.Clear();
+				return false;
+			}
+			mutation = kind == MP_OPERATION_CONTINUATION_QUEUE_DEFER ?
+				matchTeams.DeferQueue( matchSession, participant, entry->ticketId,
+					mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+					matchTeams.GetRevision() ) :
+				matchTeams.LeaveQueue( matchSession.GetSessionId(), participant,
+					entry->ticketId, matchTeams.GetRevision() );
+		}
+		execution.outcome = mutation.WasRejected() ? MP_OPERATION_REJECTED :
+			( mutation.WasApplied() ? MP_OPERATION_APPLIED : MP_OPERATION_NO_CHANGE );
+		execution.reason = mutation.WasRejected() ?
+			MP_OPERATION_REASON_CORE_REJECTED : MP_OPERATION_REASON_NONE;
+		execution.protocolReason = mutation.WasRejected() ?
+			MP_MATCH_PROTOCOL_REASON_CONFLICT : MP_MATCH_PROTOCOL_REASON_OK;
+		execution.continuation.Clear();
+		return !mutation.WasRejected();
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_ROSTER_INVITE ) {
+		mpMatchRosterInvitationId_t invitationId = 0;
+		const mpMatchTeamsMutationResult_t mutation =
+			matchTeams.IssueRosterInvitation( matchSession,
+				execution.continuation.participant, execution.continuation.side,
+				execution.continuation.rosterRole, execution.continuation.actor,
+				60000, mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+				matchTeams.GetRevision(), invitationId );
+		execution.outcome = mutation.WasRejected() ? MP_OPERATION_REJECTED :
+			( mutation.WasApplied() ? MP_OPERATION_APPLIED : MP_OPERATION_NO_CHANGE );
+		execution.reason = mutation.WasRejected() ?
+			MP_OPERATION_REASON_CORE_REJECTED : MP_OPERATION_REASON_NONE;
+		execution.protocolReason = mutation.WasRejected() ?
+			MP_MATCH_PROTOCOL_REASON_CONFLICT : MP_MATCH_PROTOCOL_REASON_OK;
+		execution.continuation.Clear();
+		return !mutation.WasRejected();
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_ROSTER_ACCEPT ) {
+		const mpMatchOperationArgument_t *invitation = MatchOperationArgument(
+			request, MP_MATCH_ARG_INVITATION_ID );
+		if ( invitation == NULL ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_INVARIANT;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+			execution.continuation.Clear();
+			return false;
+		}
+		const mpMatchTeamsJoinDecision_t decision =
+			matchTeams.PlanRosterInvitationAcceptance( matchSession,
+				execution.continuation.participant,
+				static_cast<mpMatchRosterInvitationId_t>(
+					invitation->value.unsignedValue ), BuildMatchTeamsPolicy(),
+				mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ) );
+		if ( !ApplyMatchTeamsTransaction( decision, execution ) ) {
+			return false;
+		}
+		ApplyMatchTeamsPlanToLegacy( decision.plan );
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_ROSTER_REMOVE ) {
+		const mpParticipantId removed = execution.continuation.participant;
+		if ( !ApplyMatchSpectatorTransition( removed, execution ) ) {
+			return false;
+		}
+		mpMatchTeamsTransactionPlan_t legacyPlan;
+		legacyPlan.Clear();
+		legacyPlan.incomingParticipant = removed;
+		ApplyMatchTeamsPlanToLegacy( legacyPlan );
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_ROSTER_LEAVE ) {
+		const mpParticipantId leaving = execution.continuation.participant;
+		const mpMatchParticipantState *actor = matchSession.FindParticipant( leaving );
+		if ( actor == NULL || !actor->human || actor->slot != clientNum ||
+			actor->slotGeneration != request.actorBindingGeneration ||
+			!matchSession.CanSelfLeaveRoster( leaving ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_NOT_AUTHORIZED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED;
+			execution.continuation.Clear();
+			return false;
+		}
+		if ( !ApplyMatchSpectatorTransition( leaving, execution ) ) {
+			return false;
+		}
+		mpMatchTeamsTransactionPlan_t legacyPlan;
+		legacyPlan.Clear();
+		legacyPlan.incomingParticipant = leaving;
+		ApplyMatchTeamsPlanToLegacy( legacyPlan );
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_PARTICIPANT_REMOVE ) {
+		const mpParticipantId targetId = execution.continuation.participant;
+		int targetSlot = -1;
+		uint32_t targetGeneration = 0;
+		const mpMatchParticipantState *target =
+			matchSession.FindParticipant( targetId );
+		if ( !targetId.IsValid() || targetId == execution.continuation.actor ||
+			target == NULL || !target->connected || !target->human ||
+			( target->roles & MPMatchRoleBit( MP_MATCH_ROLE_SERVER_OPERATOR ) ) != 0 ||
+			!matchSession.ResolveParticipant( targetId, targetSlot,
+				targetGeneration ) ||
+			( gameLocal.isListenServer && targetSlot == gameLocal.localClientNum ) ||
+			targetSlot < 0 ||
+			targetSlot >= gameLocal.numClients || targetSlot >= MAX_CLIENTS ||
+			target->slot != targetSlot ||
+			target->slotGeneration != targetGeneration ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_TARGET_ALIGNMENT;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED;
+			execution.continuation.Clear();
+			return false;
+		}
+		idEntity *targetEntity = gameLocal.entities[ targetSlot ];
+		if ( targetEntity == NULL ||
+			!targetEntity->IsType( idPlayer::GetClassType() ) ||
+			static_cast<idPlayer *>( targetEntity )->IsFakeClient() ||
+			botManager.IsBot( targetSlot ) ||
+			!networkSystem->ServerDropClient( targetSlot, "#str_07134" ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+		execution.outcome = MP_OPERATION_APPLIED;
+		execution.reason = MP_OPERATION_REASON_NONE;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_OK;
+		execution.resultingSessionRevision = matchSession.GetSessionRevision();
+		execution.continuation.Clear();
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_ROSTER_SUBSTITUTE ) {
+		mpMatchRosterInvitationId_t invitationId = 0;
+		for ( int index = 0; index < matchTeams.GetInvitationCount(); ++index ) {
+			const mpMatchRosterInvitation_t *candidate =
+				matchTeams.GetInvitationByIndex( index );
+			if ( candidate != NULL &&
+				candidate->target == execution.continuation.replacementParticipant &&
+				candidate->side == execution.continuation.side &&
+				candidate->role == execution.continuation.rosterRole &&
+				candidate->IsActiveAt( mpMatchEngineTime::FromMilliseconds(
+					Max( 0, gameLocal.time ) ) ) ) {
+				invitationId = candidate->invitationId;
+				break;
+			}
+		}
+		const mpMatchTeamsJoinDecision_t decision = matchTeams.PlanSubstitution(
+			matchSession, execution.continuation.participant,
+			execution.continuation.replacementParticipant,
+			execution.continuation.side, invitationId, BuildMatchTeamsPolicy(),
+			mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ) );
+		if ( !ApplyMatchTeamsTransaction( decision, execution ) ) {
+			return false;
+		}
+		ApplyMatchTeamsPlanToLegacy( decision.plan );
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_ROLE_ASSIGN ) {
+		const mpMatchParticipantState *target =
+			matchSession.FindParticipant( execution.continuation.participant );
+		if ( target == NULL || !MPMatchRosterRoleIsValid(
+			execution.continuation.rosterRole ) || target->side < 0 ||
+			target->side >= MP_MATCH_SIDE_COUNT ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.continuation.Clear();
+			return false;
+		}
+		mpMatchSession candidate = matchSession;
+		const uint64_t baselineRevision = candidate.GetSessionRevision();
+		const int currentSeat = candidate.FindRosterSeat( target->id );
+		int destinationSeat = -1;
+		if ( currentSeat >= 0 ) {
+			const mpMatchRosterSeat *seat = candidate.GetRosterSeat( currentSeat );
+			if ( seat != NULL && seat->declared &&
+				seat->side == target->side &&
+				seat->role == execution.continuation.rosterRole ) {
+				destinationSeat = currentSeat;
+			}
+		}
+		if ( destinationSeat < 0 ) {
+			for ( int seatIndex = 0; seatIndex < MP_MATCH_MAX_ROSTER_SEATS;
+				++seatIndex ) {
+				const mpMatchRosterSeat *seat = candidate.GetRosterSeat( seatIndex );
+				if ( seat != NULL && seat->declared &&
+					seat->side == target->side &&
+					seat->role == execution.continuation.rosterRole &&
+					!seat->occupant.IsValid() ) {
+					destinationSeat = seatIndex;
+					break;
+				}
+			}
+		}
+		if ( destinationSeat < 0 || ( currentSeat >= 0 &&
+			currentSeat != destinationSeat && candidate.VacateRosterSeat( currentSeat,
+				candidate.GetSessionRevision() ).WasRejected() ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+		mpMatchRoleMask_t roles = 0;
+		const bool desiredActive =
+			MPMatchRosterRoleIsActive( execution.continuation.rosterRole );
+		bool roleStateRejected = !MPMatchTeamsAssignRosterRole( target->roles,
+			execution.continuation.rosterRole, roles );
+		if ( !roleStateRejected && desiredActive ) {
+			roleStateRejected = candidate.SetParticipantRoles( target->id, roles,
+				candidate.GetSessionRevision() ).WasRejected() ||
+				candidate.SetParticipantActive( target->id, true,
+					candidate.GetSessionRevision() ).WasRejected();
+		} else if ( !roleStateRejected ) {
+			roleStateRejected = candidate.SetParticipantActive( target->id, false,
+				candidate.GetSessionRevision() ).WasRejected() ||
+				candidate.SetParticipantRoles( target->id, roles,
+					candidate.GetSessionRevision() ).WasRejected();
+		}
+		if ( roleStateRejected ||
+			( currentSeat != destinationSeat &&
+				candidate.AssignRosterSeat( destinationSeat, target->id,
+					candidate.GetSessionRevision() ).WasRejected() ) ||
+			!candidate.ValidateInvariants() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.continuation.Clear();
+			return false;
+		}
+		matchSession = candidate;
+		ReconcileGameplayPhaseAfterMatchMutation();
+		execution.outcome = matchSession.GetSessionRevision() == baselineRevision ?
+			MP_OPERATION_NO_CHANGE : MP_OPERATION_APPLIED;
+		execution.reason = MP_OPERATION_REASON_NONE;
+		execution.resultingSessionRevision = matchSession.GetSessionRevision();
+		execution.continuation.Clear();
+		mpMatchTeamsTransactionPlan_t mirrorPlan;
+		mirrorPlan.Clear();
+		mirrorPlan.incomingParticipant = target->id;
+		ApplyMatchTeamsPlanToLegacy( mirrorPlan );
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_SERIES_CONTESTANT_BIND ) {
+		const mpParticipantId targetId = execution.continuation.participant;
+		int targetSlot = -1;
+		uint32_t targetGeneration = 0;
+		const mpMatchParticipantState *target =
+			matchSession.FindParticipant( targetId );
+		if ( !targetId.IsValid() || target == NULL || !target->connected ||
+			!target->human || !target->active ||
+			!matchSession.ResolveParticipant( targetId, targetSlot,
+				targetGeneration ) || target->slot != targetSlot ||
+			target->slotGeneration != targetGeneration ||
+			targetSlot < 0 || targetSlot >= MAX_CLIENTS ||
+			targetSlot >= gameLocal.numClients ||
+			execution.continuation.side < 0 ||
+			execution.continuation.side >= MP_SERIES_SIDE_COUNT ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_TARGET_ALIGNMENT;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+		const bool alreadyBound =
+			matchSeriesCompetitionSide[ targetSlot ] == execution.continuation.side &&
+			matchSeriesCompetitionConnection[ targetSlot ] ==
+				matchConnectionId[ targetSlot ] &&
+			matchSeriesContestantSlot[ execution.continuation.side ] == targetSlot &&
+			matchSeriesContestantConnection[ execution.continuation.side ] ==
+				matchConnectionId[ targetSlot ];
+		if ( !alreadyBound && !BindCompetitionSeriesContestant(
+				execution.continuation.side, targetSlot ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+		execution.outcome = alreadyBound ?
+			MP_OPERATION_NO_CHANGE : MP_OPERATION_APPLIED;
+		execution.reason = MP_OPERATION_REASON_NONE;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_OK;
+		execution.resultingSessionRevision = matchSession.GetSessionRevision();
+		execution.continuation.Clear();
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_RULES_APPLY_PROFILE ||
+		kind == MP_OPERATION_CONTINUATION_RULES_APPLY_FIELD ||
+		kind == MP_OPERATION_CONTINUATION_RULES_COMMIT ) {
+		mpCompetitiveRules candidateRules = matchRules;
+		mpRuleCommitResult_t commit;
+		mpRuleValidationFailure_t failure;
+		failure.Clear();
+		const mpMatchRulesValidationContext_t validation =
+			BuildCompetitiveRuleValidationContext();
+
+		if ( kind == MP_OPERATION_CONTINUATION_RULES_APPLY_PROFILE ) {
+			const mpMatchOperationArgument_t *profileArg = MatchOperationArgument(
+				request, MP_MATCH_ARG_PROFILE );
+			const mpMatchProfileDescriptor_t *profile = profileArg != NULL ?
+				MPMatchProfileByKey( profileArg->value.stringValue ) : NULL;
+			mpMatchRulesDraft draft;
+			if ( profile == NULL || !candidateRules.BeginDraftFromProfile(
+				profile->id, gameLocal.gameType, draft, failure ) ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_RULE_STATE;
+				execution.ruleFailure = failure;
+				execution.continuation.Clear();
+				return false;
+			}
+			commit = candidateRules.Commit( draft, validation,
+				MP_RULES_OPEN_FOR_COMMIT );
+		} else if ( kind == MP_OPERATION_CONTINUATION_RULES_APPLY_FIELD ) {
+			const mpMatchOperationArgument_t *fieldArg = MatchOperationArgument(
+				request, MP_MATCH_ARG_SETTING_ID );
+			const mpMatchOperationArgument_t *valueArg = MatchOperationArgument(
+				request, MP_MATCH_ARG_SETTING_VALUE );
+			const mpRuleFieldDescriptor_t *field = fieldArg != NULL ?
+				MPMatchRuleFieldByKey( fieldArg->value.stringValue ) : NULL;
+			mpMatchRulesDraft draft = candidateRules.HasStagedSnapshot() ?
+				candidateRules.BeginDraftForNextWarmup() :
+				candidateRules.BeginDraftFromCommitted();
+			if ( field == NULL || valueArg == NULL ||
+				!ApplyMatchRuleOperationValue( draft, *field, valueArg->value,
+					failure ) ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_RULE_VALUE_TYPE;
+				execution.ruleFailure = failure;
+				execution.continuation.Clear();
+				return false;
+			}
+			commit = candidateRules.Commit( draft, validation,
+				MP_RULES_OPEN_FOR_COMMIT );
+		} else {
+			commit = candidateRules.ApplyStagedAtWarmup( validation );
+		}
+
+		if ( !commit.Succeeded() ||
+			( commit.disposition != MP_RULE_COMMIT_APPLIED &&
+				commit.disposition != MP_RULE_COMMIT_UNCHANGED ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.ruleFailure = commit.failure;
+			execution.continuation.Clear();
+			return false;
+		}
+
+		mpMatchSession candidateSession = matchSession;
+		if ( !ConfigureMatchSessionForRules( candidateSession,
+			candidateRules.Committed(), true ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+		matchRules = candidateRules;
+		matchSession = candidateSession;
+		competitiveRulesValidForSession = true;
+		competitiveRulesFailure = MP_RULE_VALID;
+		const mpMatchProfileDescriptor_t *profile =
+			matchRules.Committed().SourceProfile() >= 0 ?
+			MPMatchProfile( matchRules.Committed().SourceProfile() ) : NULL;
+		if ( profile != NULL ) {
+			g_matchProfile.SetString( profile->key );
+			gameLocal.serverInfo.Set( "g_matchProfile", profile->key );
+			g_matchProfile.ClearModified();
+		}
+		MirrorCompetitiveRulesToLegacy();
+		PublishCompetitiveRulesIdentity();
+		ReconcileMatchEvidenceForCommittedRules();
+		execution.outcome = commit.disposition == MP_RULE_COMMIT_UNCHANGED ?
+			MP_OPERATION_NO_CHANGE : MP_OPERATION_APPLIED;
+		execution.reason = MP_OPERATION_REASON_NONE;
+		execution.ruleFailure = commit.failure;
+		execution.resultingSessionRevision = matchSession.GetSessionRevision();
+		execution.resultingRulesRevision = matchRules.Committed().Revision();
+		execution.resultingRulesDigest = matchRules.Committed().Digest();
+		execution.continuation.Clear();
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_PROPOSAL_CREATE ) {
+		const mpMatchOperationArgument_t *opcodeArg = MatchOperationArgument(
+			request, MP_MATCH_ARG_PROPOSED_OPCODE );
+		if ( opcodeArg == NULL || nextMatchProposalId == ~static_cast<mpProposalId_t>( 0 ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_INVARIANT;
+			return false;
+		}
+		mpProposalCreateParams_t params;
+		params.Clear();
+		params.sessionId = matchSession.GetSessionId();
+		params.proposalId = nextMatchProposalId + 1;
+		params.scope = execution.continuation.proposalScope;
+		params.createdAt = mpProposalEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) );
+		const int64_t expiry = static_cast<int64_t>( Max( 0, gameLocal.time ) ) + 30000;
+		params.expiresAt = mpProposalEngineTime::FromMilliseconds( expiry );
+		params.caller = execution.continuation.actor.SequencePart();
+		params.callerVotePolicy = MP_PROPOSAL_CALLER_VOTE_YES;
+		params.operation.Clear();
+		params.operation.schemaVersion = MP_MATCH_PROTOCOL_SCHEMA_VERSION;
+		params.operation.sessionId = request.sessionId;
+		params.operation.requestId = request.requestId;
+		params.operation.opcode = static_cast<mpMatchOperationOpcode_t>(
+			opcodeArg->value.enumValue );
+		params.operation.expectedSessionRevision = request.expectedSessionRevision;
+		params.operation.expectedControlRevision = request.expectedControlRevision;
+		params.operation.actorSlot = request.actorSlot;
+		params.operation.actorBindingGeneration = request.actorBindingGeneration;
+		params.operation.hasParticipantTarget = request.hasParticipantTarget;
+		params.operation.participantTarget = request.participantTarget;
+		params.operation.hasTeamTarget = request.hasTeamTarget;
+		params.operation.teamTarget = request.teamTarget;
+		for ( int index = 0; index < request.argumentCount; ++index ) {
+			const mpMatchOperationArgument_t &argument = request.arguments[ index ];
+			if ( argument.fieldId < MP_MATCH_NESTED_ARGUMENT_BASE ) {
+				continue;
+			}
+			if ( params.operation.argumentCount >= MP_MATCH_PROTOCOL_MAX_ARGUMENTS ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_UNREPRESENTABLE;
+				return false;
+			}
+			mpMatchOperationArgument_t &target =
+				params.operation.arguments[ params.operation.argumentCount++ ];
+			target = argument;
+			target.fieldId = static_cast<unsigned char>(
+				argument.fieldId - MP_MATCH_NESTED_ARGUMENT_BASE );
+		}
+		mpMatchProtocolError_t protocolError;
+		if ( !MPMatchProtocolValidateRequest( params.operation, &protocolError ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_PROTOCOL;
+			execution.protocolReason = protocolError.reason;
+			return false;
+		}
+		for ( int index = 0; index < MP_MATCH_MAX_PARTICIPANTS; ++index ) {
+			const mpMatchParticipantState *candidate = matchSession.GetParticipantByIndex( index );
+			if ( candidate == NULL || !candidate->connected || !candidate->human ||
+				!candidate->active || ( params.scope == MP_PROPOSAL_SCOPE_TEAM_A && candidate->side != 0 ) ||
+				( params.scope == MP_PROPOSAL_SCOPE_TEAM_B && candidate->side != 1 ) ) {
+				continue;
+			}
+			if ( params.electorateCount >= MP_PROPOSAL_MAX_ELECTORATE ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_INVARIANT;
+				return false;
+			}
+			params.electorate[ params.electorateCount ].participant =
+				candidate->id.SequencePart();
+			params.electorate[ params.electorateCount ].human = true;
+			++params.electorateCount;
+		}
+		if ( params.electorateCount == 0 ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_PARTICIPANT_INACTIVE;
+			return false;
+		}
+		params.requiredYes = static_cast<unsigned char>( params.electorateCount / 2 + 1 );
+		params.requiredQuorum = params.requiredYes;
+		const mpProposalMutationResult_t mutation = matchProposals.Create(
+			params, matchProposals.GetRevision() );
+		if ( mutation.WasRejected() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.proposalReason = mutation.reason;
+			return false;
+		}
+		nextMatchProposalId = params.proposalId;
+		execution.outcome = mutation.WasApplied() ? MP_OPERATION_APPLIED : MP_OPERATION_NO_CHANGE;
+		execution.reason = MP_OPERATION_REASON_NONE;
+		execution.continuation.Clear();
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_SERIES_CONFIGURE_PROFILE ) {
+		const mpMatchOperationArgument_t *profileArgument = MatchOperationArgument(
+			request, MP_MATCH_ARG_SERIES_PROFILE );
+		const mpSeriesProfileDescriptor *profile = profileArgument != NULL ?
+			MPSeriesProfileByKey( profileArgument->value.stringValue ) : NULL;
+		int duelSlots[ MP_SERIES_SIDE_COUNT ];
+		uint64_t duelConnections[ MP_SERIES_SIDE_COUNT ];
+		if ( profile == NULL || !IsCompetitionSeriesModeSupported() ||
+			!CollectCompetitionSeriesContestants( duelSlots, duelConnections ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_SERIES_STATE;
+			execution.seriesReason = profile == NULL ?
+				MP_SERIES_REASON_UNKNOWN_PROFILE : MP_SERIES_REASON_INVALID_GAME_TYPE;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+
+		uint64_t newSeriesId = 0;
+		for ( int attempt = 0; attempt < 4 && newSeriesId == 0; ++attempt ) {
+			if ( !sys->SecureRandomBytes( &newSeriesId, sizeof( newSeriesId ) ) ) {
+				newSeriesId = 0;
+				break;
+			}
+		}
+		if ( newSeriesId == 0 ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_INVARIANT;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+			execution.continuation.Clear();
+			return false;
+		}
+
+		char mapStorage[ MP_SERIES_MAX_MAP_POOL ][ MP_SERIES_MAP_TOKEN_BYTES ];
+		const char *mapTokens[ MP_SERIES_MAX_MAP_POOL ];
+		int mapCount = 0;
+		mpSeriesReason_t buildReason = MP_SERIES_REASON_NONE;
+		if ( !BuildCompetitionSeriesMapPool( *profile, mapStorage, mapTokens,
+			mapCount, buildReason ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.seriesReason = buildReason;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+		const uint64_t seed = newSeriesId ^ matchSession.GetSessionId() ^
+			matchRules.Committed().Digest();
+		mpSeriesConfiguration configuration;
+		memset( &configuration, 0, sizeof( configuration ) );
+		if ( !MPSeriesBuildProfileDraft( profile->id, gameLocal.gameType, seed,
+			static_cast<int>( seed & 1ull ), gameLocal.IsTeamGame(), mapTokens,
+			mapCount, configuration, buildReason ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.seriesReason = buildReason;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+		mpCompetitionSeries candidate = matchSeries;
+		const mpSeriesMutationResult configured = candidate.Configure(
+			configuration, candidate.GetRevision() );
+		if ( configured.WasRejected() || !candidate.ValidateInvariants() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.seriesReason = configured.reason;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+			execution.continuation.Clear();
+			return false;
+		}
+
+		int boundSide[ MAX_CLIENTS ];
+		uint64_t boundConnection[ MAX_CLIENTS ];
+		for ( int slot = 0; slot < MAX_CLIENTS; ++slot ) {
+			boundSide[ slot ] = MP_SERIES_SIDE_NONE;
+			boundConnection[ slot ] = 0;
+		}
+		if ( gameLocal.IsTeamGame() ) {
+			for ( int index = 0; index < MP_MATCH_MAX_PARTICIPANTS; ++index ) {
+				const mpMatchParticipantState *participant =
+					matchSession.GetParticipantByIndex( index );
+				if ( participant == NULL || !participant->connected ||
+					!participant->human || !participant->active || participant->side < 0 ||
+					participant->side >= MP_SERIES_SIDE_COUNT || participant->slot < 0 ||
+					participant->slot >= MAX_CLIENTS ||
+					matchConnectionId[ participant->slot ] == 0 ) {
+					continue;
+				}
+				boundSide[ participant->slot ] = participant->side;
+				boundConnection[ participant->slot ] =
+					matchConnectionId[ participant->slot ];
+			}
+		} else {
+			for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+				boundSide[ duelSlots[ side ] ] = side;
+				boundConnection[ duelSlots[ side ] ] = duelConnections[ side ];
+			}
+		}
+		mpCompetitionSeriesReport reportCandidate;
+		if ( !InitializeCompetitionSeriesReport( candidate, newSeriesId,
+			duelSlots, reportCandidate ) ||
+			!PersistCompetitionSeriesCandidate( candidate, reportCandidate,
+				newSeriesId, matchSession.GetSessionId() ) ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+			execution.continuation.Clear();
+			return false;
+		}
+
+		matchSeries = candidate;
+		matchSeriesReport = reportCandidate;
+		matchSeriesId = newSeriesId;
+		matchSeriesLinkedSessionId = matchSession.GetSessionId();
+		matchSeriesNeedsBindingRecovery = false;
+		matchSeriesAwaitingMapSession = false;
+		for ( int slot = 0; slot < MAX_CLIENTS; ++slot ) {
+			matchSeriesCompetitionSide[ slot ] = boundSide[ slot ];
+			matchSeriesCompetitionConnection[ slot ] = boundConnection[ slot ];
+		}
+		for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+			matchSeriesContestantSlot[ side ] = gameLocal.gameType == GAME_DUEL ?
+				duelSlots[ side ] : -1;
+			matchSeriesContestantConnection[ side ] =
+				gameLocal.gameType == GAME_DUEL ? duelConnections[ side ] : 0;
+			matchSeriesGameSideForCompetition[ side ] = side;
+		}
+		execution.outcome = MP_OPERATION_APPLIED;
+		execution.reason = MP_OPERATION_REASON_NONE;
+		execution.seriesReason = MP_SERIES_REASON_NONE;
+		execution.resultingSeriesRevision = matchSeries.GetRevision();
+		execution.continuation.Clear();
+		if ( !matchEvidence.IsInitialized() ) {
+			BeginMatchEvidence();
+		}
+		LinkCurrentSeriesEvidence();
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_SERIES_ADVANCE_AND_LOAD_MAP ) {
+		mpCompetitionSeries candidate = matchSeries;
+		mpCompetitionSeriesReport reportCandidate = matchSeriesReport;
+		if ( candidate.GetState() == MP_SERIES_MAP_COMPLETE ) {
+			const mpSeriesMutationResult advanced = candidate.AdvanceAfterMap(
+				candidate.GetRevision() );
+			if ( advanced.WasRejected() || !candidate.ValidateInvariants() ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+				execution.seriesReason = advanced.reason;
+				execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+				execution.continuation.Clear();
+				return false;
+			}
+		}
+		if ( candidate.GetState() == MP_SERIES_COMPLETE ) {
+			const mpParticipantId reportAuthorizer = gameLocal.isListenServer &&
+				clientNum == gameLocal.localClientNum ? mpParticipantId::Invalid() :
+				execution.continuation.actor;
+			if ( !FinalizeCompetitionSeriesReport( candidate, reportCandidate,
+				reportAuthorizer ) ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+				execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+				execution.continuation.Clear();
+				return false;
+			}
+			matchSeries = candidate;
+			matchSeriesReport = reportCandidate;
+			execution.outcome = MP_OPERATION_APPLIED;
+			execution.reason = MP_OPERATION_REASON_NONE;
+			execution.seriesReason = MP_SERIES_REASON_NONE;
+			execution.resultingSeriesRevision = matchSeries.GetRevision();
+			execution.continuation.Clear();
+			return true;
+		}
+		const char *nextMap = candidate.GetNextMapToken();
+		return ScheduleCompetitionSeriesMap( candidate, nextMap, execution );
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_SERIES_MATCH_RESULT ) {
+		mpMatchSession candidateSession = matchSession;
+		if ( request.opcode == MP_MATCH_OP_ABORT &&
+			candidateSession.GetPhase() == COUNTDOWN ) {
+			const mpMatchMutationResult aborted = candidateSession.TransitionPhase(
+				WARMUP, MP_MATCH_TRANSITION_COUNTDOWN_ABORTED,
+				execution.continuation.actor, candidateSession.GetSessionRevision() );
+			if ( aborted.WasRejected() ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+				execution.sessionReason = aborted.reason;
+				execution.continuation.Clear();
+				return false;
+			}
+			matchSession = candidateSession;
+			execution.outcome = MP_OPERATION_APPLIED;
+			execution.reason = MP_OPERATION_REASON_NONE;
+			execution.resultingSessionRevision = matchSession.GetSessionRevision();
+			execution.continuation.Clear();
+			return true;
+		}
+
+		if ( request.opcode == MP_MATCH_OP_FORFEIT ) {
+			int forfeitingSide = execution.continuation.side;
+			if ( gameLocal.IsTeamGame() ) {
+				forfeitingSide = MP_SERIES_SIDE_NONE;
+				for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+					if ( matchSeriesGameSideForCompetition[ side ] ==
+						execution.continuation.side ) {
+						forfeitingSide = side;
+					}
+				}
+			}
+			if ( forfeitingSide < 0 || forfeitingSide >= MP_SERIES_SIDE_COUNT ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_TARGET_ALIGNMENT;
+				execution.continuation.Clear();
+				return false;
+			}
+		}
+		const mpMatchTransitionReason_t transitionReason =
+			request.opcode == MP_MATCH_OP_FORFEIT ? MP_MATCH_TRANSITION_FORFEIT :
+			MP_MATCH_TRANSITION_MATCH_ABORTED;
+		const mpMatchMutationResult transitioned = candidateSession.TransitionPhase(
+			GAMEREVIEW, transitionReason, execution.continuation.actor,
+			candidateSession.GetSessionRevision() );
+		if ( transitioned.WasRejected() || !candidateSession.ValidateInvariants() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.sessionReason = transitioned.reason;
+			execution.continuation.Clear();
+			return false;
+		}
+		matchSession = candidateSession;
+		execution.outcome = MP_OPERATION_APPLIED;
+		execution.reason = MP_OPERATION_REASON_NONE;
+		execution.resultingSessionRevision = matchSession.GetSessionRevision();
+		execution.resultingSeriesRevision = matchSeries.GetRevision();
+		execution.continuation.Clear();
+		return true;
+	}
+
+	if ( kind == MP_OPERATION_CONTINUATION_SERIES_PERSIST ) {
+		if ( matchSeries.GetState() == MP_SERIES_READY ) {
+			mpCompetitionSeries candidate = matchSeries;
+			return ScheduleCompetitionSeriesMap( candidate,
+				candidate.GetNextMapToken(), execution );
+		}
+		if ( matchSeries.GetState() == MP_SERIES_CANCELLED ) {
+			mpCompetitionSeries candidate = matchSeries;
+			mpCompetitionSeriesReport reportCandidate = matchSeriesReport;
+			const mpParticipantId reportAuthorizer = gameLocal.isListenServer &&
+				clientNum == gameLocal.localClientNum ? mpParticipantId::Invalid() :
+				execution.continuation.actor;
+			if ( !FinalizeCompetitionSeriesReport( candidate, reportCandidate,
+				reportAuthorizer ) ) {
+				execution.outcome = MP_OPERATION_REJECTED;
+				execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+				execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+				execution.continuation.Clear();
+				return false;
+			}
+			matchSeriesReport = reportCandidate;
+		} else if ( !PersistCompetitionSeries() ) {
+			execution.outcome = MP_OPERATION_REJECTED;
+			execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+			execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+			execution.continuation.Clear();
+			return false;
+		}
+		execution.resultingSeriesRevision = matchSeries.GetRevision();
+		execution.continuation.Clear();
+		return true;
+	}
+
+	// Unsupported adapter work fails closed.  No command string or partially
+	// populated legacy structure is used as an escape hatch.
+	execution.outcome = MP_OPERATION_REJECTED;
+	execution.reason = MP_OPERATION_REASON_UNREPRESENTABLE;
+	execution.continuation.Clear();
+	return false;
+}
+
+void idMultiplayerGame::ApplyMatchOperationLegacyMirror( int clientNum,
+		const mpMatchOperationRequest_t &request,
+		const mpOperationExecutionResult_t &execution ) {
+	if ( execution.outcome != MP_OPERATION_APPLIED &&
+		execution.outcome != MP_OPERATION_NO_CHANGE ) {
+		return;
+	}
+	if ( request.opcode == MP_MATCH_OP_READY_SET && clientNum >= 0 &&
+		clientNum < gameLocal.numClients ) {
+		idEntity *entity = gameLocal.entities[ clientNum ];
+		const mpMatchOperationArgument_t *enabled =
+			MatchOperationArgument( request, MP_MATCH_ARG_ENABLED );
+		if ( entity != NULL && entity->IsType( idPlayer::GetClassType() ) && enabled != NULL ) {
+			idPlayer *player = static_cast<idPlayer *>( entity );
+			const bool ready = enabled->value.unsignedValue != 0;
+			const bool changed = player->GetReady() != ready;
+			player->SetReady( ready );
+			if ( changed && !player->wantSpectate ) {
+				AddChatLine( common->GetLocalizedString( "#str_107180" ),
+					gameLocal.userInfo[ clientNum ].GetString( "ui_name" ),
+					ready ? common->GetLocalizedString( "#str_104300" ) :
+						common->GetLocalizedString( "#str_104301" ) );
+			}
+		}
+	}
+	if ( gameState != NULL && gameState->GetMPGameState() != matchSession.GetPhase() &&
+		( request.opcode == MP_MATCH_OP_FORCE_READY ||
+			request.opcode == MP_MATCH_OP_FORFEIT || request.opcode == MP_MATCH_OP_ABORT ||
+			request.opcode == MP_MATCH_OP_READY_SET ) ) {
+		const mpMatchTransitionView &transition = matchSession.GetLastTransition();
+		int forfeitingSide = MP_MATCH_SIDE_NONE;
+		if ( request.opcode == MP_MATCH_OP_FORFEIT && request.hasTeamTarget &&
+			!MPOperationMapProtocolTeam( request.teamTarget, forfeitingSide ) ) {
+			gameLocal.Warning( "typed forfeit lost its validated side before gameplay mirroring" );
+			return;
+		}
+		if ( transition.to != matchSession.GetPhase() ||
+			!CommitMatchPhaseTransition( transition.to, transition.reason,
+				transition.authorizer, forfeitingSide ) ) {
+			gameLocal.Warning( "typed match transition could not publish its gameplay effects" );
+			return;
+		}
+		if ( !gameState->NewState( matchSession.GetPhase() ) ) {
+			gameLocal.Warning( "typed match transition could not be mirrored to gameplay state" );
+			return;
+		}
+		if ( matchSession.GetPhase() == WARMUP ) {
+			gameState->SetNextMPGameState( INACTIVE );
+			gameState->SetNextMPGameStateTime( 0 );
+		}
+	}
+}
+
+void idMultiplayerGame::ServerReceiveMatchOperation( int clientNum,
+		const idBitMsg &msg ) {
+	if ( !gameLocal.isServer || clientNum < 0 || clientNum >= gameLocal.numClients ||
+		clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+	mpMatchOperationRequest_t request;
+	request.Clear();
+	mpMatchProtocolError_t protocolError;
+	if ( !MPMatchProtocolDecodeRequest( msg, request, MP_MATCH_TRAILING_REJECT,
+		&protocolError ) ) {
+		gameLocal.Warning( "rejected malformed match operation from client %d (reason %d)",
+			clientNum, protocolError.reason );
+		MPRefereeAuthSecureZero( &request, sizeof( request ) );
+		return;
+	}
+	// Establish the current connection-scoped principal before consulting the
+	// replay cache.  Otherwise a delayed packet from a previous occupant could
+	// retrieve that occupant's result or advance the new occupant's request-id
+	// window before the executor discovers the stale binding.
+	mpOperationExecutionResult_t ingress;
+	ingress.Clear();
+	mpParticipantId ingressActor = mpParticipantId::Invalid();
+	if ( !matchSessionOperational ||
+		request.sessionId != matchSession.GetSessionId() ) {
+		ingress.reason = MP_OPERATION_REASON_SESSION_MISMATCH;
+	} else if ( request.actorSlot != clientNum ) {
+		ingress.reason = MP_OPERATION_REASON_TRANSPORT_MISMATCH;
+	} else if ( !matchSession.ResolveSlotBinding( clientNum,
+			request.actorBindingGeneration, ingressActor ) ) {
+		ingress.reason = MP_OPERATION_REASON_BINDING_STALE;
+	}
+	if ( ingress.reason != MP_OPERATION_REASON_NONE ) {
+		SendMatchOperationResult( clientNum,
+			MakeMatchOperationResult( request, ingress ) );
+		ClearMatchOperationSensitiveArguments( request );
+		return;
+	}
+	if ( request.requestId <= lastMatchRequestId[ clientNum ] ) {
+		if ( request.requestId == lastMatchRequestId[ clientNum ] &&
+			lastMatchRequestResultValid[ clientNum ] ) {
+			SendMatchOperationResult( clientNum, lastMatchRequestResult[ clientNum ] );
+			ClearMatchOperationSensitiveArguments( request );
+			return;
+		}
+		mpOperationExecutionResult_t replay;
+		replay.Clear();
+		replay.reason = MP_OPERATION_REASON_PROTOCOL;
+		replay.protocolReason = MP_MATCH_PROTOCOL_REASON_INVALID_REQUEST_ID;
+		SendMatchOperationResult( clientNum, MakeMatchOperationResult( request, replay ) );
+		ClearMatchOperationSensitiveArguments( request );
+		return;
+	}
+	lastMatchRequestId[ clientNum ] = request.requestId;
+	// Synchronize all independently versioned aggregates before evaluating the
+	// client's compare-and-swap token.  Clock-only samples advance viewRevision,
+	// not controlRevision, and therefore do not invalidate legitimate actions.
+	AdvanceMatchViewRevision();
+	if ( request.expectedControlRevision != matchControlRevision ) {
+		mpOperationExecutionResult_t stale;
+		stale.Clear();
+		stale.reason = MP_OPERATION_REASON_PROTOCOL;
+		stale.protocolReason = MP_MATCH_PROTOCOL_REASON_STALE_REVISION;
+		ClearMatchOperationSensitiveArguments( request );
+		const mpMatchOperationResult_t result = MakeMatchOperationResult(
+			request, stale );
+		lastMatchRequestResult[ clientNum ] = result;
+		lastMatchRequestResultValid[ clientNum ] = true;
+		SendMatchOperationResult( clientNum, result );
+		SendChangedMatchViews();
+		return;
+	}
+
+	mpOperationAdapterContext_t context;
+	BuildMatchOperationContext( clientNum, request.opcode, true, context );
+	mpParticipantId evidenceActor = mpParticipantId::Invalid();
+	matchSession.ResolveSlotBinding( clientNum, request.actorBindingGeneration,
+		evidenceActor );
+	const mpCompetitionSeries seriesBeforeExecution = matchSeries;
+	const mpCompetitionSeriesReport reportBeforeExecution = matchSeriesReport;
+	const uint64_t seriesIdBeforeExecution = matchSeriesId;
+	const uint64_t linkedSessionBeforeExecution = matchSeriesLinkedSessionId;
+	const bool awaitingMapSessionBeforeExecution = matchSeriesAwaitingMapSession;
+
+	mpOperationExecutionResult_t execution = matchOperationExecutor.Execute(
+		request, context, matchSession, matchRules, matchProposals, matchSeries );
+	if ( execution.outcome == MP_OPERATION_NEEDS_ADAPTER ||
+		execution.continuation.kind == MP_OPERATION_CONTINUATION_SERIES_PERSIST ) {
+		ApplyMatchOperationContinuation( clientNum, request, execution );
+	}
+	if ( execution.outcome == MP_OPERATION_REJECTED ) {
+		matchSeries = seriesBeforeExecution;
+		matchSeriesReport = reportBeforeExecution;
+		matchSeriesId = seriesIdBeforeExecution;
+		matchSeriesLinkedSessionId = linkedSessionBeforeExecution;
+		matchSeriesAwaitingMapSession = awaitingMapSessionBeforeExecution;
+	}
+	ApplyMatchOperationLegacyMirror( clientNum, request, execution );
+	ObserveMatchEvidence( evidenceActor, context.localOperator );
+	if ( execution.outcome == MP_OPERATION_APPLIED &&
+		matchSession.GetPhase() == COUNTDOWN ) {
+		StartMatchMVDIfRequired();
+	}
+	if ( execution.outcome == MP_OPERATION_APPLIED &&
+		matchSession.GetPhase() == GAMEREVIEW ) {
+		const mpMatchTransitionView &transition = matchSession.GetLastTransition();
+		int forfeitingSide = MP_MATCH_SIDE_NONE;
+		if ( request.hasTeamTarget ) {
+			MPOperationMapProtocolTeam( request.teamTarget, forfeitingSide );
+		}
+		RecordMatchEvidenceResult( transition.reason, transition.authorizer,
+			forfeitingSide );
+	}
+	ClearMatchOperationSensitiveArguments( request );
+	AdvanceMatchViewRevision( true );
+	const mpMatchOperationResult_t result = MakeMatchOperationResult( request, execution );
+	lastMatchRequestResult[ clientNum ] = result;
+	lastMatchRequestResultValid[ clientNum ] = true;
+	SendMatchOperationResult( clientNum, result );
+	SendChangedMatchViews();
+}
+
+bool idMultiplayerGame::ExecuteTrustedLocalMatchOperation(
+		mpMatchOperationRequest_t &request,
+		mpOperationExecutionResult_t &execution ) {
+	execution.Clear();
+	if ( !gameLocal.isServer || gameLocal.isClient || gameLocal.isListenServer ||
+		!matchSessionOperational ||
+		matchSession.GetSessionId() == 0 ||
+		nextTrustedLocalMatchRequestId == ~static_cast<uint32_t>( 0 ) ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_TRANSPORT_MISMATCH;
+		return false;
+	}
+
+	request.schemaVersion = MP_MATCH_PROTOCOL_SCHEMA_VERSION;
+	request.sessionId = matchSession.GetSessionId();
+	request.requestId = ++nextTrustedLocalMatchRequestId;
+	request.expectedSessionRevision = matchSession.GetSessionRevision();
+	request.expectedControlRevision = matchControlRevision;
+	// Reserved marker for the executor's narrow dedicated-console principal.
+	// It is never accepted from a network transport.
+	request.actorSlot = 0;
+	request.actorBindingGeneration = 1;
+
+	mpOperationAdapterContext_t context;
+	BuildMatchOperationContext( -1, request.opcode, false, context );
+	context.trustedTransportSlot = -1;
+	context.localOperator = true;
+	context.preauthenticatedRefereeGrant = false;
+	context.actorCompetitionContestant = false;
+	context.actorCompetitionSide = MP_SERIES_SIDE_NONE;
+	context.cooldownPolicyAccepted = true;
+
+	const mpCompetitionSeries seriesBeforeExecution = matchSeries;
+	const mpCompetitionSeriesReport reportBeforeExecution = matchSeriesReport;
+	const uint64_t seriesIdBeforeExecution = matchSeriesId;
+	const uint64_t linkedSessionBeforeExecution = matchSeriesLinkedSessionId;
+	const bool awaitingMapSessionBeforeExecution = matchSeriesAwaitingMapSession;
+	execution = matchOperationExecutor.Execute( request, context, matchSession,
+		matchRules, matchProposals, matchSeries );
+	if ( execution.outcome == MP_OPERATION_NEEDS_ADAPTER ||
+		execution.continuation.kind == MP_OPERATION_CONTINUATION_SERIES_PERSIST ) {
+		ApplyMatchOperationContinuation( -1, request, execution );
+	}
+	if ( execution.outcome == MP_OPERATION_REJECTED ) {
+		matchSeries = seriesBeforeExecution;
+		matchSeriesReport = reportBeforeExecution;
+		matchSeriesId = seriesIdBeforeExecution;
+		matchSeriesLinkedSessionId = linkedSessionBeforeExecution;
+		matchSeriesAwaitingMapSession = awaitingMapSessionBeforeExecution;
+	}
+	ApplyMatchOperationLegacyMirror( -1, request, execution );
+	ObserveMatchEvidence( mpParticipantId::Invalid(), true );
+	if ( execution.outcome == MP_OPERATION_APPLIED &&
+		matchSession.GetPhase() == COUNTDOWN ) {
+		StartMatchMVDIfRequired();
+	}
+	ClearMatchOperationSensitiveArguments( request );
+	AdvanceMatchViewRevision( true );
+	SendChangedMatchViews();
+	return execution.Succeeded();
+}
+
+void idMultiplayerGame::ClientReceiveMatchOperationResult( const idBitMsg &msg ) {
+	if ( !gameLocal.isClient ) {
+		return;
+	}
+	mpMatchOperationResult_t result;
+	result.Clear();
+	mpMatchProtocolError_t error;
+	if ( !MPMatchProtocolDecodeResult( msg, result, MP_MATCH_TRAILING_REJECT, &error ) ) {
+		gameLocal.Warning( "ignored malformed match operation result (reason %d)", error.reason );
+		return;
+	}
+	if ( StoreClientMatchOperationResult( result ) && currentMenu == 1 &&
+		mainGui != NULL ) {
+		ProjectClientMatchControlMenu( true );
+	}
+}
+
+bool idMultiplayerGame::AcceptClientMatchView( const mpSessionView &incoming ) {
+	const bool samePriorSession = clientMatchViewValid &&
+		clientMatchView.publicState.sessionId != 0 &&
+		clientMatchView.publicState.sessionId == incoming.publicState.sessionId;
+	const bool bindingChanged = samePriorSession &&
+		( clientMatchView.publicState.recipient.participantId !=
+			incoming.publicState.recipient.participantId ||
+		clientMatchView.publicState.recipient.slot !=
+			incoming.publicState.recipient.slot ||
+		clientMatchView.publicState.recipient.bindingGeneration !=
+			incoming.publicState.recipient.bindingGeneration );
+	mpMatchViewError_t viewError;
+	viewError.Clear();
+	const mpMatchViewAcceptResult_t accepted = MPMatchViewAccept(
+		clientMatchView, incoming, &viewError );
+	if ( accepted == MP_MATCH_VIEW_ACCEPT_REJECTED_INVALID ||
+		accepted == MP_MATCH_VIEW_ACCEPT_REJECTED_STALE ) {
+		return false;
+	}
+	// An equal view revision is immutable.  If its recipient binding differs,
+	// fail closed instead of letting the old connection retain credentials,
+	// request ids, result text or privileged rows under a reused slot.
+	if ( bindingChanged && accepted == MP_MATCH_VIEW_ACCEPT_NO_CHANGE ) {
+		ClearClientMatchControlConnectionState( true );
+		clientMatchView.Clear();
+		clientMatchViewValid = false;
+		clientMatchControlModel.Clear();
+		return false;
+	}
+
+	if ( accepted == MP_MATCH_VIEW_ACCEPT_ADVANCED ||
+		accepted == MP_MATCH_VIEW_ACCEPT_REPLACED_SESSION ) {
+		clientMatchViewValid = true;
+		if ( accepted == MP_MATCH_VIEW_ACCEPT_REPLACED_SESSION ||
+			bindingChanged ) {
+			ClearClientMatchControlConnectionState( true );
+		}
+	}
+
+	if ( !clientMatchViewValid ) {
+		return false;
+	}
+	if ( clientPendingMatchConfirmationValid &&
+		( clientPendingMatchConfirmation.sessionId !=
+			clientMatchView.publicState.sessionId ||
+		clientPendingMatchConfirmation.expectedSessionRevision !=
+			clientMatchView.publicState.sessionRevision ||
+		clientPendingMatchConfirmation.expectedControlRevision !=
+			clientMatchView.publicState.controlRevision ||
+		clientPendingMatchConfirmation.actorSlot !=
+			clientMatchView.publicState.recipient.slot ||
+		clientPendingMatchConfirmation.actorBindingGeneration !=
+			clientMatchView.publicState.recipient.bindingGeneration ) ) {
+		ClearClientPendingMatchConfirmation( true );
+	}
+	mpMatchControlError_t modelError;
+	const mpMatchControlIngestResult_t ingested =
+		clientMatchControlModel.IngestAcceptedView( clientMatchView, &modelError );
+	if ( ingested == MP_MATCH_CONTROL_INGEST_REJECTED ) {
+		clientMatchControlModel.Clear();
+		clientMatchControlError = modelError;
+		clientMatchControlErrorValid = true;
+		return false;
+	}
+	return clientMatchControlModel.IsReady();
+}
+
+void idMultiplayerGame::ClearClientPendingMatchConfirmation(
+		bool closeModal ) {
+	ClearMatchOperationSensitiveArguments( clientPendingMatchConfirmation );
+	clientPendingMatchConfirmation.Clear();
+	clientPendingMatchConfirmationValid = false;
+	if ( closeModal && mainGui != NULL ) {
+		mainGui->SetStateInt( "match_confirm", 0 );
+	}
+}
+
+void idMultiplayerGame::ClearClientMatchControlConnectionState(
+		bool clearGuiCredential ) {
+	// Clear the actual presentation surfaces before resetting their revision
+	// cursors.  A zero cursor means "known clear"; merely zeroing it while a GUI
+	// still contains the previous occupant's projection could expose stale role,
+	// roster, evidence, or operation-result state after a slot rebind.
+	if ( mainGui != NULL ) {
+		MPMatchControlClearMenu( *mainGui, true );
+		if ( clearGuiCredential ) {
+			mainGui->SetStateString( "match_referee_credential", "" );
+		}
+	}
+	ClearClientPendingMatchConfirmation( true );
+	if ( scoreBoard != NULL ) {
+		MPMatchControlClearManagedContext( *scoreBoard );
+	}
+	idPlayer *localPlayer = gameLocal.GetLocalPlayer();
+	if ( localPlayer != NULL && localPlayer->mphud != NULL ) {
+		MPMatchControlClearManagedContext( *localPlayer->mphud );
+	}
+	clientMatchOperationResult.Clear();
+	clientMatchOperationResultValid = false;
+	clientMatchControlError.Clear();
+	clientMatchControlErrorValid = false;
+	clientMatchControlChoiceSessionId = 0;
+	clientMatchMenuProjectedViewRevision = 0;
+	clientMatchHudProjectedViewRevision = 0;
+	clientMatchScoreboardProjectedViewRevision = 0;
+	nextClientMatchRequestId = 0;
+	ClearPendingRefereePassword();
+	pendingRefereeChallenge.Clear();
+	pendingRefereeChallengeValid = false;
+}
+
+bool idMultiplayerGame::RefreshLocalClientMatchView( void ) {
+	if ( !gameLocal.isServer || gameLocal.localClientNum < 0 ) {
+		return clientMatchViewValid && clientMatchControlModel.IsReady();
+	}
+	// UpdateMainGui, the HUD and the scoreboard may all ask for the listen
+	// host's projection in the same frame.  A view revision already represents
+	// every authority-bearing aggregate plus the sampled clock cadence, so an
+	// exact local snapshot can be reused until that revision advances.  This
+	// keeps the idle presentation path allocation-free and avoids rebuilding the
+	// bounded recipient view several times per frame.
+	if ( clientMatchViewValid && clientMatchControlModel.IsReady() &&
+		clientMatchView.publicState.sessionId == matchSession.GetSessionId() &&
+		clientMatchView.publicState.viewRevision == matchViewRevision &&
+		clientMatchView.publicState.recipient.slot == gameLocal.localClientNum ) {
+		return true;
+	}
+	mpSessionView localView;
+	localView.Clear();
+	return BuildMatchView( gameLocal.localClientNum, localView ) &&
+		AcceptClientMatchView( localView );
+}
+
+void idMultiplayerGame::ProjectClientMatchControlMenu( bool notifyGui ) {
+	if ( mainGui == NULL ) {
+		return;
+	}
+	mpMatchControlProjectionContext_t context;
+	context.Clear();
+	context.callbackContext = this;
+	context.resolveParticipantText = ResolveMatchControlParticipantText;
+	context.resolveMapText = ResolveMatchControlMapText;
+	context.localOperatorVisible = gameLocal.isServer &&
+		gameLocal.isListenServer && gameLocal.localClientNum >= 0 &&
+		clientMatchViewValid && clientMatchView.publicState.recipient.slot ==
+			gameLocal.localClientNum;
+	context.displayEngineTimeMsec = static_cast<unsigned long long>(
+		Max( 0, gameLocal.time ) );
+	context.initializeChoices = clientMatchControlModel.IsReady() &&
+		clientMatchControlChoiceSessionId != clientMatchControlModel.SessionId();
+	context.authoritativeResult = clientMatchOperationResultValid ?
+		&clientMatchOperationResult : NULL;
+	context.localError = clientMatchControlErrorValid ?
+		&clientMatchControlError : NULL;
+
+	if ( clientMatchViewValid && clientMatchControlModel.IsReady() ) {
+		MPMatchControlProjectMenu( *mainGui, clientMatchView,
+			clientMatchControlModel, context );
+		clientMatchMenuProjectedViewRevision =
+			clientMatchView.publicState.viewRevision;
+		if ( context.initializeChoices ) {
+			clientMatchControlChoiceSessionId = clientMatchControlModel.SessionId();
+		}
+	} else {
+		MPMatchControlClearMenu( *mainGui,
+			clientMatchControlChoiceSessionId == 0 );
+		clientMatchControlChoiceSessionId = 0;
+		clientMatchMenuProjectedViewRevision = 0;
+	}
+	if ( notifyGui ) {
+		mainGui->StateChanged( gameLocal.time );
+	}
+}
+
+void idMultiplayerGame::ProjectClientManagedMatchContext(
+		idUserInterface *gui ) {
+	if ( gui == NULL ) {
+		return;
+	}
+	if ( gameLocal.isServer && ( !clientMatchViewValid ||
+		clientMatchView.publicState.viewRevision != matchViewRevision ) ) {
+		RefreshLocalClientMatchView();
+	}
+
+	uint64_t *projectedRevision = NULL;
+	idPlayer *localPlayer = gameLocal.GetLocalPlayer();
+	if ( gui == scoreBoard ) {
+		projectedRevision = &clientMatchScoreboardProjectedViewRevision;
+	} else if ( localPlayer != NULL && gui == localPlayer->mphud ) {
+		projectedRevision = &clientMatchHudProjectedViewRevision;
+	}
+	if ( !clientMatchViewValid || !clientMatchControlModel.IsReady() ) {
+		if ( projectedRevision == NULL || *projectedRevision != 0 ) {
+			MPMatchControlClearManagedContext( *gui );
+		}
+		if ( projectedRevision != NULL ) {
+			*projectedRevision = 0;
+		}
+		return;
+	}
+	if ( projectedRevision != NULL && *projectedRevision ==
+		clientMatchView.publicState.viewRevision ) {
+		return;
+	}
+
+	mpMatchControlProjectionContext_t context;
+	context.Clear();
+	context.callbackContext = this;
+	context.resolveParticipantText = ResolveMatchControlParticipantText;
+	context.resolveMapText = ResolveMatchControlMapText;
+	context.displayEngineTimeMsec = static_cast<unsigned long long>(
+		Max( 0, gameLocal.time ) );
+	MPMatchControlProjectManagedContext( *gui, clientMatchView,
+		clientMatchControlModel, context );
+	if ( projectedRevision != NULL ) {
+		*projectedRevision = clientMatchView.publicState.viewRevision;
+	}
+}
+
+void idMultiplayerGame::ClientReceiveMatchView( const idBitMsg &msg ) {
+	if ( !gameLocal.isClient ) {
+		return;
+	}
+	mpSessionView incoming;
+	incoming.Clear();
+	mpMatchViewError_t error;
+	if ( !MPMatchViewDecode( msg, incoming, &error ) ) {
+		gameLocal.Warning( "ignored malformed competitive match view (reason %d, field %u)",
+			error.reason, error.fieldId );
+		return;
+	}
+	if ( AcceptClientMatchView( incoming ) && currentMenu == 1 &&
+		mainGui != NULL ) {
+		ProjectClientMatchControlMenu( true );
+	}
+}
+
+bool idMultiplayerGame::SubmitMatchOperation( mpMatchOperationRequest_t &request ) {
+	if ( gameLocal.isServer && !matchSessionOperational ) {
+		return false;
+	}
+	if ( gameLocal.isServer && !RefreshLocalClientMatchView() ) {
+		return false;
+	}
+	if ( !gameLocal.isMultiplayer || !clientMatchViewValid ||
+		clientMatchView.publicState.sessionId == 0 ||
+		nextClientMatchRequestId == ~static_cast<uint32_t>( 0 ) ) {
+		return false;
+	}
+
+	// Internal compatibility/authentication callers submit an entirely unbound
+	// request and are bound here.  Match Control instead builds a request from
+	// one accepted recipient-view snapshot.  Preserve and verify that complete
+	// compare-and-swap binding: silently rebasing its selected identifiers onto
+	// a newer view could turn a stale click into a different authorized action.
+	const bool unbound = request.sessionId == 0 && request.requestId == 0 &&
+		request.expectedSessionRevision == 0 &&
+		request.expectedControlRevision == 0 && request.actorSlot == 0 &&
+		request.actorBindingGeneration == 0;
+	const bool fullyBound = request.sessionId != 0 && request.requestId != 0 &&
+		request.expectedSessionRevision != 0 &&
+		request.expectedControlRevision != 0 &&
+		request.actorSlot < MP_MATCH_PROTOCOL_MAX_ACTOR_SLOTS &&
+		request.actorBindingGeneration != 0;
+	const uint32_t expectedRequestId = nextClientMatchRequestId + 1;
+	if ( unbound ) {
+		request.schemaVersion = MP_MATCH_PROTOCOL_SCHEMA_VERSION;
+		request.sessionId = clientMatchView.publicState.sessionId;
+		request.requestId = expectedRequestId;
+		request.expectedSessionRevision =
+			clientMatchView.publicState.sessionRevision;
+		request.expectedControlRevision =
+			clientMatchView.publicState.controlRevision;
+		request.actorSlot = clientMatchView.publicState.recipient.slot;
+		request.actorBindingGeneration =
+			clientMatchView.publicState.recipient.bindingGeneration;
+	} else if ( !fullyBound ||
+		request.schemaVersion != MP_MATCH_PROTOCOL_SCHEMA_VERSION ||
+		request.sessionId != clientMatchView.publicState.sessionId ||
+		request.requestId != expectedRequestId ||
+		request.expectedSessionRevision !=
+			clientMatchView.publicState.sessionRevision ||
+		request.expectedControlRevision !=
+			clientMatchView.publicState.controlRevision ||
+		request.actorSlot != clientMatchView.publicState.recipient.slot ||
+		request.actorBindingGeneration !=
+			clientMatchView.publicState.recipient.bindingGeneration ) {
+		return false;
+	}
+	byte encodedBytes[ MP_MATCH_PROTOCOL_MAX_MESSAGE_BYTES ];
+	idBitMsg encoded;
+	encoded.Init( encodedBytes, sizeof( encodedBytes ) );
+	encoded.BeginWriting();
+	mpMatchProtocolError_t error;
+	if ( !MPMatchProtocolEncodeRequest( encoded, request, &error ) ) {
+		MPRefereeAuthSecureZero( encodedBytes, sizeof( encodedBytes ) );
+		return false;
+	}
+	nextClientMatchRequestId = request.requestId;
+	if ( gameLocal.isServer ) {
+		idBitMsg localMessage;
+		localMessage.Init( encoded.GetData(), encoded.GetSize() );
+		localMessage.SetSize( encoded.GetSize() );
+		localMessage.BeginReading();
+		ServerReceiveMatchOperation( gameLocal.localClientNum, localMessage );
+		MPRefereeAuthSecureZero( encodedBytes, sizeof( encodedBytes ) );
+		return true;
+	}
+	idBitMsg message;
+	byte messageBytes[ MP_MATCH_PROTOCOL_MAX_MESSAGE_BYTES + 1 ];
+	message.Init( messageBytes, sizeof( messageBytes ) );
+	message.BeginWriting();
+	message.WriteByte( GAME_RELIABLE_MESSAGE_MATCH_REQUEST );
+	message.WriteData( encoded.GetData(), encoded.GetSize() );
+	if ( message.IsOverflowed() ) {
+		MPRefereeAuthSecureZero( encodedBytes, sizeof( encodedBytes ) );
+		MPRefereeAuthSecureZero( messageBytes, sizeof( messageBytes ) );
+		return false;
+	}
+	networkSystem->ClientSendReliableMessage( message );
+	MPRefereeAuthSecureZero( encodedBytes, sizeof( encodedBytes ) );
+	MPRefereeAuthSecureZero( messageBytes, sizeof( messageBytes ) );
+	return true;
+}
+
+bool idMultiplayerGame::HandleMatchControlCommand( const char *token ) {
+	if ( token == NULL || token[ 0 ] == '\0' || mainGui == NULL ||
+		currentMenu != 1 ) {
+		return false;
+	}
+
+	auto setLocalError = [this]( mpMatchControlErrorReason_t reason,
+		mpMatchOperationOpcode_t opcode = MP_MATCH_OP_INVALID,
+		mpMatchProtocolReason_t protocolReason = MP_MATCH_PROTOCOL_REASON_NONE ) {
+		clientMatchControlError.Clear();
+		clientMatchControlError.reason = reason;
+		clientMatchControlError.opcode = opcode;
+		clientMatchControlError.protocolReason = protocolReason;
+		clientMatchControlErrorValid = true;
+	};
+	auto clearLocalError = [this]() {
+		clientMatchControlError.Clear();
+		clientMatchControlErrorValid = false;
+	};
+	auto parseStateInteger = [this]( const char *stateName, int minimum,
+		int maximum, int &value ) {
+		return mainGui != NULL && MPParseBoundedRuleInteger(
+			mainGui->GetStateString( stateName, "" ), minimum, maximum, value );
+	};
+
+	if ( gameLocal.isServer ) {
+		RefreshLocalClientMatchView();
+	}
+
+	if ( strcmp( token, "cancel_confirm" ) == 0 ) {
+		ClearClientPendingMatchConfirmation( true );
+		clearLocalError();
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+	if ( strcmp( token, "confirm" ) == 0 ) {
+		if ( !clientPendingMatchConfirmationValid ) {
+			setLocalError( MP_MATCH_CONTROL_ERROR_STALE_VIEW );
+			ClearClientPendingMatchConfirmation( true );
+			ProjectClientMatchControlMenu( true );
+			return true;
+		}
+		mpMatchOperationRequest_t confirmed = clientPendingMatchConfirmation;
+		const mpMatchOperationOpcode_t confirmedOpcode = confirmed.opcode;
+		ClearClientPendingMatchConfirmation( true );
+		if ( !SubmitMatchOperation( confirmed ) ) {
+			ClearMatchOperationSensitiveArguments( confirmed );
+			setLocalError( MP_MATCH_CONTROL_ERROR_STALE_VIEW, confirmedOpcode );
+			ProjectClientMatchControlMenu( true );
+			return true;
+		}
+		ClearMatchOperationSensitiveArguments( confirmed );
+		clearLocalError();
+		if ( gameLocal.isServer ) {
+			RefreshLocalClientMatchView();
+		}
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+
+	// Side-targeting controls use fixed tokens and the accepted typed view.
+	// Never parse a displayed team name or infer a Duel contestant from the
+	// current connection slot: competition-side bindings remain stable across
+	// reconnects and substitutions.
+	if ( strcmp( token, "action_side_a" ) == 0 ||
+		strcmp( token, "action_side_b" ) == 0 ) {
+		const int side = strcmp( token, "action_side_a" ) == 0 ? 0 : 1;
+		if ( !clientMatchControlModel.CanChooseActionSide( side ) ||
+			!clientMatchControlModel.SetActionSideChoice(
+				static_cast<mpMatchControlSideChoice_t>( side ) ) ) {
+			setLocalError( MP_MATCH_CONTROL_ERROR_SELECTION_INVALID );
+		} else {
+			clearLocalError();
+		}
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+
+	// These tokens change only the bounded parallel row model.  The selected
+	// display string is never parsed and never becomes an operation argument.
+	struct selectionCommand_t {
+		const char *token;
+		const char *stateName;
+		int ( mpMatchControlModel::*count )( void ) const;
+		bool ( mpMatchControlModel::*select )( int );
+	};
+	static const selectionCommand_t selectionCommands[] = {
+		{ "select_team_row", "match_team_rows_sel_0",
+			&mpMatchControlModel::TeamRowCount, &mpMatchControlModel::SelectTeamRow },
+		{ "select_replacement_row", "match_replacement_rows_sel_0",
+			&mpMatchControlModel::ReplacementRowCount,
+			&mpMatchControlModel::SelectReplacementRow },
+		{ "select_proposal_row", "match_proposal_rows_sel_0",
+			&mpMatchControlModel::ProposalTemplateRowCount,
+			&mpMatchControlModel::SelectProposalTemplateRow },
+		{ "select_profile_row", "match_profile_rows_sel_0",
+			&mpMatchControlModel::ProfileRowCount,
+			&mpMatchControlModel::SelectProfileRow },
+		{ "select_rule_row", "match_rule_rows_sel_0",
+			&mpMatchControlModel::RuleRowCount,
+			&mpMatchControlModel::SelectRuleRow },
+		{ "select_series_map", "match_series_map_rows_sel_0",
+			&mpMatchControlModel::SeriesMapRowCount,
+			&mpMatchControlModel::SelectSeriesMapRow }
+	};
+	for ( int index = 0; index < static_cast<int>( sizeof( selectionCommands ) /
+			sizeof( selectionCommands[ 0 ] ) ); ++index ) {
+		const selectionCommand_t &entry = selectionCommands[ index ];
+		if ( strcmp( token, entry.token ) != 0 ) {
+			continue;
+		}
+		const int count = ( clientMatchControlModel.*entry.count )();
+		int selection = -1;
+		if ( count <= 0 || !parseStateInteger( entry.stateName, 0,
+				count - 1, selection ) ||
+			!( clientMatchControlModel.*entry.select )( selection ) ) {
+			setLocalError( MP_MATCH_CONTROL_ERROR_SELECTION_INVALID );
+		} else {
+			clearLocalError();
+			if ( strcmp( token, "select_rule_row" ) == 0 ) {
+				const mpMatchControlRuleRow_t *row =
+					clientMatchControlModel.RuleRow( selection );
+				if ( row != NULL ) {
+					const int value = row->editValueValid ? row->editValue :
+						( row->hasStagedValue ? row->stagedValue :
+							row->committedValue );
+					mainGui->SetStateInt( "match_rule_value", value );
+				}
+			}
+		}
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+
+	if ( strcmp( token, "refresh" ) == 0 ) {
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+
+	if ( strcmp( token, "referee_login" ) == 0 ) {
+		char password[ MP_REFEREE_AUTH_MAX_PASSWORD_BYTES + 1 ];
+		MPRefereeAuthSecureZero( password, sizeof( password ) );
+		const char *source = mainGui->GetStateString(
+			"match_referee_credential", "" );
+		int length = 0;
+		while ( length <= MP_REFEREE_AUTH_MAX_PASSWORD_BYTES &&
+			source[ length ] != '\0' ) {
+			++length;
+		}
+		const bool bounded = length > 0 &&
+			length <= MP_REFEREE_AUTH_MAX_PASSWORD_BYTES;
+		if ( bounded ) {
+			memcpy( password, source, static_cast<size_t>( length ) );
+			password[ length ] = '\0';
+		}
+		// Clear the GUI-owned copy before authentication allocates or sends any
+		// challenge state.  The stack copy is wiped on every exit below.
+		mainGui->SetStateString( "match_referee_credential", "" );
+		const mpMatchViewOperationAvailability_t *availability =
+			clientMatchControlModel.OperationAvailability(
+				MP_MATCH_OP_REF_AUTHENTICATE );
+		const bool available = availability != NULL &&
+			availability->available &&
+			availability->reason == MP_MATCH_PROTOCOL_REASON_OK;
+		const bool submitted = bounded && available &&
+			RequestRefereeAuthentication( password );
+		MPRefereeAuthSecureZero( password, sizeof( password ) );
+		if ( submitted ) {
+			clearLocalError();
+		} else if ( !available ) {
+			setLocalError( MP_MATCH_CONTROL_ERROR_OPERATION_UNAVAILABLE,
+				MP_MATCH_OP_REF_AUTHENTICATE, availability != NULL ?
+					availability->reason : MP_MATCH_PROTOCOL_REASON_CONFLICT );
+		} else {
+			setLocalError( MP_MATCH_CONTROL_ERROR_INVALID_VALUE,
+				MP_MATCH_OP_REF_AUTHENTICATE );
+		}
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+
+	mpMatchControlCommand_t command = MP_MATCH_CONTROL_COMMAND_INVALID;
+	bool armConfirmation = false;
+	struct confirmationCommand_t {
+		const char *token;
+		mpMatchControlCommand_t command;
+	};
+	static const confirmationCommand_t confirmationCommands[] = {
+		{ "arm_force_ready", MP_MATCH_CONTROL_COMMAND_FORCE_READY },
+		{ "arm_rules_commit", MP_MATCH_CONTROL_COMMAND_RULES_COMMIT },
+		{ "arm_roster_remove", MP_MATCH_CONTROL_COMMAND_ROSTER_REMOVE },
+		{ "arm_roster_substitute", MP_MATCH_CONTROL_COMMAND_ROSTER_SUBSTITUTE },
+		{ "arm_series_cancel", MP_MATCH_CONTROL_COMMAND_SERIES_CANCEL },
+		{ "arm_series_start", MP_MATCH_CONTROL_COMMAND_SERIES_START },
+		{ "arm_series_advance", MP_MATCH_CONTROL_COMMAND_SERIES_ADVANCE },
+		{ "arm_veto_ban", MP_MATCH_CONTROL_COMMAND_VETO_BAN },
+		{ "arm_veto_pick", MP_MATCH_CONTROL_COMMAND_VETO_PICK },
+		{ "arm_veto_decider", MP_MATCH_CONTROL_COMMAND_VETO_DECIDER },
+		{ "arm_veto_side_marine", MP_MATCH_CONTROL_COMMAND_VETO_SIDE_MARINE },
+		{ "arm_veto_side_strogg", MP_MATCH_CONTROL_COMMAND_VETO_SIDE_STROGG },
+		{ "arm_forfeit", MP_MATCH_CONTROL_COMMAND_FORFEIT },
+		{ "arm_abort", MP_MATCH_CONTROL_COMMAND_ABORT },
+		{ "arm_participant_remove",
+			MP_MATCH_CONTROL_COMMAND_PARTICIPANT_REMOVE }
+	};
+	for ( int index = 0; index < static_cast<int>( sizeof( confirmationCommands ) /
+			sizeof( confirmationCommands[ 0 ] ) ); ++index ) {
+		if ( strcmp( token, confirmationCommands[ index ].token ) == 0 ) {
+			command = confirmationCommands[ index ].command;
+			armConfirmation = true;
+			break;
+		}
+	}
+	if ( command == MP_MATCH_CONTROL_COMMAND_INVALID &&
+		!MPMatchControlCommandFromToken( token, command ) ) {
+		setLocalError( MP_MATCH_CONTROL_ERROR_UNKNOWN_COMMAND );
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+	const mpMatchOperationOpcode_t opcode =
+		MPMatchControlCommandOpcode( command );
+
+	if ( command == MP_MATCH_CONTROL_COMMAND_ROSTER_INVITE ||
+		command == MP_MATCH_CONTROL_COMMAND_ROLE_ASSIGN ) {
+		int role = 0;
+		if ( !parseStateInteger( "match_role_choice",
+				MP_MATCH_PROTOCOL_ROSTER_ROLE_PLAYER,
+				MP_MATCH_PROTOCOL_ROSTER_ROLE_SUBSTITUTE, role ) ||
+			!clientMatchControlModel.SetRoleChoice(
+				static_cast<mpMatchProtocolRosterRole_t>( role ) ) ) {
+			setLocalError( MP_MATCH_CONTROL_ERROR_INVALID_VALUE, opcode );
+			ProjectClientMatchControlMenu( true );
+			return true;
+		}
+	}
+
+	if ( command == MP_MATCH_CONTROL_COMMAND_PROPOSAL_YES ||
+		command == MP_MATCH_CONTROL_COMMAND_PROPOSAL_NO ||
+		command == MP_MATCH_CONTROL_COMMAND_PROPOSAL_ABSTAIN ||
+		command == MP_MATCH_CONTROL_COMMAND_PROPOSAL_CANCEL ) {
+		const char *scope = mainGui->GetStateString(
+			"match_proposal_scope_choice", "" );
+		mpMatchControlProposalChoice_t choice;
+		if ( strcmp( scope, "global" ) == 0 ) {
+			choice = MP_MATCH_CONTROL_PROPOSAL_GLOBAL;
+		} else if ( strcmp( scope, "side" ) == 0 ) {
+			choice = MP_MATCH_CONTROL_PROPOSAL_OWN_SIDE;
+		} else {
+			setLocalError( MP_MATCH_CONTROL_ERROR_INVALID_VALUE, opcode );
+			ProjectClientMatchControlMenu( true );
+			return true;
+		}
+		clientMatchControlModel.SetProposalChoice( choice );
+	}
+
+	if ( command == MP_MATCH_CONTROL_COMMAND_SERIES_STAGE ) {
+		const char *profile = mainGui->GetStateString(
+			"match_series_profile_choice", "" );
+		mpSeriesProfileId_t profileId = MP_SERIES_PROFILE_COUNT;
+		if ( strcmp( profile, "best_of_one" ) == 0 ) {
+			profileId = MP_SERIES_PROFILE_BEST_OF_ONE;
+		} else if ( strcmp( profile, "best_of_three" ) == 0 ) {
+			profileId = MP_SERIES_PROFILE_BEST_OF_THREE;
+		} else if ( strcmp( profile, "best_of_five" ) == 0 ) {
+			profileId = MP_SERIES_PROFILE_BEST_OF_FIVE;
+		}
+		if ( profileId == MP_SERIES_PROFILE_COUNT ||
+			!clientMatchControlModel.SetSeriesProfileChoice( profileId ) ) {
+			setLocalError( MP_MATCH_CONTROL_ERROR_INVALID_VALUE, opcode );
+			ProjectClientMatchControlMenu( true );
+			return true;
+		}
+	}
+
+	bool needsRuleValue = command == MP_MATCH_CONTROL_COMMAND_RULES_STAGE_FIELD;
+	if ( command == MP_MATCH_CONTROL_COMMAND_PROPOSAL_CREATE ) {
+		const mpMatchControlProposalTemplateRow_t *proposal =
+			clientMatchControlModel.ProposalTemplateRow(
+				clientMatchControlModel.SelectedProposalTemplateRow() );
+		needsRuleValue = proposal != NULL &&
+			proposal->opcode == MP_MATCH_OP_RULES_STAGE_FIELD;
+	}
+	if ( needsRuleValue ) {
+		const mpMatchControlRuleRow_t *rule = clientMatchControlModel.RuleRow(
+			clientMatchControlModel.SelectedRuleRow() );
+		int value = 0;
+		if ( rule == NULL || !parseStateInteger( "match_rule_value",
+				rule->minimumValue, rule->maximumValue, value ) ||
+			!clientMatchControlModel.SetSelectedRuleValue( value ) ) {
+			setLocalError( MP_MATCH_CONTROL_ERROR_INVALID_VALUE, opcode );
+			ProjectClientMatchControlMenu( true );
+			return true;
+		}
+	}
+
+	if ( nextClientMatchRequestId == ~static_cast<uint32_t>( 0 ) ) {
+		setLocalError( MP_MATCH_CONTROL_ERROR_INVALID_REQUEST_ID, opcode );
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+	mpMatchOperationRequest_t request;
+	request.Clear();
+	mpMatchControlError_t buildError;
+	if ( !clientMatchControlModel.BuildRequest( command,
+			nextClientMatchRequestId + 1, request, &buildError ) ) {
+		clientMatchControlError = buildError;
+		clientMatchControlErrorValid = true;
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+	const mpMatchOperationDescriptor_t *operationDescriptor =
+		MPMatchOperationDescriptor( request.opcode );
+	const bool requiresConfirmation = operationDescriptor != NULL &&
+		operationDescriptor->confirmationLocalizationId != MP_MATCH_LOCALIZATION_NONE;
+	if ( requiresConfirmation && !armConfirmation ) {
+		ClearMatchOperationSensitiveArguments( request );
+		setLocalError( MP_MATCH_CONTROL_ERROR_OPERATION_UNAVAILABLE, opcode,
+			MP_MATCH_PROTOCOL_REASON_CONFLICT );
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+	if ( armConfirmation ) {
+		if ( !requiresConfirmation ) {
+			ClearMatchOperationSensitiveArguments( request );
+			setLocalError( MP_MATCH_CONTROL_ERROR_OPERATION_UNAVAILABLE, opcode,
+				MP_MATCH_PROTOCOL_REASON_CONFLICT );
+			mainGui->SetStateInt( "match_confirm", 0 );
+		} else {
+			ClearClientPendingMatchConfirmation( false );
+			clientPendingMatchConfirmation = request;
+			clientPendingMatchConfirmationValid = true;
+			clearLocalError();
+		}
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+	if ( !SubmitMatchOperation( request ) ) {
+		setLocalError( MP_MATCH_CONTROL_ERROR_STALE_VIEW, opcode );
+		ProjectClientMatchControlMenu( true );
+		return true;
+	}
+	clearLocalError();
+	if ( gameLocal.isServer ) {
+		RefreshLocalClientMatchView();
+	}
+	ProjectClientMatchControlMenu( true );
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::InitializeCompetitiveRules
+
+Import legacy server values once for the casual profile.  Managed profiles are
+typed data and never execute a cfg or continue polling cvars after commit.
+================
+*/
+bool idMultiplayerGame::InitializeCompetitiveRules( void ) {
+	competitiveRulesValidForSession = false;
+	competitiveRulesFailure = MP_RULE_VALID;
+
+	mpRuleValidationFailure_t failure;
+	if ( !MPValidateMatchRulesDescriptorTable( failure ) ||
+		!MPValidateBuiltInMatchProfiles( failure ) ) {
+		competitiveRulesFailure = failure.reason;
+		gameLocal.Warning( "competitive rules descriptor validation failed (%d)", failure.reason );
+		return false;
+	}
+
+	const char *requestedProfile = g_matchProfile.GetString();
+	const mpMatchProfileDescriptor_t *profile = NULL;
+	if ( idStr::Icmp( requestedProfile, "competitive" ) == 0 ) {
+		profile = MPMatchProfile( MPRecommendedMatchProfileForGameType( gameLocal.gameType ) );
+	} else {
+		profile = MPMatchProfileByKey( requestedProfile );
+	}
+	if ( profile == NULL ) {
+		gameLocal.Warning( "unknown match profile '%s'; using casual", requestedProfile );
+		profile = MPMatchProfile( MP_MATCH_PROFILE_CASUAL );
+	}
+
+	const mpMatchRulesValidationContext_t context =
+		BuildCompetitiveRuleValidationContext();
+	if ( competitiveRulesInitialized ) {
+		if ( matchRules.HasStagedSnapshot() ) {
+			const mpMatchRulesSnapshot *staged = matchRules.StagedSnapshot();
+			if ( staged != NULL && staged->GetInteger( MP_RULE_GAME_TYPE ) ==
+				gameLocal.gameType ) {
+				mpCompetitiveRules candidate = matchRules;
+				const mpRuleCommitResult_t applied =
+					candidate.ApplyStagedAtWarmup( context );
+				if ( !applied.Succeeded() ) {
+					competitiveRulesFailure = applied.failure.reason;
+					gameLocal.serverInfo.Set( "si_matchRules", "invalid" );
+					return false;
+				}
+				matchRules = candidate;
+				competitiveRulesValidForSession = true;
+				competitiveRulesFailure = MP_RULE_VALID;
+				const mpMatchProfileDescriptor_t *appliedProfile =
+					matchRules.Committed().SourceProfile() >= 0 ?
+					MPMatchProfile( matchRules.Committed().SourceProfile() ) : NULL;
+				if ( appliedProfile != NULL ) {
+					g_matchProfile.SetString( appliedProfile->key );
+					gameLocal.serverInfo.Set( "g_matchProfile", appliedProfile->key );
+				}
+				g_matchProfile.ClearModified();
+				MirrorCompetitiveRulesToLegacy();
+				PublishCompetitiveRulesIdentity();
+				return true;
+			}
+			gameLocal.Warning( "discarded staged match rules after a gametype change" );
+			matchRules.DiscardStagedSnapshot();
+		}
+
+		const bool selectorChanged = g_matchProfile.IsModified();
+		if ( !selectorChanged &&
+			matchRules.Committed().GetInteger( MP_RULE_GAME_TYPE ) == gameLocal.gameType ) {
+			const mpMatchRulesDraft current = matchRules.BeginDraftFromCommitted();
+			if ( !mpCompetitiveRules::ValidateDraft( current, context, failure ) ) {
+				competitiveRulesFailure = failure.reason;
+				gameLocal.serverInfo.Set( "si_matchRules", "invalid" );
+				return false;
+			}
+			competitiveRulesValidForSession = true;
+			competitiveRulesFailure = MP_RULE_VALID;
+			MirrorCompetitiveRulesToLegacy();
+			PublishCompetitiveRulesIdentity();
+			return true;
+		}
+	}
+
+	mpMatchRulesDraft draft;
+	if ( profile == NULL || !matchRules.BeginDraftFromProfile( profile->id,
+		gameLocal.gameType, draft, failure ) ) {
+		gameLocal.Warning( "match profile '%s' does not support gametype '%s'; using the recommended profile",
+			requestedProfile, MPGameTypeName( gameLocal.gameType ) );
+		profile = MPMatchProfile( MPRecommendedMatchProfileForGameType( gameLocal.gameType ) );
+		if ( profile == NULL || !matchRules.BeginDraftFromProfile( profile->id,
+			gameLocal.gameType, draft, failure ) ) {
+			competitiveRulesFailure = failure.reason;
+			return false;
+		}
+	}
+
+	// A casual session deliberately preserves the existing server's values at
+	// this boundary.  After commit those values are mirrors, not another rules
+	// authority.  Every setter is typed and failure leaves the prior snapshot
+	// untouched.
+	if ( profile->id == MP_MATCH_PROFILE_CASUAL ) {
+		const int readyBasisPoints = idMath::ClampInt( 0, 10000,
+			idMath::Ftoi( gameLocal.serverInfo.GetFloat( "si_warmupReadyPercentage" ) * 10000.0f + 0.5f ) );
+		const bool useReady = gameLocal.serverInfo.GetBool( "si_warmup" ) &&
+			gameLocal.serverInfo.GetBool( "si_useReady" );
+		const int overtimeSeconds = gameLocal.serverInfo.GetInt( "si_overtime" );
+		bool imported = true;
+		imported = imported && draft.SetEnum( MP_RULE_GAME_TYPE, gameLocal.gameType, failure );
+		imported = imported && draft.SetBool( MP_RULE_MANAGED_MATCH, false, failure );
+		imported = imported && draft.SetBool( MP_RULE_WARMUP_ENABLED,
+			gameLocal.serverInfo.GetBool( "si_warmup" ), failure );
+		imported = imported && draft.SetEnum( MP_RULE_READINESS_POLICY,
+			useReady ? MP_READY_INDIVIDUAL : MP_READY_DISABLED, failure );
+		imported = imported && draft.SetInteger( MP_RULE_READY_THRESHOLD_BASIS_POINTS,
+			readyBasisPoints, failure );
+		imported = imported && draft.SetBool( MP_RULE_BOTS_CAN_READY, true, failure );
+		imported = imported && draft.SetInteger( MP_RULE_MIN_ACTIVE_HUMANS,
+			Max( 1, gameLocal.serverInfo.GetInt( "si_minPlayers" ) ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_MIN_TEAM_SIZE,
+			Max( 1, gameLocal.serverInfo.GetInt( "si_teamSizeMin" ) ), failure );
+		imported = imported && draft.SetBool( MP_RULE_REQUIRE_BOTH_TEAMS,
+			gameLocal.serverInfo.GetBool( "si_teamForcePresent" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_ROSTER_SIZE_PER_TEAM, 0, failure );
+		imported = imported && draft.SetInteger( MP_RULE_COUNTDOWN_SECONDS,
+			gameLocal.serverInfo.GetInt( "si_countDown" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_TIME_LIMIT_MINUTES,
+			gameLocal.serverInfo.GetInt( "si_timeLimit" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_FRAG_LIMIT,
+			gameLocal.serverInfo.GetInt( "si_fragLimit" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_CAPTURE_LIMIT,
+			gameLocal.serverInfo.GetInt( "si_captureLimit" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_CONTROL_TIME_SECONDS,
+			gameLocal.serverInfo.GetInt( "si_controlTime" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_ROUND_LIMIT,
+			gameLocal.serverInfo.GetInt( "si_roundLimit" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_ROUND_TIME_LIMIT_SECONDS,
+			gameLocal.serverInfo.GetInt( "si_roundTimeLimit" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_ROUND_COUNTDOWN_SECONDS,
+			gameLocal.serverInfo.GetInt( "si_roundWarmupDelay" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_ROUND_REVIEW_SECONDS,
+			gameLocal.serverInfo.GetInt( "si_roundEndDelay" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_MERCY_LIMIT,
+			gameLocal.serverInfo.GetInt( "si_mercyLimit" ), failure );
+		imported = imported && draft.SetEnum( MP_RULE_OVERTIME_POLICY,
+			overtimeSeconds > 0 ? MP_OVERTIME_TIMED_PERIODS : MP_OVERTIME_SUDDEN_DEATH, failure );
+		imported = imported && draft.SetInteger( MP_RULE_OVERTIME_PERIOD_SECONDS,
+			Max( 0, overtimeSeconds ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_OVERTIME_MAX_PERIODS, 0, failure );
+		imported = imported && draft.SetInteger( MP_RULE_SUDDEN_DEATH_RESPAWN_DELAY,
+			gameLocal.serverInfo.GetInt( "si_suddenDeathRespawnDelay" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_SUDDEN_DEATH_RESPAWN_INCREASE,
+			gameLocal.serverInfo.GetInt( "si_suddenDeathRespawnIncrease" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_SUDDEN_DEATH_RESPAWN_MAX,
+			gameLocal.serverInfo.GetInt( "si_suddenDeathRespawnMax" ), failure );
+		imported = imported && draft.SetBool( MP_RULE_TEAM_DAMAGE,
+			gameLocal.serverInfo.GetBool( "si_teamDamage" ), failure );
+		imported = imported && draft.SetBool( MP_RULE_FORFEIT_ON_EMPTY_TEAM, false, failure );
+		imported = imported && draft.SetBool( MP_RULE_BUYING_ENABLED,
+			gameLocal.serverInfo.GetBool( "si_isBuyingEnabled" ), failure );
+		imported = imported && draft.SetInteger( MP_RULE_TEAM_TIMEOUT_COUNT, 0, failure );
+		imported = imported && draft.SetInteger( MP_RULE_TEAM_TIMEOUT_SECONDS, 0, failure );
+		imported = imported && draft.SetEnum( MP_RULE_TIMEOUT_REQUEST_WINDOW,
+			MP_TIMEOUT_DURING_LIVE_PLAY, failure );
+		imported = imported && draft.SetEnum( MP_RULE_TIMEOUT_RESUME_POLICY,
+			MP_TIMEOUT_RESUME_OWNER_OR_REFEREE, failure );
+		if ( !imported ) {
+			competitiveRulesFailure = failure.reason;
+			gameLocal.Warning( "could not import casual match rule %d (%d)", failure.field, failure.reason );
+			return false;
+		}
+	}
+
+	const mpRuleCommitResult_t commit = matchRules.Commit( draft, context,
+		MP_RULES_OPEN_FOR_COMMIT );
+	if ( !commit.Succeeded() ) {
+		competitiveRulesFailure = commit.failure.reason;
+		gameLocal.Warning( "competitive rules rejected field %d (%d)",
+			commit.failure.field, commit.failure.reason );
+		gameLocal.serverInfo.Set( "si_matchRules", "invalid" );
+		return false;
+	}
+
+	competitiveRulesValidForSession = true;
+	competitiveRulesInitialized = true;
+	competitiveRulesFailure = MP_RULE_VALID;
+	g_matchProfile.SetString( profile->key );
+	gameLocal.serverInfo.Set( "g_matchProfile", profile->key );
+	g_matchProfile.ClearModified();
+	MirrorCompetitiveRulesToLegacy();
+	PublishCompetitiveRulesIdentity();
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::MirrorCompetitiveRulesToLegacy
+================
+*/
+void idMultiplayerGame::MirrorCompetitiveRulesToLegacy( void ) {
+	const mpMatchRulesSnapshot &rules = matchRules.Committed();
+
+#define MIRROR_MATCH_INT( cvar, key, field ) \
+	do { const int value = rules.GetInteger( field ); ( cvar ).SetInteger( value ); gameLocal.serverInfo.SetInt( key, value ); } while ( 0 )
+#define MIRROR_MATCH_BOOL( cvar, key, field ) \
+	do { const bool value = rules.GetBool( field ); ( cvar ).SetBool( value ); gameLocal.serverInfo.SetBool( key, value ); } while ( 0 )
+
+	// Userinfo is interpreted on both peers.  Publish the managed-session bit
+	// explicitly so clients bypass stock spectator coercion without depending on
+	// server-only session aggregates.
+	gameLocal.serverInfo.SetBool( "si_managedMatch",
+		rules.GetBool( MP_RULE_MANAGED_MATCH ) );
+
+	const bool warmupEnabled = rules.GetBool( MP_RULE_WARMUP_ENABLED );
+	cvarSystem->SetCVarBool( "si_warmup", warmupEnabled );
+	gameLocal.serverInfo.SetBool( "si_warmup", warmupEnabled );
+	const bool useReady = rules.GetInteger( MP_RULE_READINESS_POLICY ) != MP_READY_DISABLED;
+	cvarSystem->SetCVarBool( "si_useReady", useReady );
+	gameLocal.serverInfo.SetBool( "si_useReady", useReady );
+	const float readyFraction = rules.GetInteger( MP_RULE_READY_THRESHOLD_BASIS_POINTS ) / 10000.0f;
+	si_warmupReadyPercentage.SetFloat( readyFraction );
+	gameLocal.serverInfo.SetFloat( "si_warmupReadyPercentage", readyFraction );
+	MIRROR_MATCH_INT( si_minPlayers, "si_minPlayers", MP_RULE_MIN_ACTIVE_HUMANS );
+	MIRROR_MATCH_INT( si_teamSizeMin, "si_teamSizeMin", MP_RULE_MIN_TEAM_SIZE );
+	MIRROR_MATCH_BOOL( si_teamForcePresent, "si_teamForcePresent", MP_RULE_REQUIRE_BOTH_TEAMS );
+	const int countDownSeconds = rules.GetInteger( MP_RULE_COUNTDOWN_SECONDS );
+	cvarSystem->SetCVarInteger( "si_countDown", countDownSeconds );
+	gameLocal.serverInfo.SetInt( "si_countDown", countDownSeconds );
+	MIRROR_MATCH_INT( si_timeLimit, "si_timeLimit", MP_RULE_TIME_LIMIT_MINUTES );
+	MIRROR_MATCH_INT( si_fragLimit, "si_fragLimit", MP_RULE_FRAG_LIMIT );
+	MIRROR_MATCH_INT( si_captureLimit, "si_captureLimit", MP_RULE_CAPTURE_LIMIT );
+	MIRROR_MATCH_INT( si_controlTime, "si_controlTime", MP_RULE_CONTROL_TIME_SECONDS );
+	MIRROR_MATCH_INT( si_roundLimit, "si_roundLimit", MP_RULE_ROUND_LIMIT );
+	MIRROR_MATCH_INT( si_roundTimeLimit, "si_roundTimeLimit", MP_RULE_ROUND_TIME_LIMIT_SECONDS );
+	MIRROR_MATCH_INT( si_roundWarmupDelay, "si_roundWarmupDelay", MP_RULE_ROUND_COUNTDOWN_SECONDS );
+	MIRROR_MATCH_INT( si_roundEndDelay, "si_roundEndDelay", MP_RULE_ROUND_REVIEW_SECONDS );
+	MIRROR_MATCH_INT( si_mercyLimit, "si_mercyLimit", MP_RULE_MERCY_LIMIT );
+	const int overtimeSeconds = rules.GetInteger( MP_RULE_OVERTIME_POLICY ) == MP_OVERTIME_TIMED_PERIODS ?
+		rules.GetInteger( MP_RULE_OVERTIME_PERIOD_SECONDS ) : 0;
+	si_overtime.SetInteger( overtimeSeconds );
+	gameLocal.serverInfo.SetInt( "si_overtime", overtimeSeconds );
+	MIRROR_MATCH_INT( si_suddenDeathRespawnDelay, "si_suddenDeathRespawnDelay", MP_RULE_SUDDEN_DEATH_RESPAWN_DELAY );
+	MIRROR_MATCH_INT( si_suddenDeathRespawnIncrease, "si_suddenDeathRespawnIncrease", MP_RULE_SUDDEN_DEATH_RESPAWN_INCREASE );
+	MIRROR_MATCH_INT( si_suddenDeathRespawnMax, "si_suddenDeathRespawnMax", MP_RULE_SUDDEN_DEATH_RESPAWN_MAX );
+	const bool teamDamage = rules.GetBool( MP_RULE_TEAM_DAMAGE );
+	cvarSystem->SetCVarBool( "si_teamDamage", teamDamage );
+	gameLocal.serverInfo.SetBool( "si_teamDamage", teamDamage );
+	MIRROR_MATCH_BOOL( si_isBuyingEnabled, "si_isBuyingEnabled", MP_RULE_BUYING_ENABLED );
+
+#undef MIRROR_MATCH_BOOL
+#undef MIRROR_MATCH_INT
+}
+
+/*
+================
+idMultiplayerGame::PublishCompetitiveRulesIdentity
+================
+*/
+void idMultiplayerGame::PublishCompetitiveRulesIdentity( void ) {
+	const mpMatchRulesSnapshot &snapshot = matchRules.Committed();
+	const mpMatchProfileDescriptor_t *profile = snapshot.SourceProfile() >= 0 ?
+		MPMatchProfile( snapshot.SourceProfile() ) : NULL;
+	idStr digest;
+	snapshot.DigestString( digest );
+	idStr identity = va( "v%u;%s;r%u;%s", snapshot.SchemaVersion(),
+		profile != NULL ? profile->key : "custom", snapshot.Revision(), digest.c_str() );
+	si_matchRules.SetString( identity.c_str() );
+	gameLocal.serverInfo.Set( "si_matchRules", identity.c_str() );
+}
+
+bool idMultiplayerGame::ConfigureMatchSessionForRules( mpMatchSession &session,
+		const mpMatchRulesSnapshot &rules, bool rulesValid ) const {
+	mpMatchReadinessPolicy policy;
+	policy.policy = MP_MATCH_READY_DISABLED;
+	policy.botPolicy = MP_MATCH_BOTS_EXCLUDED;
+	policy.teamMode = gameLocal.IsTeamGame();
+	policy.minimumActiveHumans = 1;
+	policy.minimumActivePerRequiredSide = 0;
+	policy.readyThresholdBasisPoints = 10000;
+	policy.maximumActivePerSide = 0;
+	policy.requiredSideMask = 0u;
+	policy.requireDeclaredRosterSeats = false;
+
+	int rosterSize = 0;
+	int timeoutCount = 0;
+	int timeoutDurationMsec = 0;
+	bool timeoutDuringCountdown = false;
+	mpMatchResumePolicy_t resumePolicy = MP_MATCH_RESUME_OWNER_OR_AUTHORITY;
+	int regulationMsec = 0;
+	if ( rulesValid ) {
+		policy.policy = static_cast<mpMatchReadyPolicy_t>(
+			rules.GetInteger( MP_RULE_READINESS_POLICY ) );
+		policy.botPolicy = rules.GetBool( MP_RULE_BOTS_CAN_READY ) ?
+			MP_MATCH_BOTS_COUNT_AS_READY : MP_MATCH_BOTS_EXCLUDED;
+		policy.minimumActiveHumans = rules.GetInteger( MP_RULE_MIN_ACTIVE_HUMANS );
+		const bool requireBothTeams = policy.teamMode &&
+			rules.GetBool( MP_RULE_REQUIRE_BOTH_TEAMS );
+		policy.requiredSideMask = requireBothTeams ? 3u : 0u;
+		policy.minimumActivePerRequiredSide = requireBothTeams ?
+			rules.GetInteger( MP_RULE_MIN_TEAM_SIZE ) : 0;
+		policy.readyThresholdBasisPoints = static_cast<uint32_t>(
+			rules.GetInteger( MP_RULE_READY_THRESHOLD_BASIS_POINTS ) );
+		rosterSize = rules.GetInteger( MP_RULE_ROSTER_SIZE_PER_TEAM );
+		policy.maximumActivePerSide = rosterSize;
+		policy.requireDeclaredRosterSeats = rosterSize > 0;
+		timeoutCount = rules.GetInteger( MP_RULE_TEAM_TIMEOUT_COUNT );
+		timeoutDurationMsec = rules.GetInteger( MP_RULE_TEAM_TIMEOUT_SECONDS ) * 1000;
+		timeoutDuringCountdown = rules.GetInteger( MP_RULE_TIMEOUT_REQUEST_WINDOW ) ==
+			MP_TIMEOUT_DURING_COUNTDOWN_OR_LIVE;
+		switch ( rules.GetInteger( MP_RULE_TIMEOUT_RESUME_POLICY ) ) {
+			case MP_TIMEOUT_RESUME_BOTH_SIDES_OR_REFEREE:
+				resumePolicy = MP_MATCH_RESUME_BOTH_TEAMS_OR_AUTHORITY;
+				break;
+			case MP_TIMEOUT_RESUME_REFEREE_ONLY:
+				resumePolicy = MP_MATCH_RESUME_AUTHORITY_ONLY;
+				break;
+			default:
+				resumePolicy = MP_MATCH_RESUME_OWNER_OR_AUTHORITY;
+				break;
+		}
+		regulationMsec = rules.GetInteger( MP_RULE_TIME_LIMIT_MINUTES ) * 60 * 1000;
+	}
+	if ( IsArenaCampaignMatch() ) {
+		policy.policy = MP_MATCH_READY_DISABLED;
+		policy.botPolicy = MP_MATCH_BOTS_COUNT_AS_READY;
+		policy.minimumActiveHumans = 1;
+		policy.minimumActivePerRequiredSide = 0;
+		policy.readyThresholdBasisPoints = 0;
+		policy.requiredSideMask = 0;
+	}
+
+	if ( session.ConfigureReadiness( policy,
+		session.GetSessionRevision() ).WasRejected() ) {
+		return false;
+	}
+
+	const int seatsPerSide = MP_MATCH_MAX_ROSTER_SEATS / MP_MATCH_SIDE_COUNT;
+	for ( int seat = 0; seat < MP_MATCH_MAX_ROSTER_SEATS; ++seat ) {
+		const int side = seat / seatsPerSide;
+		const int sideSeat = seat % seatsPerSide;
+		const bool desiredRequired = policy.teamMode && side < MP_MATCH_SIDE_COUNT &&
+			sideSeat < rosterSize;
+		const bool desiredCoach = policy.teamMode && rosterSize > 0 &&
+			side < MP_MATCH_SIDE_COUNT && sideSeat == rosterSize;
+		const bool desiredSubstitute = policy.teamMode && rosterSize > 0 &&
+			side < MP_MATCH_SIDE_COUNT && sideSeat > rosterSize;
+		const mpMatchRosterSeat *existing = session.GetRosterSeat( seat );
+		if ( desiredRequired ) {
+			const mpMatchRosterRole_t role = sideSeat == 0 ?
+				MP_MATCH_ROSTER_CAPTAIN : MP_MATCH_ROSTER_PLAYER;
+			if ( existing != NULL && existing->side != side &&
+				existing->occupant.IsValid() ) {
+				return false;
+			}
+			if ( session.DeclareRosterSeat( seat, side, role, true,
+				session.GetSessionRevision() ).WasRejected() ) {
+				return false;
+			}
+		} else if ( desiredCoach || desiredSubstitute ) {
+			const mpMatchRosterRole_t role = desiredCoach ?
+				MP_MATCH_ROSTER_COACH : MP_MATCH_ROSTER_SUBSTITUTE;
+			if ( existing != NULL && existing->occupant.IsValid() &&
+				( existing->side != side ||
+					existing->role != role ) ) {
+				return false;
+			}
+			if ( session.DeclareRosterSeat( seat, side, role, false,
+				session.GetSessionRevision() ).WasRejected() ) {
+				return false;
+			}
+		} else if ( existing != NULL && existing->declared ) {
+			if ( existing->occupant.IsValid() ||
+				session.ClearRosterSeat( seat,
+					session.GetSessionRevision() ).WasRejected() ) {
+				return false;
+			}
+		}
+	}
+
+	if ( session.ConfigureTimeouts( timeoutCount, timeoutDurationMsec,
+		timeoutDuringCountdown, 5000, resumePolicy,
+		session.GetSessionRevision() ).WasRejected() ||
+		session.ConfigureRegulationPeriod( regulationMsec,
+			session.GetSessionRevision() ).WasRejected() ) {
+		return false;
+	}
+
+	mpMatchReadinessBlockerMask_t blockers = 0;
+	if ( !rulesValid ) {
+		const bool mapFailure = competitiveRulesFailure ==
+			MP_RULE_ERROR_MAP_CHECK_MISMATCH ||
+			competitiveRulesFailure == MP_RULE_ERROR_MAP_UNSUPPORTED;
+		blockers |= MPMatchReadinessBlockerBit( mapFailure ?
+			MP_MATCH_BLOCKER_MAP_INVALID : MP_MATCH_BLOCKER_RULES_INVALID );
+	}
+	return !session.SetExternalReadinessBlockers( blockers,
+		session.GetSessionRevision() ).WasRejected();
+}
+
+bool idMultiplayerGame::ConfigureMatchSessionFromCompetitiveRules( void ) {
+	mpMatchSession candidate = matchSession;
+	if ( !ConfigureMatchSessionForRules( candidate, matchRules.Committed(),
+		competitiveRulesValidForSession ) ) {
+		return false;
+	}
+	matchSession = candidate;
+	return true;
+}
+
+mpMatchTeamsPolicy_t idMultiplayerGame::BuildMatchTeamsPolicy( void ) const {
+	mpMatchTeamsPolicy_t policy;
+	policy.Clear();
+	policy.teamMode = gameLocal.IsTeamGame();
+	policy.queueEnabled = gameLocal.gameType == GAME_DUEL;
+	policy.requireRosterMembership = policy.teamMode &&
+		matchRules.Committed().GetInteger( MP_RULE_ROSTER_SIZE_PER_TEAM ) > 0;
+	policy.invitationBypassesLock = true;
+	policy.requireInvitationForSubstitution = true;
+	policy.allowLiveJoin = false;
+	policy.allowLiveSubstitution = false;
+	const int serverCapacity = idMath::ClampInt( 1, MAX_CLIENTS,
+		gameLocal.serverInfo.GetInt( "si_maxPlayers", "12" ) );
+	policy.maximumActiveTotal = gameLocal.gameType == GAME_DUEL ? 2 : serverCapacity;
+	const int rosterSize = matchRules.Committed().GetInteger(
+		MP_RULE_ROSTER_SIZE_PER_TEAM );
+	policy.maximumActivePerSide = policy.teamMode ?
+		( rosterSize > 0 ? rosterSize : Max( 1, serverCapacity / 2 ) ) : 0;
+	return policy;
+}
+
+bool idMultiplayerGame::ApplyMatchTeamsTransaction(
+		const mpMatchTeamsJoinDecision_t &decision,
+		mpOperationExecutionResult_t &execution ) {
+	if ( !decision.IsAllowed() ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+		execution.protocolReason = decision.reason == MP_MATCH_TEAMS_REASON_TEAM_LOCKED ?
+			MP_MATCH_PROTOCOL_REASON_NOT_AUTHORIZED : MP_MATCH_PROTOCOL_REASON_CONFLICT;
+		execution.continuation.Clear();
+		return false;
+	}
+	const mpMatchTeamsTransactionPlan_t &plan = decision.plan;
+	const mpMatchTeamsPolicy_t policy = BuildMatchTeamsPolicy();
+	auto rejectTransaction = [&execution]() {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_CONFLICT;
+		execution.continuation.Clear();
+		return false;
+	};
+	mpMatchTeams candidateTeams = matchTeams;
+	mpMatchSession candidateSession = matchSession;
+	const mpMatchTeamsMutationResult_t teamMutation =
+		candidateTeams.CommitTransactionPlan( plan, matchSession, policy,
+			mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+			matchTeams.GetRevision() );
+	if ( teamMutation.WasRejected() ) {
+		return rejectTransaction();
+	}
+
+	auto applyMutation = []( const mpMatchMutationResult &mutation ) {
+		return !mutation.WasRejected();
+	};
+	if ( plan.vacateRosterSeat && !applyMutation(
+		candidateSession.VacateRosterSeat( plan.rosterSeat,
+			candidateSession.GetSessionRevision() ) ) ) {
+		return rejectTransaction();
+	}
+	if ( plan.vacateOutgoingRosterSeat && !applyMutation(
+		candidateSession.VacateRosterSeat( plan.outgoingRosterSeat,
+			candidateSession.GetSessionRevision() ) ) ) {
+		return rejectTransaction();
+	}
+	if ( plan.setOutgoingActive && !applyMutation(
+		candidateSession.SetParticipantActive( plan.outgoingParticipant,
+			plan.outgoingActive, candidateSession.GetSessionRevision() ) ) ) {
+		return rejectTransaction();
+	}
+	if ( plan.setOutgoingSide && !applyMutation(
+		candidateSession.SetParticipantSide( plan.outgoingParticipant,
+			plan.outgoingSide, candidateSession.GetSessionRevision() ) ) ) {
+		return rejectTransaction();
+	}
+	if ( plan.clearOutgoingRosterRole ) {
+		const mpMatchParticipantState *outgoing =
+			candidateSession.FindParticipant( plan.outgoingParticipant );
+		mpMatchRoleMask_t roles = 0;
+		if ( outgoing == NULL || !MPMatchTeamsClearRosterRole(
+			outgoing->roles, roles ) || !applyMutation(
+				candidateSession.SetParticipantRoles( plan.outgoingParticipant,
+					roles, candidateSession.GetSessionRevision() ) ) ) {
+			return rejectTransaction();
+		}
+	}
+	if ( plan.assignOutgoingRosterRole ) {
+		const mpMatchParticipantState *outgoing =
+			candidateSession.FindParticipant( plan.outgoingParticipant );
+		mpMatchRoleMask_t roles = 0;
+		if ( outgoing == NULL || !MPMatchTeamsAssignRosterRole(
+			outgoing->roles, plan.outgoingRosterRole, roles ) || !applyMutation(
+				candidateSession.SetParticipantRoles( plan.outgoingParticipant,
+					roles, candidateSession.GetSessionRevision() ) ) ) {
+			return rejectTransaction();
+		}
+	}
+	if ( plan.setIncomingSide && !applyMutation(
+		candidateSession.SetParticipantSide( plan.incomingParticipant,
+			plan.incomingSide, candidateSession.GetSessionRevision() ) ) ) {
+		return rejectTransaction();
+	}
+	auto assignIncomingRosterRole = [&candidateSession, &plan, &applyMutation]() {
+		const mpMatchParticipantState *incoming =
+			candidateSession.FindParticipant( plan.incomingParticipant );
+		mpMatchRoleMask_t roles = 0;
+		return incoming != NULL && MPMatchTeamsAssignRosterRole(
+			incoming->roles, plan.rosterRole, roles ) && applyMutation(
+				candidateSession.SetParticipantRoles( plan.incomingParticipant,
+					roles, candidateSession.GetSessionRevision() ) );
+	};
+	// Activation requires the player role first; deactivation requires activity
+	// to clear before installing a coach/substitute role.  This ordering keeps
+	// every intermediate candidate state valid without publishing any of it.
+	if ( plan.assignIncomingRosterRole && plan.incomingActive &&
+		!assignIncomingRosterRole() ) {
+		return rejectTransaction();
+	}
+	if ( plan.setIncomingActive && !applyMutation(
+		candidateSession.SetParticipantActive( plan.incomingParticipant,
+			plan.incomingActive, candidateSession.GetSessionRevision() ) ) ) {
+		return rejectTransaction();
+	}
+	if ( plan.assignIncomingRosterRole && !plan.incomingActive &&
+		!assignIncomingRosterRole() ) {
+		return rejectTransaction();
+	}
+	if ( plan.assignRosterSeat && !applyMutation(
+		candidateSession.AssignRosterSeat( plan.rosterSeat,
+			plan.incomingParticipant, candidateSession.GetSessionRevision() ) ) ) {
+		return rejectTransaction();
+	}
+	if ( plan.assignOutgoingRosterSeat && !applyMutation(
+		candidateSession.AssignRosterSeat( plan.outgoingRosterSeat,
+			plan.outgoingParticipant, candidateSession.GetSessionRevision() ) ) ) {
+		return rejectTransaction();
+	}
+	if ( !candidateTeams.ValidateInvariants() || !candidateSession.ValidateInvariants() ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_INVARIANT;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+		execution.continuation.Clear();
+		return false;
+	}
+	matchTeams = candidateTeams;
+	matchSession = candidateSession;
+	ReconcileGameplayPhaseAfterMatchMutation();
+	execution.outcome = teamMutation.WasApplied() ||
+		matchSession.GetSessionRevision() != plan.expectedSessionRevision ?
+		MP_OPERATION_APPLIED : MP_OPERATION_NO_CHANGE;
+	execution.reason = MP_OPERATION_REASON_NONE;
+	execution.resultingSessionRevision = matchSession.GetSessionRevision();
+	execution.continuation.Clear();
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::ApplyMatchSpectatorTransition
+
+Leaving play is a team transaction too.  It must release any roster seat,
+queue ticket and invitation authority before clearing the gameplay side, while
+preserving the baseline player role so the same connection can request a legal
+join later.  Work on copies and publish both aggregates only after every
+invariant succeeds.
+================
+*/
+bool idMultiplayerGame::ApplyMatchSpectatorTransition(
+		mpParticipantId participant, mpOperationExecutionResult_t &execution ) {
+	auto rejectTransition = [&execution]( mpMatchProtocolReason_t reason ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_CORE_REJECTED;
+		execution.protocolReason = reason;
+		execution.continuation.Clear();
+		return false;
+	};
+
+	const mpMatchParticipantState *current = matchSession.FindParticipant( participant );
+	if ( current == NULL || !current->connected ) {
+		return rejectTransition( MP_MATCH_PROTOCOL_REASON_INVALID_PARTICIPANT );
+	}
+
+	mpMatchTeams candidateTeams = matchTeams;
+	mpMatchSession candidateSession = matchSession;
+	const uint64_t baselineSessionRevision = candidateSession.GetSessionRevision();
+	const mpMatchTeamsMutationResult_t teamMutation =
+		candidateTeams.RemoveParticipant( candidateSession.GetSessionId(), participant,
+			mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+			candidateTeams.GetRevision() );
+	if ( teamMutation.WasRejected() ) {
+		return rejectTransition( MP_MATCH_PROTOCOL_REASON_CONFLICT );
+	}
+
+	const int rosterSeat = candidateSession.FindRosterSeat( participant );
+	if ( rosterSeat >= 0 && candidateSession.VacateRosterSeat( rosterSeat,
+		candidateSession.GetSessionRevision() ).WasRejected() ) {
+		return rejectTransition( MP_MATCH_PROTOCOL_REASON_CONFLICT );
+	}
+	if ( rosterSeat >= 0 ) {
+		const mpMatchParticipantState *candidateParticipant =
+			candidateSession.FindParticipant( participant );
+		mpMatchRoleMask_t roles = 0;
+		if ( candidateParticipant == NULL || !MPMatchTeamsAssignRosterRole(
+			candidateParticipant->roles, MP_MATCH_ROSTER_PLAYER, roles ) ||
+			candidateSession.SetParticipantRoles( participant, roles,
+				candidateSession.GetSessionRevision() ).WasRejected() ) {
+			return rejectTransition( MP_MATCH_PROTOCOL_REASON_CONFLICT );
+		}
+	}
+	if ( candidateSession.SetParticipantActive( participant, false,
+		candidateSession.GetSessionRevision() ).WasRejected() ||
+		candidateSession.SetParticipantSide( participant, MP_MATCH_SIDE_NONE,
+			candidateSession.GetSessionRevision() ).WasRejected() ) {
+		return rejectTransition( MP_MATCH_PROTOCOL_REASON_ILLEGAL_PHASE );
+	}
+	if ( !candidateTeams.ValidateInvariants() ||
+		!candidateSession.ValidateInvariants() ) {
+		execution.outcome = MP_OPERATION_REJECTED;
+		execution.reason = MP_OPERATION_REASON_INVARIANT;
+		execution.protocolReason = MP_MATCH_PROTOCOL_REASON_INTERNAL;
+		execution.continuation.Clear();
+		return false;
+	}
+
+	matchTeams = candidateTeams;
+	matchSession = candidateSession;
+	ReconcileGameplayPhaseAfterMatchMutation();
+	execution.outcome = teamMutation.WasApplied() ||
+		matchSession.GetSessionRevision() != baselineSessionRevision ?
+		MP_OPERATION_APPLIED : MP_OPERATION_NO_CHANGE;
+	execution.reason = MP_OPERATION_REASON_NONE;
+	execution.protocolReason = MP_MATCH_PROTOCOL_REASON_OK;
+	execution.resultingSessionRevision = matchSession.GetSessionRevision();
+	execution.continuation.Clear();
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::ReconcileGameplayPhaseAfterMatchMutation
+
+Roster/readiness mutations can atomically cancel COUNTDOWN inside the session.
+Apply the corresponding rvGameState side effects without attempting a second
+session transition.
+================
+*/
+void idMultiplayerGame::ReconcileGameplayPhaseAfterMatchMutation( void ) {
+	if ( !gameLocal.isServer || gameState == NULL ||
+		gameState->GetMPGameState() != COUNTDOWN ||
+		matchSession.GetPhase() != WARMUP ) {
+		return;
+	}
+	gameState->NewState( WARMUP );
+	gameState->SetNextMPGameState( INACTIVE );
+	gameState->SetNextMPGameStateTime( 0 );
+}
+
+void idMultiplayerGame::ApplyMatchTeamsPlanToLegacy(
+		const mpMatchTeamsTransactionPlan_t &plan ) {
+	const mpParticipantId participants[ 2 ] = {
+		plan.incomingParticipant, plan.outgoingParticipant
+	};
+	for ( int index = 0; index < 2; ++index ) {
+		if ( !participants[ index ].IsValid() ||
+			( index == 1 && participants[ 0 ] == participants[ 1 ] ) ) {
+			continue;
+		}
+		int slot = -1;
+		uint32_t generation = 0;
+		if ( !matchSession.ResolveParticipant( participants[ index ], slot,
+			generation ) || slot < 0 || slot >= gameLocal.numClients ) {
+			continue;
+		}
+		const mpMatchParticipantState *state =
+			matchSession.FindParticipant( participants[ index ] );
+		if ( state == NULL ) {
+			continue;
+		}
+		idDict updated = gameLocal.userInfo[ slot ];
+		if ( state->active ) {
+			updated.Set( "ui_spectate", "Play" );
+			if ( state->side >= 0 && state->side < TEAM_MAX ) {
+				updated.Set( "ui_team", teamNames[ state->side ] );
+			}
+		} else {
+			updated.Set( "ui_spectate", "Spectate" );
+		}
+		gameLocal.SetUserInfo( slot, updated, false );
+	}
+}
+
+void idMultiplayerGame::ProcessMatchTeamQueue( void ) {
+	if ( !gameLocal.isServer || !BuildMatchTeamsPolicy().queueEnabled ) {
+		return;
+	}
+	for ( int attempt = 0; attempt < MP_MATCH_TEAMS_MAX_QUEUE_ENTRIES; ++attempt ) {
+		const mpMatchTeamsJoinDecision_t decision = matchTeams.PlanNextQueueAdmission(
+			matchSession, BuildMatchTeamsPolicy(),
+			mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ) );
+		if ( !decision.IsAllowed() ) {
+			break;
+		}
+		mpOperationExecutionResult_t execution;
+		execution.Clear();
+		if ( !ApplyMatchTeamsTransaction( decision, execution ) ) {
+			break;
+		}
+		ApplyMatchTeamsPlanToLegacy( decision.plan );
+		ObserveMatchEvidence( mpParticipantId::Invalid() );
+	}
+}
+
+static uint32_t MatchEvidenceUnsignedStat( int value ) {
+	return value > 0 ? static_cast<uint32_t>( value ) : 0u;
+}
+
+static uint32_t MatchEvidenceUnsignedStat64( int64_t value ) {
+	if ( value <= 0 ) {
+		return 0u;
+	}
+	return value > static_cast<int64_t>( UINT32_MAX ) ? UINT32_MAX :
+		static_cast<uint32_t>( value );
+}
+
+mpEvidenceCommittedStamp idMultiplayerGame::BuildMatchEvidenceStamp( void ) const {
+	mpEvidenceCommittedStamp stamp;
+	stamp.sessionRevision = matchSession.GetSessionRevision();
+	stamp.matchTimeMsec = MatchViewTimeValue(
+		matchSession.GetMatchTime().Milliseconds() );
+	const time_t wallClock = time( NULL );
+	stamp.hostTimeUtcMsec = wallClock > 0 ?
+		static_cast<uint64_t>( wallClock ) * 1000ull : 0ull;
+	return stamp;
+}
+
+mpEvidenceActorRef idMultiplayerGame::MatchEvidenceActor(
+		mpParticipantId participant, bool serverOperator ) const {
+	if ( serverOperator ) {
+		return MPEvidenceServerOperatorActor();
+	}
+	return participant.IsValid() ?
+		MPEvidenceParticipantActor( participant.SequencePart() ) :
+		MPEvidenceSystemActor();
+}
+
+bool idMultiplayerGame::BeginMatchEvidence( void ) {
+	idStr evidenceMap;
+	if ( matchSeriesId != 0 && matchSeries.GetState() == MP_SERIES_MAP_ACTIVE ) {
+		if ( !CompetitionSeriesMapMatchesRuntime( matchSeries, gameLocal.gameType,
+			gameLocal.GetMapName(), &evidenceMap ) ) {
+			gameLocal.Warning( "cannot initialize series evidence for loaded map '%s'",
+				gameLocal.GetMapName() );
+			return false;
+		}
+	} else {
+		NormalizeMapDeclPath( gameLocal.GetMapName(), evidenceMap );
+		if ( evidenceMap.Length() == 0 ) {
+			NormalizeMapDeclPath( gameLocal.serverInfo.GetString( "si_map" ),
+				evidenceMap );
+		}
+	}
+	mpEvidenceMetadataInput metadata;
+	metadata.sessionId = matchSession.GetSessionId();
+	metadata.seriesId = matchSeriesId != 0 &&
+		matchSeries.GetState() == MP_SERIES_MAP_ACTIVE ? matchSeriesId : 0;
+	metadata.rulesDigest = matchRules.Committed().Digest();
+	metadata.modeId = static_cast<uint32_t>( Max( 0,
+		static_cast<int>( gameLocal.gameType ) ) );
+	metadata.build = BUILD_STRING;
+	metadata.map = evidenceMap.c_str();
+	metadata.mode = MPGameTypeName( gameLocal.gameType );
+	if ( !matchEvidence.Reset( metadata ) ) {
+		gameLocal.Warning( "could not initialize bounded competitive match evidence" );
+		return false;
+	}
+	matchEvidenceObserver.Reset( matchSession, matchProposals );
+	matchEvidenceFinalized = false;
+	matchEvidencePersisted = false;
+	matchEvidenceFinalizationPending = false;
+	matchMVDStartedBySession = false;
+	matchMVDAttemptedBySession = false;
+	matchMVDOperatorOwnedBySession = false;
+	memset( matchMVDQPath, 0, sizeof( matchMVDQPath ) );
+	LinkCurrentSeriesEvidence();
+	return true;
+}
+
+void idMultiplayerGame::ReconcileMatchEvidenceForCommittedRules( void ) {
+	const bool reportBackedSeriesMap = matchSeriesId != 0 &&
+		matchSeries.GetState() == MP_SERIES_MAP_ACTIVE;
+	const bool enabled = gameLocal.isServer &&
+		( matchEvidenceMode > 0 || reportBackedSeriesMap ) &&
+		matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH );
+	if ( !enabled ) {
+		// Rules can return to casual only before the map snapshot freezes, so an
+		// automatic MVD cannot legitimately be live here.  Keep the stop anyway
+		// as a fail-safe, then discard the uncommitted competitive artifact.
+		StopMatchMVD( "managed match evidence disabled" );
+		matchEvidence.Clear();
+		matchEvidenceFinalized = false;
+		matchEvidencePersisted = false;
+		matchEvidenceFinalizationPending = false;
+		matchMVDStartedBySession = false;
+		matchMVDAttemptedBySession = false;
+		matchMVDOperatorOwnedBySession = false;
+		memset( matchMVDQPath, 0, sizeof( matchMVDQPath ) );
+		return;
+	}
+
+	const uint64_t expectedSeriesId = reportBackedSeriesMap ? matchSeriesId : 0;
+	const bool identityMatches = matchEvidence.IsInitialized() &&
+		matchEvidence.GetMetadata().sessionId == matchSession.GetSessionId() &&
+		matchEvidence.GetMetadata().seriesId == expectedSeriesId &&
+		matchEvidence.GetMetadata().rulesDigest == matchRules.Committed().Digest() &&
+		matchEvidence.GetMetadata().modeId == static_cast<uint32_t>( Max( 0,
+			static_cast<int>( gameLocal.gameType ) ) );
+	if ( identityMatches ) {
+		return;
+	}
+	// A committed rules/profile replacement is legal only before freeze.  Seed
+	// a fresh artifact from that exact snapshot so a casual-to-managed switch or
+	// warmup profile edit cannot retain the previous digest or pre-policy events.
+	if ( matchSession.HasFrozenRules() ) {
+		gameLocal.Warning( "competitive evidence rules digest changed after freeze" );
+		return;
+	}
+	if ( !BeginMatchEvidence() ) {
+		matchEvidence.Clear();
+		matchEvidenceFinalized = false;
+		matchEvidencePersisted = false;
+		matchEvidenceFinalizationPending = false;
+	}
+}
+
+void idMultiplayerGame::LinkCurrentSeriesEvidence( void ) {
+	if ( !matchEvidence.IsInitialized() || matchEvidenceFinalized ||
+		matchSeriesId == 0 || ( matchSeries.GetState() != MP_SERIES_MAP_ACTIVE &&
+			matchSeries.GetState() != MP_SERIES_MAP_COMPLETE ) ) {
+		return;
+	}
+	const mpEvidenceWriteResult linked = matchEvidence.LinkSeriesId(
+		BuildMatchEvidenceStamp(), matchSeriesId );
+	if ( linked.code == MP_EVIDENCE_WRITE_REJECTED ) {
+		gameLocal.Warning( "could not link match evidence to competition series %llu "
+			"(reason %d)", static_cast<unsigned long long>( matchSeriesId ),
+			linked.reason );
+	}
+}
+
+void idMultiplayerGame::ObserveMatchEvidence( mpParticipantId actor,
+		bool serverOperator ) {
+	if ( !gameLocal.isServer || matchEvidenceMode < 2 ||
+		!matchEvidence.IsInitialized() ||
+		matchEvidenceFinalized ) {
+		return;
+	}
+	matchEvidenceObserver.Observe( matchEvidence, BuildMatchEvidenceStamp(),
+		matchSession, matchProposals,
+		MatchEvidenceActor( actor, serverOperator ) );
+}
+
+void idMultiplayerGame::RecordMatchEvidenceParticipantStats( int clientNum,
+		mpParticipantId participant ) {
+	if ( !matchEvidence.IsInitialized() || matchEvidenceFinalized ||
+		!participant.IsValid() || clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+	const mpMatchParticipantState *state = matchSession.FindParticipant( participant );
+	if ( state == NULL || !state->human || state->slot != clientNum ) {
+		return;
+	}
+	rvPlayerStat *stats = statManager != NULL ?
+		statManager->GetPlayerStat( clientNum ) : NULL;
+	int64_t shots = 0;
+	int64_t hits = 0;
+	if ( stats != NULL ) {
+		for ( int weapon = 0; weapon < MAX_WEAPONS; ++weapon ) {
+			shots += Max( 0, stats->weaponShots[ weapon ] );
+			hits += Max( 0, stats->weaponHits[ weapon ] );
+		}
+	}
+	char displayName[ MP_MATCH_EVIDENCE_MAX_DISPLAY_NAME_BYTES + 1 ];
+	MatchArtifactDisplayName(
+		gameLocal.userInfo[ clientNum ].GetString( "ui_name" ),
+		participant.SequencePart(), displayName,
+		MP_MATCH_EVIDENCE_MAX_DISPLAY_NAME_BYTES );
+	mpEvidenceParticipantStatsInput input;
+	input.participantSequence = participant.SequencePart();
+	input.side = static_cast<int8_t>( state->side );
+	input.displayName = displayName;
+	input.score = playerState[ clientNum ].fragCount;
+	input.kills = stats != NULL ? MatchEvidenceUnsignedStat( stats->kills ) : 0;
+	input.deaths = stats != NULL ? MatchEvidenceUnsignedStat( stats->deaths ) : 0;
+	input.suicides = stats != NULL ? MatchEvidenceUnsignedStat( stats->suicides ) : 0;
+	input.damageGiven = stats != NULL ? MatchEvidenceUnsignedStat( stats->damageGiven ) : 0;
+	input.damageReceived = stats != NULL ? MatchEvidenceUnsignedStat( stats->damageTaken ) : 0;
+	input.shots = MatchEvidenceUnsignedStat64( shots );
+	input.hits = Min( input.shots, MatchEvidenceUnsignedStat64( hits ) );
+	mpEvidenceWriteResult written = matchEvidence.RecordParticipantFinalStats(
+		BuildMatchEvidenceStamp(), input );
+	if ( written.code == MP_EVIDENCE_WRITE_REJECTED &&
+		written.reason == MP_EVIDENCE_REASON_INVALID_TEXT ) {
+		idStr::snPrintf( displayName, sizeof( displayName ), "player-%u",
+			participant.SequencePart() );
+		written = matchEvidence.RecordParticipantFinalStats(
+			BuildMatchEvidenceStamp(), input );
+	}
+	if ( written.WasDropped() ) {
+		gameLocal.Warning( "competitive evidence participant-stat capacity exhausted" );
+	}
+}
+
+void idMultiplayerGame::RecordMatchEvidenceFinalStats( void ) {
+	if ( !matchEvidence.IsInitialized() || matchEvidenceFinalized ) {
+		return;
+	}
+	uint32_t teamDamage[ MP_MATCH_SIDE_COUNT ] = { 0, 0 };
+	for ( int index = 0; index < MP_MATCH_MAX_PARTICIPANTS; ++index ) {
+		const mpMatchParticipantState *participant =
+			matchSession.GetParticipantByIndex( index );
+		if ( participant == NULL || !participant->id.IsValid() ||
+			!participant->human || participant->slot < 0 ||
+			participant->slot >= MAX_CLIENTS ) {
+			continue;
+		}
+		RecordMatchEvidenceParticipantStats( participant->slot, participant->id );
+		if ( participant->side >= 0 && participant->side < MP_MATCH_SIDE_COUNT &&
+			statManager != NULL ) {
+			const rvPlayerStat *stats = statManager->GetPlayerStat( participant->slot );
+			if ( stats != NULL ) {
+				const uint64_t combined = static_cast<uint64_t>( teamDamage[ participant->side ] ) +
+					MatchEvidenceUnsignedStat( stats->damageGiven );
+				teamDamage[ participant->side ] = combined > UINT32_MAX ? UINT32_MAX :
+					static_cast<uint32_t>( combined );
+			}
+		}
+	}
+	if ( gameLocal.IsTeamGame() ) {
+		for ( int side = 0; side < MP_MATCH_SIDE_COUNT; ++side ) {
+			matchEvidence.RecordTeamFinalStats( BuildMatchEvidenceStamp(), side,
+				teamScore[ side ], 0, 0, teamDamage[ side ] );
+		}
+	}
+}
+
+void idMultiplayerGame::RecordMatchEvidenceResult(
+		mpMatchTransitionReason_t reason, mpParticipantId authorizer,
+		int forfeitingSide ) {
+	if ( !matchEvidence.IsInitialized() || matchEvidenceFinalized ) {
+		return;
+	}
+	for ( int index = 0; index < matchEvidence.GetEventCount(); ++index ) {
+		const mpEvidenceEvent *existing = matchEvidence.GetEvent( index );
+		if ( existing != NULL && existing->kind == MP_EVIDENCE_EVENT_MAP_RESULT ) {
+			return;
+		}
+	}
+	mpEvidenceMapResult result;
+	memset( &result, 0, sizeof( result ) );
+	result.winnerSide = -1;
+	result.reason = static_cast<uint16_t>( reason != MP_MATCH_TRANSITION_NONE ?
+		reason : MP_MATCH_TRANSITION_SESSION_END );
+	result.authorizer = MatchEvidenceActor( authorizer );
+	const bool activeSeriesMap = matchSeriesId != 0 &&
+		matchSeries.GetState() == MP_SERIES_MAP_ACTIVE;
+	if ( activeSeriesMap ) {
+		for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+			if ( gameLocal.IsTeamGame() ) {
+				const int gameSide = matchSeriesGameSideForCompetition[ side ];
+				result.sideScore[ side ] = gameSide >= 0 && gameSide < TEAM_MAX ?
+					teamScore[ gameSide ] : 0;
+			} else {
+				const int slot = matchSeriesContestantSlot[ side ];
+				result.sideScore[ side ] = slot >= 0 && slot < MAX_CLIENTS &&
+					matchSeriesContestantConnection[ side ] != 0 &&
+					matchSeriesContestantConnection[ side ] ==
+						matchConnectionId[ slot ] ? playerState[ slot ].fragCount : 0;
+			}
+		}
+	} else {
+		result.sideScore[ 0 ] = teamScore[ 0 ];
+		result.sideScore[ 1 ] = teamScore[ 1 ];
+	}
+	if ( reason == MP_MATCH_TRANSITION_MATCH_ABORTED ||
+		reason == MP_MATCH_TRANSITION_MAP_SHUTDOWN ||
+		reason == MP_MATCH_TRANSITION_FATAL_RESET ||
+		reason == MP_MATCH_TRANSITION_SESSION_END ) {
+		result.outcome = MP_EVIDENCE_RESULT_ABORTED;
+	} else if ( reason == MP_MATCH_TRANSITION_FORFEIT ) {
+		result.outcome = MP_EVIDENCE_RESULT_FORFEIT;
+		if ( forfeitingSide < 0 || forfeitingSide >= MP_SERIES_SIDE_COUNT ) {
+			const mpMatchParticipantState *actor = matchSession.FindParticipant( authorizer );
+			forfeitingSide = activeSeriesMap ? ResolveCompetitionSide( authorizer ) :
+				( actor != NULL ? actor->side : MP_MATCH_SIDE_NONE );
+		} else if ( activeSeriesMap && gameLocal.IsTeamGame() ) {
+			int competitionSide = MP_SERIES_SIDE_NONE;
+			for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+				if ( matchSeriesGameSideForCompetition[ side ] == forfeitingSide ) {
+					competitionSide = side;
+					break;
+				}
+			}
+			forfeitingSide = competitionSide;
+		}
+		if ( forfeitingSide >= 0 && forfeitingSide < MP_SERIES_SIDE_COUNT ) {
+			result.winnerSide = static_cast<int8_t>( forfeitingSide == 0 ? 1 : 0 );
+		}
+	} else if ( activeSeriesMap ) {
+		if ( result.sideScore[ 0 ] != result.sideScore[ 1 ] ) {
+			result.outcome = MP_EVIDENCE_RESULT_DECIDED;
+			result.winnerSide = static_cast<int8_t>(
+				result.sideScore[ 0 ] > result.sideScore[ 1 ] ? 0 : 1 );
+			if ( gameLocal.gameType == GAME_DUEL ) {
+				const int winnerSlot = matchSeriesContestantSlot[
+					result.winnerSide ];
+				uint32_t generation = 0;
+				mpParticipantId winner;
+				if ( winnerSlot >= 0 && winnerSlot < MAX_CLIENTS &&
+					matchSession.GetSlotGeneration( winnerSlot, generation ) &&
+					matchSession.ResolveSlotBinding( winnerSlot, generation, winner ) ) {
+					result.winnerParticipant = winner.SequencePart();
+				}
+			}
+		} else {
+			result.outcome = MP_EVIDENCE_RESULT_DRAW;
+		}
+	} else if ( gameLocal.IsTeamGame() ) {
+		const int leader = TeamLeader();
+		if ( leader >= 0 && leader < MP_MATCH_SIDE_COUNT ) {
+			result.outcome = MP_EVIDENCE_RESULT_DECIDED;
+			result.winnerSide = static_cast<int8_t>( leader );
+		} else {
+			result.outcome = MP_EVIDENCE_RESULT_DRAW;
+		}
+	} else if ( rankedPlayers.Num() > 0 && rankedPlayers[ 0 ].First() != NULL ) {
+		result.outcome = MP_EVIDENCE_RESULT_DECIDED;
+		const int winnerSlot = rankedPlayers[ 0 ].First()->entityNumber;
+		uint32_t generation = 0;
+		mpParticipantId winner;
+		if ( matchSession.GetSlotGeneration( winnerSlot, generation ) &&
+			matchSession.ResolveSlotBinding( winnerSlot, generation, winner ) ) {
+			result.winnerParticipant = winner.SequencePart();
+		}
+	} else {
+		result.outcome = MP_EVIDENCE_RESULT_DRAW;
+	}
+	if ( result.outcome == MP_EVIDENCE_RESULT_FORFEIT &&
+		result.winnerSide < 0 && result.winnerParticipant == 0 ) {
+		result.outcome = MP_EVIDENCE_RESULT_ABORTED;
+	}
+	const mpEvidenceWriteResult written = matchEvidence.AppendMapResult(
+		BuildMatchEvidenceStamp(), result );
+	if ( written.code != MP_EVIDENCE_WRITE_ACCEPTED ) {
+		matchEvidenceFinalizationPending = true;
+		gameLocal.Warning( "competitive terminal result could not be journaled (reason %d)",
+			written.reason );
+	}
+}
+
+bool idMultiplayerGame::PersistMatchEvidence(
+		mpEvidenceStorageResult *storageResult ) {
+	if ( storageResult != NULL ) {
+		storageResult->Clear();
+	}
+	if ( !matchEvidence.IsInitialized() ) {
+		return false;
+	}
+	mpMatchEvidenceFileSystemWriter writer( fileSystem );
+	mpEvidenceStorageResult stored = MPMatchEvidenceStoragePersist(
+		matchEvidence, writer, matchEvidenceWorkspace );
+	if ( stored.Succeeded() ) {
+		matchEvidencePersisted = true;
+		if ( storageResult != NULL ) {
+			*storageResult = stored;
+		}
+		return true;
+	}
+	const uint16_t failureReason = static_cast<uint16_t>( stored.reason !=
+		MP_EVIDENCE_STORAGE_REASON_NONE ? stored.reason :
+		MP_EVIDENCE_STORAGE_REASON_TEMP_WRITE_FAILED );
+	MatchEvidenceOutputFailureOnce( matchEvidence, BuildMatchEvidenceStamp(),
+		MP_EVIDENCE_OUTPUT_MAP_ARTIFACT, failureReason );
+	gameLocal.Warning( "could not persist competitive match evidence (reason %d, cleanup %d)",
+		stored.reason, stored.cleanupReason );
+	// The failure event belongs in the artifact itself.  Retry once after
+	// appending it; persistent backend failure remains a typed series-report
+	// artifact status and never blocks the authoritative checkpoint forever.
+	stored = MPMatchEvidenceStoragePersist( matchEvidence, writer,
+		matchEvidenceWorkspace );
+	if ( stored.Succeeded() ) {
+		matchEvidencePersisted = true;
+		if ( storageResult != NULL ) {
+			*storageResult = stored;
+		}
+		return true;
+	}
+	matchEvidencePersisted = false;
+	if ( storageResult != NULL ) {
+		*storageResult = stored;
+	}
+	return false;
+}
+
+bool idMultiplayerGame::CommitCompetitionSeriesMapEvidence(
+		const mpEvidenceStorageResult &evidenceStorage ) {
+	if ( matchSeriesId == 0 || matchSeries.GetState() != MP_SERIES_MAP_ACTIVE ||
+		!matchSeriesReport.IsInitialized() || !matchEvidence.IsInitialized() ||
+		matchSeriesAwaitingMapSession ||
+		matchSeriesLinkedSessionId != matchSession.GetSessionId() ) {
+		return false;
+	}
+	idStr selectedMapToken;
+	if ( !CompetitionSeriesMapMatchesRuntime( matchSeries, gameLocal.gameType,
+		gameLocal.GetMapName(), &selectedMapToken ) ) {
+		gameLocal.Warning( "competition result does not match loaded map '%s'",
+			gameLocal.GetMapName() );
+		return false;
+	}
+	const mpEvidenceMetadata &metadata = matchEvidence.GetMetadata();
+	idStr selectedPath;
+	idStr evidencePath;
+	if ( metadata.sessionId != matchSession.GetSessionId() ||
+		metadata.seriesId != matchSeriesId ||
+		metadata.rulesDigest != matchRules.Committed().Digest() ||
+		metadata.modeId != static_cast<uint32_t>( Max( 0,
+			static_cast<int>( gameLocal.gameType ) ) ) ||
+		!ResolveCompetitionMapPath( selectedMapToken.c_str(), selectedPath ) ||
+		!ResolveCompetitionMapPath( metadata.map, evidencePath ) ||
+		idStr::Icmp( selectedPath.c_str(), evidencePath.c_str() ) != 0 ) {
+		gameLocal.Warning( "competition result journal identity does not match its bound session" );
+		return false;
+	}
+	const mpEvidenceMapResult *evidenceResult = NULL;
+	for ( int index = 0; index < matchEvidence.GetEventCount(); ++index ) {
+		const mpEvidenceEvent *event = matchEvidence.GetEvent( index );
+		if ( event != NULL && event->kind == MP_EVIDENCE_EVENT_MAP_RESULT ) {
+			evidenceResult = &event->data.result;
+		}
+	}
+	if ( evidenceResult == NULL ) {
+		return false;
+	}
+
+	mpSeriesMapOutcome_t seriesOutcome = MP_SERIES_MAP_ABORTED;
+	mpSeriesReportMapOutcome_t reportOutcome = MP_SERIES_REPORT_MAP_ABORTED;
+	int winnerSide = MP_SERIES_SIDE_NONE;
+	if ( evidenceResult->outcome == MP_EVIDENCE_RESULT_DECIDED ) {
+		seriesOutcome = MP_SERIES_MAP_DECIDED;
+		reportOutcome = MP_SERIES_REPORT_MAP_DECIDED;
+		winnerSide = evidenceResult->winnerSide;
+	} else if ( evidenceResult->outcome == MP_EVIDENCE_RESULT_FORFEIT ) {
+		seriesOutcome = MP_SERIES_MAP_FORFEIT;
+		reportOutcome = MP_SERIES_REPORT_MAP_FORFEIT;
+		winnerSide = evidenceResult->winnerSide;
+	}
+	if ( ( seriesOutcome == MP_SERIES_MAP_DECIDED ||
+		seriesOutcome == MP_SERIES_MAP_FORFEIT ) &&
+		( winnerSide < 0 || winnerSide >= MP_SERIES_SIDE_COUNT ) ) {
+		return false;
+	}
+
+	mpCompetitionSeries seriesCandidate = matchSeries;
+	const mpSeriesMutationResult committed = seriesCandidate.CommitMapResult(
+		seriesOutcome, winnerSide, evidenceResult->sideScore[ 0 ],
+		evidenceResult->sideScore[ 1 ], matchSession.GetSessionId(),
+		matchRules.Committed().Digest(), seriesCandidate.GetRevision() );
+	if ( committed.WasRejected() || !seriesCandidate.ValidateInvariants() ) {
+		gameLocal.Warning( "competition series rejected sealed map result (reason %d)",
+			committed.reason );
+		return false;
+	}
+	const int attemptIndex = seriesCandidate.GetAttemptCount() - 1;
+	const mpSeriesMapAttempt *attempt = seriesCandidate.GetAttempt( attemptIndex );
+	const mpSeriesSelectedMap *selection = attempt != NULL ?
+		seriesCandidate.GetSelectedMap( attempt->selectionIndex ) : NULL;
+	const mpSeriesConfiguration &configuration = seriesCandidate.GetConfiguration();
+	if ( attempt == NULL || selection == NULL || selection->poolIndex < 0 ||
+		selection->poolIndex >= configuration.mapPoolCount ) {
+		return false;
+	}
+
+	mpSeriesReportMapResultInput mapInput;
+	memset( &mapInput, 0, sizeof( mapInput ) );
+	mapInput.attempt = static_cast<uint32_t>( attemptIndex + 1 );
+	mapInput.sessionId = attempt->matchSessionId;
+	mapInput.mapToken = configuration.mapPool[ selection->poolIndex ];
+	mapInput.rulesDigest = attempt->rulesDigest;
+	mapInput.outcome = reportOutcome;
+	mapInput.reason = evidenceResult->reason != 0 ? evidenceResult->reason :
+		static_cast<uint16_t>( MP_MATCH_TRANSITION_SESSION_END );
+	mapInput.winnerContestant = winnerSide;
+	mapInput.score[ 0 ] = attempt->score[ 0 ];
+	mapInput.score[ 1 ] = attempt->score[ 1 ];
+
+	mpSeriesReportArtifactInput &evidenceArtifact =
+		mapInput.artifacts[ MP_SERIES_REPORT_ARTIFACT_EVIDENCE ];
+	evidenceArtifact.qpath = "";
+	if ( matchEvidenceMode <= 0 ) {
+		evidenceArtifact.status = MP_SERIES_REPORT_ARTIFACT_NOT_REQUESTED;
+	} else if ( evidenceStorage.Succeeded() &&
+		MPMatchSeriesReportIsSafeArtifactQPath(
+			MP_SERIES_REPORT_ARTIFACT_EVIDENCE,
+			evidenceStorage.paths.finalQPath ) ) {
+		evidenceArtifact.status = MP_SERIES_REPORT_ARTIFACT_AVAILABLE;
+		evidenceArtifact.qpath = evidenceStorage.paths.finalQPath;
+	} else {
+		evidenceArtifact.status = MP_SERIES_REPORT_ARTIFACT_FAILED;
+		evidenceArtifact.reason = static_cast<uint16_t>( evidenceStorage.reason !=
+			MP_EVIDENCE_STORAGE_REASON_NONE ? evidenceStorage.reason :
+			MP_EVIDENCE_STORAGE_REASON_TEMP_WRITE_FAILED );
+	}
+
+	mpSeriesReportArtifactInput &mvdArtifact =
+		mapInput.artifacts[ MP_SERIES_REPORT_ARTIFACT_MVD ];
+	ProjectMatchMVDReportArtifact( mvdArtifact );
+
+	mpCompetitionSeriesReport reportCandidate = matchSeriesReport;
+	const mpSeriesReportWriteResult appended = reportCandidate.AppendMapResult(
+		mapInput );
+	if ( appended.code != MP_SERIES_REPORT_WRITE_ACCEPTED ) {
+		gameLocal.Warning( "competition report rejected sealed map result (reason %d)",
+			appended.reason );
+		return false;
+	}
+
+	const bool mapWon[ MP_SERIES_SIDE_COUNT ] = {
+		winnerSide == 0, winnerSide == 1
+	};
+	if ( gameLocal.IsTeamGame() ) {
+		for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+			const int gameSide = matchSeriesGameSideForCompetition[ side ];
+			const mpEvidenceTeamFinalStats *source = NULL;
+			for ( int index = 0; index < matchEvidence.GetTeamStatsCount(); ++index ) {
+				const mpEvidenceTeamFinalStats *candidate =
+					matchEvidence.GetTeamStats( index );
+				if ( candidate != NULL && candidate->side == gameSide ) {
+					source = candidate;
+					break;
+				}
+			}
+			mpSeriesReportTeamStatsInput delta;
+			memset( &delta, 0, sizeof( delta ) );
+			delta.contestant = side;
+			delta.mapsPlayed = 1;
+			delta.mapsWon = mapWon[ side ] ? 1 : 0;
+			delta.score = attempt->score[ side ];
+			if ( source != NULL ) {
+				delta.objectives = source->objectives;
+				delta.roundsWon = source->roundsWon;
+				delta.damageGiven = source->damageGiven;
+			}
+			const mpSeriesReportWriteResult accumulated =
+				reportCandidate.AccumulateTeamStats( delta );
+			if ( accumulated.code == MP_SERIES_REPORT_WRITE_REJECTED ) {
+				return false;
+			}
+		}
+	} else if ( gameLocal.gameType == GAME_DUEL ) {
+		const mpSeriesReportIdentity &identity = reportCandidate.GetIdentity();
+		for ( int side = 0; side < MP_SERIES_SIDE_COUNT; ++side ) {
+			const int slot = matchSeriesContestantSlot[ side ];
+			uint32_t generation = 0;
+			mpParticipantId participant;
+			if ( slot < 0 || slot >= MAX_CLIENTS ||
+				!matchSession.GetSlotGeneration( slot, generation ) ||
+				!matchSession.ResolveSlotBinding( slot, generation, participant ) ) {
+				continue;
+			}
+			const mpEvidenceParticipantFinalStats *source = NULL;
+			for ( int index = 0; index < matchEvidence.GetParticipantStatsCount();
+					++index ) {
+				const mpEvidenceParticipantFinalStats *candidate =
+					matchEvidence.GetParticipantStats( index );
+				if ( candidate != NULL && candidate->participantSequence ==
+					participant.SequencePart() ) {
+					source = candidate;
+					break;
+				}
+			}
+			if ( source == NULL ) {
+				continue;
+			}
+			mpSeriesReportParticipantStatsInput delta;
+			memset( &delta, 0, sizeof( delta ) );
+			delta.participantSequence =
+				identity.contestants[ side ].participantSequence;
+			delta.contestant = side;
+			delta.displayName = identity.contestants[ side ].label;
+			delta.mapsPlayed = 1;
+			delta.mapsWon = mapWon[ side ] ? 1 : 0;
+			delta.score = attempt->score[ side ];
+			delta.kills = source->kills;
+			delta.deaths = source->deaths;
+			delta.suicides = source->suicides;
+			delta.damageGiven = source->damageGiven;
+			delta.damageReceived = source->damageReceived;
+			delta.shots = source->shots;
+			delta.hits = source->hits;
+			const mpSeriesReportWriteResult accumulated =
+				reportCandidate.AccumulateParticipantStats( delta );
+			if ( accumulated.code == MP_SERIES_REPORT_WRITE_REJECTED ) {
+				return false;
+			}
+		}
+	}
+
+	if ( !PersistCompetitionSeriesCandidate( seriesCandidate, reportCandidate,
+		matchSeriesId, matchSession.GetSessionId() ) ) {
+		MatchEvidenceOutputFailureOnce( matchEvidence, BuildMatchEvidenceStamp(),
+			MP_EVIDENCE_OUTPUT_SERIES_RECOVERY, 1 );
+		if ( matchEvidenceMode > 0 ) {
+			PersistMatchEvidence();
+		}
+		return false;
+	}
+	matchSeries = seriesCandidate;
+	matchSeriesReport = reportCandidate;
+	matchSeriesLinkedSessionId = matchSession.GetSessionId();
+	matchSeriesAwaitingMapSession = false;
+	return true;
+}
+
+void idMultiplayerGame::StartMatchMVDIfRequired( void ) {
+	if ( !gameLocal.isServer || matchMVDAttemptedBySession ||
+		matchMVDStartedBySession || matchEvidenceMode <= 0 ||
+		!matchEvidence.IsInitialized() || !matchSession.HasFrozenRules() ||
+		matchRules.Committed().GetInteger( MP_RULE_MANAGED_MATCH ) == 0 ) {
+		return;
+	}
+	matchMVDAttemptedBySession = true;
+	matchMVDOperatorOwnedBySession = false;
+	if ( networkSystem->ServerIsMVDRecording() ) {
+		// A manually started stream remains operator-owned.  Its staged qpath is
+		// reported as pending until the engine publishes a matching terminal
+		// result; a future final path is never linked as if it already existed.
+		serverMVDRecordingResult_t result;
+		memset( &result, 0, sizeof( result ) );
+		if ( networkSystem->ServerCopyMVDRecordingQPath( matchMVDQPath,
+				sizeof( matchMVDQPath ) ) &&
+			networkSystem->ServerCopyMVDRecordingResult( result ) &&
+			MatchMVDResultForFinalQPath( result, matchMVDQPath ) &&
+			result.state == SERVER_MVD_RESULT_PENDING ) {
+			matchMVDOperatorOwnedBySession = true;
+		} else {
+			MatchEvidenceOutputFailureOnce( matchEvidence,
+				BuildMatchEvidenceStamp(), MP_EVIDENCE_OUTPUT_MVD_START,
+				MATCH_MVD_REPORT_REASON_RESULT_MISMATCH );
+			gameLocal.Warning( "operator-owned competitive MVD state was unavailable" );
+		}
+		return;
+	}
+	idStr recordingName = va( "match_%llu_%s",
+		static_cast<unsigned long long>( matchSession.GetSessionId() ),
+		gameLocal.serverInfo.GetString( "si_map" ) );
+	if ( !networkSystem->ServerStartMVDRecording( recordingName.c_str() ) ) {
+		serverMVDRecordingResult_t failed;
+		memset( &failed, 0, sizeof( failed ) );
+		const uint16_t failureReason =
+			networkSystem->ServerCopyMVDRecordingResult( failed ) &&
+			failed.state == SERVER_MVD_RESULT_FAILED ?
+				MatchMVDEngineFailureReason( failed.reason ) :
+				MATCH_MVD_REPORT_REASON_RESULT_UNAVAILABLE;
+		MatchEvidenceOutputFailureOnce( matchEvidence,
+			BuildMatchEvidenceStamp(), MP_EVIDENCE_OUTPUT_MVD_START,
+			failureReason );
+		gameLocal.Warning( "automatic competitive MVD recording could not start" );
+		return;
+	}
+	matchMVDStartedBySession = true;
+	if ( !networkSystem->ServerCopyMVDRecordingQPath( matchMVDQPath,
+		sizeof( matchMVDQPath ) ) ) {
+		MatchEvidenceOutputFailureOnce( matchEvidence,
+			BuildMatchEvidenceStamp(), MP_EVIDENCE_OUTPUT_MVD_START,
+			MATCH_MVD_REPORT_REASON_RESULT_UNAVAILABLE );
+		networkSystem->ServerStopMVDRecording(
+			"competitive MVD path unavailable" );
+		matchMVDStartedBySession = false;
+		gameLocal.Warning( "automatic competitive MVD path was unavailable" );
+	} else {
+		serverMVDRecordingResult_t pending;
+		memset( &pending, 0, sizeof( pending ) );
+		if ( !networkSystem->ServerCopyMVDRecordingResult( pending ) ||
+			!MatchMVDResultForFinalQPath( pending, matchMVDQPath ) ||
+			pending.state != SERVER_MVD_RESULT_PENDING ) {
+			MatchEvidenceOutputFailureOnce( matchEvidence,
+				BuildMatchEvidenceStamp(), MP_EVIDENCE_OUTPUT_MVD_START,
+				MATCH_MVD_REPORT_REASON_RESULT_MISMATCH );
+			networkSystem->ServerStopMVDRecording(
+				"competitive MVD state mismatch" );
+			matchMVDStartedBySession = false;
+			gameLocal.Warning( "automatic competitive MVD state did not match its path" );
+		}
+	}
+}
+
+void idMultiplayerGame::StopMatchMVD( const char *reason ) {
+	if ( !matchMVDAttemptedBySession ) {
+		return;
+	}
+	if ( matchMVDStartedBySession && networkSystem->ServerIsMVDRecording() ) {
+		networkSystem->ServerStopMVDRecording( reason != NULL ? reason :
+			"competitive match complete" );
+	}
+	matchMVDStartedBySession = false;
+	if ( matchMVDQPath[ 0 ] == '\0' ) {
+		return;
+	}
+
+	serverMVDRecordingResult_t result;
+	memset( &result, 0, sizeof( result ) );
+	if ( !networkSystem->ServerCopyMVDRecordingResult( result ) ||
+		!MatchMVDResultForFinalQPath( result, matchMVDQPath ) ) {
+		MatchEvidenceOutputFailureOnce( matchEvidence,
+			BuildMatchEvidenceStamp(), MP_EVIDENCE_OUTPUT_MVD_STOP,
+			MATCH_MVD_REPORT_REASON_RESULT_MISMATCH );
+		gameLocal.Warning( "competitive MVD terminal result did not match its recording" );
+		return;
+	}
+	if ( result.state == SERVER_MVD_RESULT_COMMITTED ) {
+		mpEvidenceArtifactLinkInput artifact;
+		artifact.kind = MP_EVIDENCE_ARTIFACT_MVD;
+		artifact.qpath = result.finalQPath;
+		const mpEvidenceWriteResult linked = matchEvidence.LinkArtifact(
+			BuildMatchEvidenceStamp(), artifact );
+		if ( linked.code == MP_EVIDENCE_WRITE_REJECTED ) {
+			MatchEvidenceOutputFailureOnce( matchEvidence,
+				BuildMatchEvidenceStamp(), MP_EVIDENCE_OUTPUT_MVD_STOP,
+				MATCH_MVD_REPORT_REASON_RESULT_MISMATCH );
+			gameLocal.Warning( "committed competitive MVD could not be linked "
+				"to evidence (reason %d)", linked.reason );
+		}
+	} else if ( result.state == SERVER_MVD_RESULT_FAILED ) {
+		MatchEvidenceOutputFailureOnce( matchEvidence,
+			BuildMatchEvidenceStamp(), MP_EVIDENCE_OUTPUT_MVD_STOP,
+			MatchMVDEngineFailureReason( result.reason ) );
+		gameLocal.Warning( "competitive MVD publication failed (reason %d)",
+			result.reason );
+	} else if ( !matchMVDOperatorOwnedBySession ) {
+		MatchEvidenceOutputFailureOnce( matchEvidence,
+			BuildMatchEvidenceStamp(), MP_EVIDENCE_OUTPUT_MVD_STOP,
+			MATCH_MVD_REPORT_REASON_AUTOMATIC_STILL_PENDING );
+		gameLocal.Warning( "automatic competitive MVD remained pending at finalization" );
+	}
+}
+
+bool idMultiplayerGame::FinalizeMatchEvidence( bool abortedIfUndecided ) {
+	if ( !matchEvidence.IsInitialized() || matchEvidenceFinalized ) {
+		matchEvidenceFinalizationPending = false;
+		return true;
+	}
+	bool hasTerminalResult = false;
+	for ( int index = 0; index < matchEvidence.GetEventCount(); ++index ) {
+		const mpEvidenceEvent *event = matchEvidence.GetEvent( index );
+		if ( event != NULL && event->kind == MP_EVIDENCE_EVENT_MAP_RESULT ) {
+			hasTerminalResult = true;
+			break;
+		}
+	}
+	// An earlier gameplay-result append failure must not be silently replaced by
+	// a later map-reset ABORTED result.  Retain the exact journal fail-closed;
+	// event-capacity reservation makes this an invariant/corruption path.
+	if ( matchEvidenceFinalizationPending && !hasTerminalResult ) {
+		gameLocal.Warning( "competitive finalization remains pending without a "
+			"terminal map result" );
+		return false;
+	}
+	ObserveMatchEvidence( mpParticipantId::Invalid() );
+	RecordMatchEvidenceFinalStats();
+	if ( abortedIfUndecided ) {
+		RecordMatchEvidenceResult( MP_MATCH_TRANSITION_SESSION_END,
+			mpParticipantId::Invalid() );
+	}
+	hasTerminalResult = false;
+	for ( int index = 0; index < matchEvidence.GetEventCount(); ++index ) {
+		const mpEvidenceEvent *event = matchEvidence.GetEvent( index );
+		if ( event != NULL && event->kind == MP_EVIDENCE_EVENT_MAP_RESULT ) {
+			hasTerminalResult = true;
+			break;
+		}
+	}
+	if ( !hasTerminalResult ) {
+		matchEvidenceFinalizationPending = true;
+		gameLocal.Warning( "competitive evidence cannot finalize without a "
+			"terminal map result" );
+		return false;
+	}
+	// A previous failure may have been the durable paired checkpoint rather
+	// than the journal.  With the terminal seal present, allow that transaction
+	// to retry below and set the flag again only if persistence still fails.
+	matchEvidenceFinalizationPending = false;
+	StopMatchMVD( "match evidence finalized" );
+	mpEvidenceStorageResult evidenceStorage;
+	evidenceStorage.Clear();
+	if ( matchEvidenceMode > 0 ) {
+		PersistMatchEvidence( &evidenceStorage );
+	}
+	if ( matchSeries.GetState() == MP_SERIES_MAP_ACTIVE &&
+		!matchSeriesAwaitingMapSession &&
+		!CommitCompetitionSeriesMapEvidence( evidenceStorage ) ) {
+		matchEvidenceFinalizationPending = true;
+		gameLocal.Warning( "competition map result remains pending because its "
+			"unified report checkpoint could not commit" );
+		return false;
+	}
+	matchEvidenceFinalized = true;
+	matchEvidenceFinalizationPending = false;
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::BeginMatchSession
+================
+*/
+bool idMultiplayerGame::BeginMatchSession( void ) {
+	matchSessionOperational = false;
+	if ( !FinalizeMatchEvidence( true ) ) {
+		return false;
+	}
+	if ( nextMatchSessionId == 0 ) {
+		const uint64_t maximumSessionId = ~static_cast<uint64_t>( 0 );
+		const uint64_t reservedSessionRange = UINT64_C( 1 ) << 32;
+		for ( int attempt = 0; attempt < 4 && nextMatchSessionId == 0; ++attempt ) {
+			uint64_t randomBase = 0;
+			if ( sys->SecureRandomBytes( &randomBase, sizeof( randomBase ) ) &&
+				randomBase != 0 &&
+				randomBase <= maximumSessionId - reservedSessionRange ) {
+				nextMatchSessionId = randomBase;
+			}
+		}
+		if ( nextMatchSessionId == 0 ) {
+			gameLocal.Warning( "could not establish a boot-unique competitive session identity" );
+			return false;
+		}
+	}
+	if ( nextMatchSessionId == ~static_cast<uint64_t>( 0 ) ) {
+		gameLocal.Error( "competitive match session id exhausted" );
+		return false;
+	}
+	++nextMatchSessionId;
+	if ( !matchSession.Reset( nextMatchSessionId,
+		mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ) ) ) {
+		return false;
+	}
+	matchItemTiming.Clear();
+	matchItemTimingNeedsInitialScan = false;
+	matchPhaseEffectsSessionId = 0;
+	matchPhaseEffectsRevision = 0;
+	if ( !InitializeRefereeAuthentication() ) {
+		return false;
+	}
+	mpProposalCooldownPolicy_t proposalCooldowns;
+	proposalCooldowns.Clear();
+	proposalCooldowns.durationMsec[ MP_MATCH_COOLDOWN_INTERACTION ] = 2000;
+	proposalCooldowns.durationMsec[ MP_MATCH_COOLDOWN_TEAM_ACTION ] = 10000;
+	proposalCooldowns.durationMsec[ MP_MATCH_COOLDOWN_PRIVILEGED ] = 30000;
+	if ( !matchProposals.Reset( matchSession.GetSessionId(),
+		mpProposalEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+		proposalCooldowns ) ) {
+		return false;
+	}
+	if ( !matchTeams.Reset( matchSession.GetSessionId(),
+		mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ) ) ) {
+		return false;
+	}
+	matchViewRevision = 1;
+	matchControlRevision = 1;
+	matchViewObservedSessionRevision = matchSession.GetSessionRevision();
+	matchViewObservedRulesRevision = matchRules.Committed().Revision();
+	matchViewObservedRulesDigest = matchRules.Committed().Digest();
+	matchViewObservedProposalRevision = matchProposals.GetRevision();
+	matchViewObservedSeriesRevision = matchSeries.GetRevision();
+	matchViewObservedTeamsRevision = matchTeams.GetRevision();
+	matchViewNextClockUpdateTime = Max( 0, gameLocal.time ) + 1000;
+	nextMatchProposalId = 0;
+	memset( matchViewSentRevision, 0, sizeof( matchViewSentRevision ) );
+	memset( lastMatchRequestId, 0, sizeof( lastMatchRequestId ) );
+	memset( lastMatchRequestResultValid, 0, sizeof( lastMatchRequestResultValid ) );
+	memset( matchOperationNextAllowedTime, 0, sizeof( matchOperationNextAllowedTime ) );
+
+	if ( !ConfigureMatchSessionFromCompetitiveRules() ) {
+		return false;
+	}
+	if ( matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH ) ) {
+		const mpMatchItemTimingMutationResult itemMap =
+			matchItemTiming.BeginMap( matchSession.GetSessionId() );
+		if ( itemMap.WasRejected() ) {
+			gameLocal.Warning( "could not initialize competitive item timing (reason %d)",
+				itemMap.reason );
+			return false;
+		}
+		matchItemTimingNeedsInitialScan = true;
+	}
+	matchViewObservedItemTimingRevision = matchItemTiming.GetRevision();
+	matchEvidenceMode = idMath::ClampInt( 0, 2, g_matchEvidence.GetInteger() );
+	if ( matchSeries.GetState() == MP_SERIES_MAP_ACTIVE ) {
+		if ( !CompetitionSeriesMapMatchesRuntime( matchSeries,
+			gameLocal.gameType, gameLocal.GetMapName() ) ||
+			!matchSeriesReport.IsInitialized() ||
+			matchSeriesReport.GetIdentity().rulesDigest !=
+				matchRules.Committed().Digest() ||
+			!PersistCompetitionSeriesCandidate( matchSeries, matchSeriesReport,
+				matchSeriesId, matchSession.GetSessionId() ) ) {
+			gameLocal.Warning( "competition series map could not bind to this "
+				"session and rules identity" );
+			return false;
+		}
+		matchSeriesLinkedSessionId = matchSession.GetSessionId();
+		matchSeriesAwaitingMapSession = false;
+	}
+	ReconcileMatchEvidenceForCommittedRules();
+	if ( matchSeries.GetState() == MP_SERIES_MAP_ACTIVE &&
+		!matchEvidence.IsInitialized() ) {
+		gameLocal.Warning( "competition series map has no authoritative result journal" );
+		return false;
+	}
+	matchViewObservedEvidenceRevision = matchEvidence.GetEvidenceRevision();
+	matchViewObservedEvidenceFinalized = matchEvidenceFinalized;
+	matchViewObservedEvidencePersisted = matchEvidencePersisted;
+	matchViewObservedMVDRecording = matchEvidence.IsInitialized() &&
+		networkSystem->ServerIsMVDRecording();
+	matchSessionOperational = true;
+	return true;
+}
+
+bool idMultiplayerGame::IsManagedMatch( void ) const {
+	if ( gameLocal.isServer ) {
+		return matchSession.GetSessionId() != 0 &&
+			matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH );
+	}
+	return gameLocal.serverInfo.GetBool( "si_managedMatch" );
+}
+
+/*
+================
+idMultiplayerGame::RejectManagedLegacyMutation
+
+All legacy administration entry points share one fail-closed boundary.  The
+message is useful both in the local console/rcon response and in the in-game
+chat history, without broadcasting an operator-only diagnostic to players.
+================
+*/
+bool idMultiplayerGame::RejectManagedLegacyMutation( const char *action ) {
+	if ( !IsManagedMatch() ) {
+		return false;
+	}
+
+	const char *message = common->GetLocalizedString( "#str_42749" );
+	common->Printf( "%s\n", message );
+	if ( gameLocal.GetLocalPlayer() != NULL ) {
+		AddChatLine( "%s", message );
+	}
+	common->DPrintf( "managed match rejected legacy mutation '%s'\n",
+		action != NULL ? action : "unknown" );
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::IsManagedTeamCommunicationActive
+
+The managed communication policy is a server-only adapter over one validated,
+committed rules snapshot and its live session.  A committed managed bit without
+that complete boundary is not permission to fall back to legacy team routing.
+================
+*/
+bool idMultiplayerGame::IsManagedTeamCommunicationActive( void ) const {
+	return gameLocal.isServer && !gameLocal.isClient && !gameLocal.isRepeater &&
+		matchSessionOperational &&
+		competitiveRulesInitialized && competitiveRulesValidForSession &&
+		matchRules.Committed().Revision() != 0 &&
+		matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH ) &&
+		matchRules.Committed().GetInteger( MP_RULE_GAME_TYPE ) == gameLocal.gameType &&
+		matchSession.GetSessionId() != 0;
+}
+
+/*
+================
+idMultiplayerGame::BuildManagedTeamCommunicationBinding
+
+Connection slots are transport addresses, not identities.  Bind the current
+slot generation to the authoritative session participant on every route.
+================
+*/
+bool idMultiplayerGame::BuildManagedTeamCommunicationBinding( int clientNum,
+		mpMatchTeamCommunicationBinding_t &binding ) const {
+	binding.Clear();
+	if ( !IsManagedTeamCommunicationActive() || clientNum < 0 ||
+		clientNum >= gameLocal.numClients || clientNum >= MAX_CLIENTS ) {
+		return false;
+	}
+
+	idEntity *entity = gameLocal.entities[ clientNum ];
+	if ( entity == NULL || !entity->IsType( idPlayer::GetClassType() ) ) {
+		return false;
+	}
+	idPlayer *player = static_cast<idPlayer *>( entity );
+	if ( player->IsFakeClient() || botManager.IsBot( clientNum ) ) {
+		return false;
+	}
+
+	uint32_t slotGeneration = 0;
+	return matchSession.GetSlotGeneration( clientNum, slotGeneration ) &&
+		MPMatchBuildTeamCommunicationBinding( matchSession, clientNum,
+			slotGeneration, binding );
+}
+
+/*
+================
+idMultiplayerGame::ServerReconcileManagedUserInfo
+
+Treat ui_team/ui_spectate as a compatibility request, never as authority.  The
+request is evaluated before idPlayer::UserInfoChanged can mutate gameplay, then
+the accepted authoritative result is written back into the same dictionary.
+================
+*/
+bool idMultiplayerGame::ServerReconcileManagedUserInfo( int clientNum,
+		idDict &info ) {
+	if ( !gameLocal.isServer || gameLocal.isClient || !IsManagedMatch() ||
+		clientNum < 0 || clientNum >= MAX_CLIENTS ||
+		gameLocal.entities[ clientNum ] == NULL ||
+		!gameLocal.entities[ clientNum ]->IsType( idPlayer::GetClassType() ) ) {
+		return false;
+	}
+	if ( !matchSessionOperational ) {
+		const bool corrected = idStr::Icmp(
+			info.GetString( "ui_spectate" ), "Spectate" ) != 0;
+		if ( corrected ) {
+			info.Set( "ui_spectate", "Spectate" );
+		}
+		return corrected;
+	}
+	idPlayer *player = static_cast<idPlayer *>( gameLocal.entities[ clientNum ] );
+	if ( player->IsFakeClient() ) {
+		return false;
+	}
+
+	mpParticipantId participant;
+	uint32_t generation = 0;
+	bool aggregateChanged = false;
+	if ( !matchSession.GetSlotGeneration( clientNum, generation ) ||
+		!matchSession.ResolveSlotBinding( clientNum, generation, participant ) ) {
+		const mpMatchMutationResult bound = matchSession.BindParticipant( clientNum,
+			true, MPMatchRoleBit( MP_MATCH_ROLE_PLAYER ),
+			matchSession.GetSessionRevision(), participant );
+		if ( bound.WasRejected() ) {
+			if ( idStr::Icmp( info.GetString( "ui_spectate" ), "Spectate" ) != 0 ) {
+				info.Set( "ui_spectate", "Spectate" );
+				return true;
+			}
+			return false;
+		}
+		aggregateChanged = bound.WasApplied();
+	}
+
+	const bool requestedActive =
+		idStr::Icmp( info.GetString( "ui_spectate" ), "Spectate" ) != 0;
+	const int requestedSide = gameLocal.IsTeamGame() ?
+		( idStr::Icmp( info.GetString( "ui_team" ), "Strogg" ) == 0 ?
+			TEAM_STROGG : TEAM_MARINE ) : MP_MATCH_SIDE_NONE;
+	const mpMatchParticipantState *state = matchSession.FindParticipant( participant );
+	if ( state == NULL ) {
+		return false;
+	}
+	const int requestedRosterSeat = matchSession.FindRosterSeat( participant );
+
+	mpOperationExecutionResult_t execution;
+	execution.Clear();
+	if ( requestedActive &&
+		( !state->active || state->side != requestedSide ) ) {
+		const mpMatchTeamsPolicy_t policy = BuildMatchTeamsPolicy();
+		const mpMatchTeamsJoinDecision_t decision = matchTeams.EvaluateJoin(
+			matchSession, participant, requestedSide, 0, policy,
+			mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ) );
+		if ( decision.IsAllowed() ) {
+			aggregateChanged = ApplyMatchTeamsTransaction( decision, execution ) ||
+				aggregateChanged;
+		} else if ( decision.disposition == MP_MATCH_TEAMS_JOIN_QUEUE ) {
+			const mpMatchTeamsMutationResult_t queued = matchTeams.JoinQueue(
+				matchSession, participant, requestedSide, policy,
+				mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+				matchTeams.GetRevision() );
+			aggregateChanged = queued.WasApplied() || aggregateChanged;
+		}
+	} else if ( !requestedActive && ( state->active ||
+		( requestedRosterSeat < 0 && state->side != MP_MATCH_SIDE_NONE ) ) ) {
+		aggregateChanged = ApplyMatchSpectatorTransition( participant, execution ) ||
+			aggregateChanged;
+	}
+
+	state = matchSession.FindParticipant( participant );
+	bool corrected = false;
+	if ( state != NULL ) {
+		const char *authoritativeSpectate = state->active ? "Play" : "Spectate";
+		if ( idStr::Icmp( info.GetString( "ui_spectate" ),
+			authoritativeSpectate ) != 0 ) {
+			info.Set( "ui_spectate", authoritativeSpectate );
+			corrected = true;
+		}
+		const int rosterSeat = matchSession.FindRosterSeat( participant );
+		if ( gameLocal.IsTeamGame() && state->side >= 0 &&
+			state->side < TEAM_MAX && ( state->active || rosterSeat >= 0 ) &&
+			idStr::Icmp( info.GetString( "ui_team" ),
+				teamNames[ state->side ] ) != 0 ) {
+			info.Set( "ui_team", teamNames[ state->side ] );
+			corrected = true;
+		}
+	}
+	if ( aggregateChanged ) {
+		ObserveMatchEvidence( participant );
+		AdvanceMatchViewRevision( true );
+	}
+	return corrected;
+}
+
+/*
+================
+idMultiplayerGame::SynchronizeMatchParticipant
+================
+*/
+void idMultiplayerGame::SynchronizeMatchParticipant( int clientNum ) {
+	if ( !gameLocal.isServer || !matchSessionOperational ||
+		clientNum < 0 || clientNum >= gameLocal.numClients ||
+		clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+	idEntity *entity = gameLocal.entities[ clientNum ];
+	if ( entity == NULL || !entity->IsType( idPlayer::GetClassType() ) ) {
+		return;
+	}
+	idPlayer *player = static_cast<idPlayer *>( entity );
+
+	mpParticipantId participant;
+	uint32_t generation = 0;
+	if ( !matchSession.GetSlotGeneration( clientNum, generation ) ||
+		!matchSession.ResolveSlotBinding( clientNum, generation, participant ) ) {
+		const mpMatchRoleMask_t playerRole = MPMatchRoleBit( MP_MATCH_ROLE_PLAYER );
+		if ( matchSession.BindParticipant( clientNum, !player->IsFakeClient(), playerRole,
+			matchSession.GetSessionRevision(), participant ).WasRejected() ) {
+			return;
+		}
+	}
+
+	// spectating is a physical gameplay state also used for death/elimination.
+	// Managed participation follows durable player intent instead.
+	const bool active = playerState[ clientNum ].ingame && !player->wantSpectate;
+	const int side = gameLocal.IsTeamGame() && player->team >= 0 && player->team < TEAM_MAX ?
+		player->team : MP_MATCH_SIDE_NONE;
+
+	// Userinfo remains a compatibility ingress, not a second authority model.
+	// During a managed match every human side/participation change is evaluated
+	// by the same transactional team core used by typed operations.  A denied or
+	// queued legacy request is mirrored back from authoritative state so a local
+	// cvar cannot make the gameplay object and match aggregate disagree.
+	if ( IsManagedMatch() ) {
+		const mpMatchParticipantState *state = matchSession.FindParticipant( participant );
+		if ( state == NULL ) {
+			return;
+		}
+		if ( player->IsFakeClient() ) {
+			bool referenced = state->active || state->side != MP_MATCH_SIDE_NONE ||
+				matchSession.FindRosterSeat( participant ) >= 0 ||
+				matchTeams.FindQueuePosition( participant ) >= 0;
+			for ( int index = 0; !referenced &&
+				index < matchTeams.GetInvitationCount(); ++index ) {
+				const mpMatchRosterInvitation_t *invitation =
+					matchTeams.GetInvitationByIndex( index );
+				referenced = invitation != NULL &&
+					( invitation->target == participant ||
+						invitation->issuer == participant );
+			}
+			if ( referenced ) {
+				mpOperationExecutionResult_t execution;
+				execution.Clear();
+				if ( ApplyMatchSpectatorTransition( participant, execution ) ) {
+					mpMatchTeamsTransactionPlan_t mirrorPlan;
+					mirrorPlan.Clear();
+					mirrorPlan.incomingParticipant = participant;
+					ApplyMatchTeamsPlanToLegacy( mirrorPlan );
+					if ( execution.outcome == MP_OPERATION_APPLIED ) {
+						ObserveMatchEvidence( participant );
+					}
+				}
+			}
+			return;
+		}
+		const int rosterSeat = matchSession.FindRosterSeat( participant );
+		// A benched roster role keeps its team affiliation while inactive.  An
+		// ordinary spectator is neutral even if stock gameplay retains the last
+		// selected ui_team value for menu convenience.
+		const int intendedSide = active ? side :
+			( rosterSeat >= 0 ? state->side : MP_MATCH_SIDE_NONE );
+		if ( state->active != active || state->side != intendedSide ) {
+			mpOperationExecutionResult_t execution;
+			execution.Clear();
+			bool changed = false;
+			if ( !active ) {
+				changed = ApplyMatchSpectatorTransition( participant, execution );
+			} else {
+				const mpMatchTeamsPolicy_t policy = BuildMatchTeamsPolicy();
+				const mpMatchTeamsJoinDecision_t decision = matchTeams.EvaluateJoin(
+					matchSession, participant, side, 0, policy,
+					mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ) );
+				if ( decision.IsAllowed() ) {
+					changed = ApplyMatchTeamsTransaction( decision, execution );
+					if ( changed ) {
+						ApplyMatchTeamsPlanToLegacy( decision.plan );
+					}
+				} else if ( decision.disposition == MP_MATCH_TEAMS_JOIN_QUEUE ) {
+					const mpMatchTeamsMutationResult_t queued = matchTeams.JoinQueue(
+						matchSession, participant, side, policy,
+						mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+						matchTeams.GetRevision() );
+					changed = !queued.WasRejected();
+				}
+			}
+			mpMatchTeamsTransactionPlan_t mirrorPlan;
+			mirrorPlan.Clear();
+			mirrorPlan.incomingParticipant = participant;
+			ApplyMatchTeamsPlanToLegacy( mirrorPlan );
+			if ( changed ) {
+				ObserveMatchEvidence( participant );
+			}
+		}
+		return;
+	}
+
+	if ( matchSession.SetParticipantActive( participant, active,
+		matchSession.GetSessionRevision() ).WasRejected() ) {
+		return;
+	}
+	if ( matchSession.SetParticipantSide( participant, side,
+		matchSession.GetSessionRevision() ).WasRejected() ) {
+		return;
+	}
+
+	const mpMatchReadyPolicy_t readyPolicy = matchSession.GetReadinessPolicy().policy;
+	if ( !player->IsFakeClient() &&
+		( readyPolicy == MP_MATCH_READY_INDIVIDUAL ||
+			readyPolicy == MP_MATCH_READY_INDIVIDUAL_AND_TEAM ) ) {
+		matchSession.SetParticipantReady( participant, active && player->IsReady(),
+			matchSession.GetSessionRevision() );
+	}
+}
+
+void idMultiplayerGame::SynchronizeAllMatchParticipants( void ) {
+	for ( int clientNum = 0; clientNum < gameLocal.numClients && clientNum < MAX_CLIENTS; ++clientNum ) {
+		SynchronizeMatchParticipant( clientNum );
+	}
+}
+
+mpMatchTransitionReason_t idMultiplayerGame::InferMatchTransitionReason(
+		mpGameState_t from, mpGameState_t to ) const {
+	if ( to == INACTIVE ) {
+		return MP_MATCH_TRANSITION_MAP_SHUTDOWN;
+	}
+	if ( from == INACTIVE && to == WARMUP ) {
+		return MP_MATCH_TRANSITION_SESSION_INITIALIZED;
+	}
+	if ( from == WARMUP && to == COUNTDOWN ) {
+		return MP_MATCH_TRANSITION_READY_GATE;
+	}
+	if ( from == COUNTDOWN && to == WARMUP ) {
+		return MP_MATCH_TRANSITION_COUNTDOWN_ABORTED;
+	}
+	if ( from == COUNTDOWN && to == GAMEON ) {
+		return MP_MATCH_TRANSITION_COUNTDOWN_COMPLETE;
+	}
+	if ( from == GAMEON && to == SUDDENDEATH ) {
+		return MP_MATCH_TRANSITION_REGULATION_TIE;
+	}
+	if ( ( from == GAMEON || from == SUDDENDEATH ) && to == GAMEREVIEW ) {
+		return MP_MATCH_TRANSITION_LIMIT_REACHED;
+	}
+	if ( from == GAMEREVIEW && to == NEXTGAME ) {
+		return MP_MATCH_TRANSITION_REVIEW_COMPLETE;
+	}
+	if ( from == NEXTGAME && to == WARMUP ) {
+		return MP_MATCH_TRANSITION_SAME_MAP_RESTART;
+	}
+	return MP_MATCH_TRANSITION_NONE;
+}
+
+bool idMultiplayerGame::CanCommitMatchPhaseTransition( mpGameState_t newState ) const {
+	if ( !matchSessionOperational ) {
+		return false;
+	}
+	const mpGameState_t from = matchSession.GetPhase();
+	const mpMatchTransitionReason_t reason = InferMatchTransitionReason( from, newState );
+	if ( reason == MP_MATCH_TRANSITION_NONE ||
+		!mpMatchSession::IsLegalPhaseTransition( from, newState, reason ) ) {
+		return false;
+	}
+	if ( newState == COUNTDOWN ) {
+		if ( !CanEnterMatchCountdown() || !competitiveRulesValidForSession ) {
+			return false;
+		}
+		mpMatchSession candidate = matchSession;
+		const mpMatchRulesSnapshot &rules = matchRules.Committed();
+		return !candidate.BeginCountdown( rules.Revision(), rules.Digest(),
+			reason, mpParticipantId::Invalid(),
+			candidate.GetSessionRevision() ).WasRejected();
+	}
+	return true;
+}
+
+bool idMultiplayerGame::CanEnterMatchCountdown( void ) const {
+	if ( !matchSessionOperational ) {
+		return false;
+	}
+
+	const mpSeriesState_t seriesState = matchSeries.GetState();
+	const bool liveSeries = seriesState != MP_SERIES_DISABLED &&
+		seriesState != MP_SERIES_COMPLETE && seriesState != MP_SERIES_CANCELLED;
+	return gameLocal.gameType != GAME_DUEL || !liveSeries ||
+		!matchSeriesNeedsBindingRecovery;
+}
+
+bool idMultiplayerGame::CommitMatchPhaseTransition( mpGameState_t newState ) {
+	if ( !matchSessionOperational ||
+		( newState == COUNTDOWN && !CanEnterMatchCountdown() ) ) {
+		return false;
+	}
+	if ( matchSession.GetPhase() == newState ) {
+		if ( gameState == NULL || gameState->GetMPGameState() == newState ) {
+			return false;
+		}
+		return ApplyCommittedMatchPhaseEffects( MP_MATCH_SIDE_NONE );
+	}
+	const mpMatchTransitionReason_t reason = InferMatchTransitionReason(
+		matchSession.GetPhase(), newState );
+	return CommitMatchPhaseTransition( newState, reason, mpParticipantId::Invalid() );
+}
+
+bool idMultiplayerGame::CommitMatchPhaseTransition( mpGameState_t newState,
+		mpMatchTransitionReason_t reason, mpParticipantId authorizer ) {
+	return CommitMatchPhaseTransition( newState, reason, authorizer,
+		MP_MATCH_SIDE_NONE );
+}
+
+bool idMultiplayerGame::ApplyCommittedMatchPhaseEffects( int forfeitingSide ) {
+	const mpMatchTransitionView &transition = matchSession.GetLastTransition();
+	if ( !gameLocal.isServer || matchSession.GetSessionId() == 0 ||
+		transition.to != matchSession.GetPhase() ||
+		transition.reason <= MP_MATCH_TRANSITION_NONE ||
+		transition.reason >= MP_MATCH_TRANSITION_REASON_COUNT ) {
+		return false;
+	}
+
+	// A typed executor can commit the aggregate before rvGameState mirrors it.
+	// Key the adapter effects to that committed revision so the typed path, the
+	// legacy mirror and a replayed result cannot journal or score it twice.
+	if ( matchPhaseEffectsSessionId == matchSession.GetSessionId() &&
+		matchPhaseEffectsRevision == matchSession.GetSessionRevision() ) {
+		return true;
+	}
+
+	if ( transition.to == WARMUP ) {
+		SynchronizeAllMatchParticipants();
+	}
+	// Review seals evidence first.  The evidence finalizer then advances the
+	// series and report together through the single atomic recovery checkpoint;
+	// publishing a score here would expose a half-committed map on I/O failure.
+
+	ObserveMatchEvidence( transition.authorizer );
+	if ( transition.to == COUNTDOWN ) {
+		StartMatchMVDIfRequired();
+	} else if ( transition.to == GAMEREVIEW ) {
+		RecordMatchEvidenceResult( transition.reason, transition.authorizer,
+			forfeitingSide );
+	}
+	matchPhaseEffectsSessionId = matchSession.GetSessionId();
+	matchPhaseEffectsRevision = matchSession.GetSessionRevision();
+	return true;
+}
+
+bool idMultiplayerGame::CommitMatchPhaseTransition( mpGameState_t newState,
+		mpMatchTransitionReason_t reason, mpParticipantId authorizer,
+		int forfeitingSide ) {
+	if ( !gameLocal.isServer || !matchSessionOperational ) {
+		return false;
+	}
+	if ( newState == COUNTDOWN && !CanEnterMatchCountdown() ) {
+		return false;
+	}
+	// A typed participant/roster mutation may atomically cancel COUNTDOWN in
+	// the session. In that case rvGameState still needs to apply the already
+	// committed phase side effects, but must not create a second revision.
+	if ( matchSession.GetPhase() == newState ) {
+		const mpMatchTransitionView &transition = matchSession.GetLastTransition();
+		if ( gameState == NULL || gameState->GetMPGameState() == newState ||
+			transition.to != newState || transition.reason != reason ||
+			( authorizer.IsValid() && transition.authorizer != authorizer ) ) {
+			return false;
+		}
+		return ApplyCommittedMatchPhaseEffects( forfeitingSide );
+	}
+	if ( reason == MP_MATCH_TRANSITION_NONE ) {
+		return false;
+	}
+	if ( newState == COUNTDOWN ) {
+		SynchronizeAllMatchParticipants();
+		if ( !CanEnterMatchCountdown() || !competitiveRulesValidForSession ) {
+			return false;
+		}
+		const mpMatchRulesSnapshot &rules = matchRules.Committed();
+		const mpMatchMutationResult countdown = matchSession.BeginCountdown(
+			rules.Revision(), rules.Digest(), reason, authorizer,
+			matchSession.GetSessionRevision() );
+		if ( countdown.WasRejected() ) {
+			gameLocal.Warning( "rejected atomic match countdown start (reason %d)",
+				countdown.reason );
+			return false;
+		}
+	} else {
+		const mpMatchMutationResult transition = matchSession.TransitionPhase( newState,
+			reason, authorizer, matchSession.GetSessionRevision() );
+		if ( transition.WasRejected() ) {
+			gameLocal.Warning( "rejected match phase transition %d -> %d (reason %d, error %d)",
+				matchSession.GetPhase(), newState, reason, transition.reason );
+			return false;
+		}
+	}
+	return ApplyCommittedMatchPhaseEffects( forfeitingSide );
+}
+
+mpMatchRoundTransitionReason_t idMultiplayerGame::InferRoundTransitionReason(
+		roundState_t from, roundState_t to ) const {
+	if ( from == RS_INACTIVE && to == RS_COUNTDOWN ) {
+		return MP_MATCH_ROUND_TRANSITION_PARENT_ACTIVE;
+	}
+	if ( from == RS_COUNTDOWN && to == RS_ACTIVE ) {
+		return MP_MATCH_ROUND_TRANSITION_COUNTDOWN_COMPLETE;
+	}
+	if ( from == RS_ACTIVE && to == RS_COMPLETE ) {
+		return MP_MATCH_ROUND_TRANSITION_RESULT_COMMITTED;
+	}
+	if ( from == RS_COMPLETE && to == RS_COUNTDOWN ) {
+		return MP_MATCH_ROUND_TRANSITION_NEXT_ROUND;
+	}
+	return MP_MATCH_ROUND_TRANSITION_NONE;
+}
+
+bool idMultiplayerGame::CommitMatchRoundTransition( roundState_t newState ) {
+	if ( !gameLocal.isServer ) {
+		return true;
+	}
+	if ( !matchSessionOperational ) {
+		return false;
+	}
+	const roundState_t from = matchSession.GetRoundState();
+	if ( from == newState ) {
+		return true;
+	}
+	const mpMatchRoundTransitionReason_t reason = InferRoundTransitionReason( from, newState );
+	if ( reason == MP_MATCH_ROUND_TRANSITION_NONE ) {
+		return false;
+	}
+	const mpMatchMutationResult transition = matchSession.TransitionRound( newState,
+		reason, matchSession.GetSessionRevision() );
+	if ( transition.WasRejected() ) {
+		gameLocal.Warning( "rejected match round transition %d -> %d (reason %d, error %d)",
+			from, newState, reason, transition.reason );
+		return false;
+	}
+	ObserveMatchEvidence( mpParticipantId::Invalid() );
+	return true;
+}
+
+bool idMultiplayerGame::BeginMatchOvertimePeriod( void ) {
+	if ( !gameLocal.isServer || !matchSessionOperational ||
+		!competitiveRulesValidForSession ||
+		matchSession.GetPhase() != GAMEON ) {
+		return false;
+	}
+	const mpMatchRulesSnapshot &rules = matchRules.Committed();
+	if ( rules.GetInteger( MP_RULE_OVERTIME_POLICY ) != MP_OVERTIME_TIMED_PERIODS ) {
+		return false;
+	}
+	const int maxPeriods = rules.GetInteger( MP_RULE_OVERTIME_MAX_PERIODS );
+	const uint32_t currentPeriod = matchSession.GetLivePeriod().period;
+	if ( maxPeriods > 0 && currentPeriod >= static_cast<uint32_t>( maxPeriods ) ) {
+		return false;
+	}
+	const int durationMsec = rules.GetInteger( MP_RULE_OVERTIME_PERIOD_SECONDS ) * 1000;
+	return matchSession.BeginOvertimePeriod( currentPeriod, durationMsec,
+		matchSession.GetSessionRevision() ).WasApplied();
+}
+
 /*
 ================
 idMultiplayerGame::Shutdown
 ================
 */
 void idMultiplayerGame::Shutdown( void ) {
-
+	if ( !FinalizeMatchEvidence( true ) ) {
+		gameLocal.Warning( "competitive finalization remains pending at shutdown; "
+			"the durable active-map checkpoint was retained" );
+	}
 	Clear();
 	statManager->Shutdown();
 
@@ -816,8 +8659,24 @@ idMultiplayerGame::Reset
 ================
 */
 void idMultiplayerGame::Reset() {
+	if ( !FinalizeMatchEvidence( true ) ) {
+		gameLocal.Warning( "competitive finalization remains pending across map reset" );
+	}
 	Clear();
 	assert( !scoreBoard && !mainGui && !mapList );
+	InitializeCompetitiveRules();
+	bool recoveryAvailable = true;
+	if ( gameLocal.isServer ) {
+		recoveryAvailable = RestoreCompetitionSeriesIfRequested();
+	}
+	if ( gameLocal.isServer && !recoveryAvailable &&
+		idStr::Cmp( g_matchSeriesRecoveryId.GetString(), "0" ) != 0 ) {
+		gameLocal.Warning( "active competition-series recovery remains unavailable; "
+			"clear g_matchSeriesRecoveryId to start a new series" );
+	}
+	if ( gameLocal.isServer && recoveryAvailable && !BeginMatchSession() ) {
+		gameLocal.Warning( "could not initialize the authoritative competitive match session" );
+	}
 
 	mpBuyingManager.Reset();
 	
@@ -975,6 +8834,13 @@ idMultiplayerGame::ServerClientConnect
 ================
 */
 void idMultiplayerGame::ServerClientConnect( int clientNum ) {
+	if ( clientNum >= 0 && clientNum < MAX_CLIENTS ) {
+		ClearMatchOperationTransportSlot( clientNum );
+		if ( nextMatchConnectionId == UINT64_MAX ) {
+			gameLocal.Error( "competitive connection identity exhausted" );
+		}
+		matchConnectionId[ clientNum ] = ++nextMatchConnectionId;
+	}
 	memset( &playerState[ clientNum ], 0, sizeof( playerState[ clientNum ] ) );
 	statManager->ClientConnect( clientNum );
 }
@@ -1007,6 +8873,7 @@ void idMultiplayerGame::SpawnPlayer( int clientNum ) {
 	if ( p->IsLocalClient() && gameLocal.GetLocalPlayer() ) {
 		tourneyGUI.SetupTourneyGUI( gameLocal.GetLocalPlayer()->mphud, scoreBoard );
 	}
+	SynchronizeMatchParticipant( clientNum );
 
 	lastVOAnnounce = 0;
 }
@@ -1029,6 +8896,32 @@ void idMultiplayerGame::Clear() {
 	vote = VOTE_NONE;
 	voteTimeOut = 0;
 	voteExecTime = 0;
+	voteEligibleCount = 0;
+	clientMatchView.Clear();
+	clientMatchViewValid = false;
+	clientMatchControlModel.Clear();
+	ClearClientMatchControlConnectionState( true );
+	matchSessionOperational = false;
+	// A failed paired series/report checkpoint is retriable.  Map reset may tear
+	// down presentation state, but it must not erase the sealed journal and its
+	// artifact identity before BeginMatchSession retries that transaction.
+	if ( !matchEvidenceFinalizationPending ) {
+		matchEvidence.Clear();
+		matchEvidenceFinalized = false;
+		matchEvidencePersisted = false;
+		matchEvidenceMode = 0;
+		matchMVDStartedBySession = false;
+		matchMVDAttemptedBySession = false;
+		matchMVDOperatorOwnedBySession = false;
+		memset( matchMVDQPath, 0, sizeof( matchMVDQPath ) );
+	}
+	matchItemTiming.Clear();
+	matchItemTimingNeedsInitialScan = false;
+	matchViewObservedItemTimingRevision = 0;
+	matchPhaseEffectsSessionId = 0;
+	matchPhaseEffectsRevision = 0;
+	memset( matchViewSentRevision, 0, sizeof( matchViewSentRevision ) );
+	memset( lastMatchRequestResultValid, 0, sizeof( lastMatchRequestResultValid ) );
 	matchStartedTime = 0;
 	arenaResultPending = false;
 	arenaResultReported = false;
@@ -1513,7 +9406,7 @@ void idMultiplayerGame::ReceiveDeathMessage( idPlayer *attacker, int attackerSco
 // RAVEN END
 		}
 
-		if( gameLocal.gameType == GAME_DM ) {
+		if( gameLocal.gameType == GAME_DM || gameLocal.gameType == GAME_DUEL ) {
 			// print rank text next time after we update scores
 
 			// stash the scores on the client so we can print accurate rank info
@@ -1552,6 +9445,7 @@ void idMultiplayerGame::UpdateScoreboard( idUserInterface *scoreBoard ) {
 	}
 
 	scoreBoard->SetStateInt( "gametype", gameLocal.gameType );
+	ProjectClientManagedMatchContext( scoreBoard );
 
 	//statManager->UpdateInGameHud( scoreBoard, true );
 
@@ -1587,7 +9481,7 @@ void idMultiplayerGame::UpdateDMScoreboard( idUserInterface *scoreBoard ) {
 	scoreBoard->SetStateString( "spectator_scores_sel_0", "-1" );
 	bool useReady = ( gameLocal.serverInfo.GetBool( "si_useReady" ) &&
 		!IsArenaCampaignMatch() && gameLocal.mpGame.GetGameState()->GetMPGameState() == WARMUP );
-	if( gameLocal.gameType == GAME_DM ) {
+	if( gameLocal.gameType == GAME_DM || gameLocal.gameType == GAME_DUEL ) {
 		for ( i = 0; i < MAX_CLIENTS; i++ ) {
 			if( i < rankedPlayers.Num() ) {
 				// ranked player
@@ -1806,12 +9700,19 @@ void idMultiplayerGame::UpdateTeamScoreboard( idUserInterface *scoreBoard ) {
 	scoreBoard->SetStateString( "spectator_scores_sel_0", "-1" );
 	bool useReady = ( gameLocal.serverInfo.GetBool( "si_useReady" ) &&
 		!IsArenaCampaignMatch() && gameLocal.mpGame.GetGameState()->GetMPGameState() == WARMUP );
+	const bool roundMode = MPGameTypeHasAny( gameLocal.gameType, GTF_ROUND );
+	const char *scoreColumn = ( gameLocal.gameType == GAME_CA ) ? "#str_41406" :
+		( roundMode ? "#str_41409" : "#str_200198" );
+	scoreBoard->SetStateString( "scoreColumn", common->GetLocalizedString( scoreColumn ) );
 
 	for ( int i = 0; i < SCOREBOARD_MAX_CLIENTS; i++ ) {
 		if( i < rankedPlayers.Num() ) {
 			// ranked player
 			idPlayer*	rankedPlayer	= rankedPlayers[ i ].First();
 			int			rankedScore		= rankedPlayers[ i ].Second();
+			if ( rankedPlayer == NULL || rankedPlayer->team < 0 || rankedPlayer->team >= TEAM_MAX ) {
+				continue;
+			}
 
 			if ( rankedPlayer == player ) {
 				// highlight who we are
@@ -1820,7 +9721,7 @@ void idMultiplayerGame::UpdateTeamScoreboard( idUserInterface *scoreBoard ) {
 
 // RAVEN BEGIN
 // mekberg: redid this
-			if ( gameLocal.gameType == GAME_TDM )
+			if ( gameLocal.gameType == GAME_TDM || roundMode )
 			{
 				scoreBoard->SetStateString ( 
 				va("team_%i_scores_item_%i", rankedPlayer->team, numTeamEntries[ rankedPlayer->team ]), 
@@ -1944,6 +9845,8 @@ void idMultiplayerGame::UpdateTeamScoreboard( idUserInterface *scoreBoard ) {
 		scoreBoard->SetStateString( "serverlimit", va( "%s: %d", common->GetLocalizedString( "#str_107661" ), gameLocal.serverInfo.GetInt( "si_captureLimit" ) ) );
 	} else if ( gameLocal.gameType == GAME_DEADZONE ) {
 		scoreBoard->SetStateString( "serverlimit", va( "%s: %d", common->GetLocalizedString( "#str_122008" ), gameLocal.serverInfo.GetInt( "si_controlTime" ) ) );		
+	} else if ( roundMode ) {
+		scoreBoard->SetStateString( "serverlimit", va( "%s: %d", common->GetLocalizedString( "#str_41404" ), gameLocal.serverInfo.GetInt( "si_roundLimit" ) ) );
 	} else {
 		scoreBoard->SetStateString( "serverlimit", va( "%s: %d", common->GetLocalizedString( "#str_107660" ), gameLocal.serverInfo.GetInt( "si_fragLimit" ) ) );		
 	}
@@ -2316,7 +10219,7 @@ int idMultiplayerGame::NumActualClients( bool countSpectators, int *teamcounts )
 		if ( countSpectators || CanPlay( p ) ) {
 			c++;
 		}
-		if ( teamcounts && CanPlay( p ) ) {
+		if ( teamcounts && CanPlay( p ) && p->team >= 0 && p->team < TEAM_MAX ) {
 			teamcounts[ p->team ]++;
 		}
 	}
@@ -2349,6 +10252,13 @@ bool idMultiplayerGame::AllPlayersReady( idStr* reason ) {
 	idPlayer	*p;
 	int			team[ 2 ];
 	bool		notReady;
+
+	if ( gameLocal.isServer && !CanEnterMatchCountdown() ) {
+		if ( reason ) {
+			*reason = common->GetLocalizedString( "#str_42650" );
+		}
+		return false;
+	}
 
 	notReady = false;
 	
@@ -2430,7 +10340,6 @@ bool idMultiplayerGame::AllPlayersReady( idStr* reason ) {
 				readyCount++;
 			}
 		}
-		team[ p->team ]++;
 	}
 
 	readyPlayerCount = readyCount;
@@ -2456,15 +10365,15 @@ bool idMultiplayerGame::AllPlayersReady( idStr* reason ) {
 			if( gameLocal.GetLocalPlayer() && gameLocal.GetLocalPlayer()->IsReady() ) {
 				// Tourney has a different hud layout, so needs a different "you are (not)ready" string
 				if( gameLocal.gameType == GAME_TOURNEY ) {
-					*reason = va( common->GetLocalizedString( "#str_110018" ), common->KeysFromBinding( "_impulse17" ) );
+					*reason = va( common->GetLocalizedString( "#str_110018" ), common->KeysFromBindingForPrompt( "_impulse17" ) );
 				} else {
-					*reason = va( common->GetLocalizedString( "#str_107711" ), common->KeysFromBinding( "_impulse17" ) );
+					*reason = va( common->GetLocalizedString( "#str_107711" ), common->KeysFromBindingForPrompt( "_impulse17" ) );
 				}
 			} else if( gameLocal.GetLocalPlayer() ) {
 				if( gameLocal.gameType == GAME_TOURNEY ) {
-					*reason = va( common->GetLocalizedString( "#str_110017" ), common->KeysFromBinding( "_impulse17" ) );				
+					*reason = va( common->GetLocalizedString( "#str_110017" ), common->KeysFromBindingForPrompt( "_impulse17" ) );
 				} else {
-					*reason = va( common->GetLocalizedString( "#str_107710" ), common->KeysFromBinding( "_impulse17" ) );
+					*reason = va( common->GetLocalizedString( "#str_107710" ), common->KeysFromBindingForPrompt( "_impulse17" ) );
 				}
 			}
 		}
@@ -2634,7 +10543,11 @@ emptied out sat in GAMEON forever.  Returns the team left standing, or -1.
 int idMultiplayerGame::ForfeitTeam( void ) {
 	int i, count[ TEAM_MAX ];
 
-	if ( !gameLocal.IsTeamGame() || !gameLocal.serverInfo.GetBool( "si_forfeit" ) ) {
+	const bool forfeitEnabled = IsManagedMatch() ?
+		( competitiveRulesValidForSession &&
+			matchRules.Committed().GetBool( MP_RULE_FORFEIT_ON_EMPTY_TEAM ) ) :
+		gameLocal.serverInfo.GetBool( "si_forfeit" );
+	if ( !gameLocal.IsTeamGame() || !forfeitEnabled ) {
 		return -1;
 	}
 
@@ -2876,7 +10789,7 @@ void idMultiplayerGame::PlayerStats( int clientNum, char *data, const int len ) 
 	*data = 0;
 
 	// make sure we don't exceed the client list
-	if ( clientNum < 0 || clientNum > gameLocal.numClients ) {
+	if ( clientNum < 0 || clientNum >= gameLocal.numClients || clientNum >= MAX_CLIENTS ) {
 		return;
 	}
 
@@ -2934,9 +10847,15 @@ void idMultiplayerGame::ExecuteVote( void ) {
 			cvarSystem->SetCVarString( "si_gametype", voteValue );
 			cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "serverMapRestart\n");
 			break;
-		case VOTE_KICK:
-			cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "kick %s", voteValue.c_str() ) );
+		case VOTE_KICK: {
+			int kickClientNum;
+			if ( !ParseVotePlayerSlot( voteValue.c_str(), kickClientNum ) || kickClientNum == gameLocal.localClientNum ) {
+				common->Warning( "Ignoring vote execution for invalid kick slot '%s'", voteValue.c_str() );
+				break;
+			}
+			cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "kick %d", kickClientNum ) );
 			break;
+		}
 		case VOTE_MAP:
 			cvarSystem->SetCVarString( "si_map", voteValue );
 			cmdSystem->BufferCommandText( CMD_EXEC_APPEND, "serverMapRestart\n");
@@ -2973,11 +10892,62 @@ void idMultiplayerGame::ExecuteVote( void ) {
 
 /*
 ================
+idMultiplayerGame::AbortInheritedVoteForManagedMatch
+
+Managed sessions use the typed proposal service exclusively.  A vote can still
+be live when a server commits managed rules, including a passed vote waiting in
+the inherited execution delay.  Cancel the complete lifecycle before it can
+mutate server state through that stale authority path.
+================
+*/
+bool idMultiplayerGame::AbortInheritedVoteForManagedMatch( void ) {
+	if ( !matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH ) ||
+		( vote == VOTE_NONE && voteExecTime == 0 ) ) {
+		return false;
+	}
+
+	if ( vote != VOTE_NONE ) {
+		ClientUpdateVote( VOTE_ABORTED, yesVotes, noVotes, currentVoteData );
+	}
+
+	vote = VOTE_NONE;
+	voteTimeOut = 0;
+	voteExecTime = 0;
+	yesVotes = 0;
+	noVotes = 0;
+	voteEligibleCount = 0;
+	voteValue.Clear();
+	voteString.Clear();
+	voted = false;
+	currentVoteData.m_fieldFlags = 0;
+	currentVoteData.m_kick = 0;
+	currentVoteData.m_map.Clear();
+	currentVoteData.m_gameType = 0;
+	currentVoteData.m_timeLimit = 0;
+	currentVoteData.m_fragLimit = 0;
+	currentVoteData.m_tourneyLimit = 0;
+	currentVoteData.m_captureLimit = 0;
+	currentVoteData.m_buying = 0;
+	currentVoteData.m_teamBalance = 0;
+	currentVoteData.m_controlTime = 0;
+	for ( int i = 0; i < MAX_CLIENTS; ++i ) {
+		playerState[ i ].vote = PLAYER_VOTE_NONE;
+	}
+	ClearVote();
+
+	gameLocal.Printf( "aborted inherited vote after managed match authority became active\n" );
+	return true;
+}
+
+/*
+================
 idMultiplayerGame::CheckVote
 ================
 */
 void idMultiplayerGame::CheckVote( void ) {
-	int numVoters, i;
+	if ( AbortInheritedVoteForManagedMatch() ) {
+		return;
+	}
 
 	if ( vote == VOTE_NONE ) {
 		return;
@@ -2993,33 +10963,20 @@ void idMultiplayerGame::CheckVote( void ) {
 		return;
 	}
 
-	// count voting players
-	numVoters = 0;
-
-	for ( i = 0; i < gameLocal.numClients; i++ ) {
-		idEntity *ent = gameLocal.entities[ i ];
-// RAVEN BEGIN
-// jnewquist: Use accessor for static class type 
-		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
-// RAVEN END
-			continue;
-		}
-		if ( playerState[ i ].vote != PLAYER_VOTE_NONE ) {
-			numVoters++;
-		}
-	}
-	if ( !numVoters ) {
+	// The electorate is frozen when the vote starts.  Disconnects and slot
+	// reuse cannot lower its denominator or grant a late joiner a ballot.
+	if ( voteEligibleCount <= 0 ) {
 		// abort
 		vote = VOTE_NONE;
 		ClientUpdateVote( VOTE_ABORTED, yesVotes, noVotes, currentVoteData );
 		return;
 	}
-	if ( float(yesVotes) / numVoters > 0.5f ) {
+	if ( float(yesVotes) / voteEligibleCount > 0.5f ) {
 		ClientUpdateVote( VOTE_PASSED, yesVotes, noVotes, currentVoteData );
 		voteExecTime = gameLocal.time + 2000;
 		return;
 	}
-	if ( gameLocal.time > voteTimeOut || float(noVotes) / numVoters >= 0.5f ) {
+	if ( gameLocal.time > voteTimeOut || float(noVotes) / voteEligibleCount >= 0.5f ) {
 		ClientUpdateVote( VOTE_FAILED, yesVotes, noVotes, currentVoteData );
 		vote = VOTE_NONE;
 		return;
@@ -3068,7 +11025,7 @@ void idMultiplayerGame::ClientCallPackedVote( const voteStruct_t &voteData ) {
 		outMsg.WriteShort( idMath::ClampShort( voteData.m_fragLimit ) );
 	}
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_BUYING ) ) {
-		outMsg.WriteShort( idMath::ClampShort( voteData.m_buying) );
+		outMsg.WriteByte( voteData.m_buying ? 1 : 0 );
 	}
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_TEAMBALANCE ) ) {
 		outMsg.WriteByte( idMath::ClampChar( voteData.m_teamBalance ) );
@@ -3089,13 +11046,29 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 	memset( &voteData, 0, sizeof( voteData ) );
 
 	assert( -1 != clientNum );
+	if ( !IsEligibleVotePlayerSlot( clientNum ) ) {
+		common->Warning( "Ignoring packed vote from invalid client slot %d", clientNum );
+		return;
+	}
+
+	// Managed matches have one proposal service and one revisioned authority
+	// path.  The inherited packed vote is intentionally retained only for
+	// casual/mixed-version servers; accepting it here would let a client mutate
+	// server state without the match operation capability, target and CAS
+	// checks.
+	if ( matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH ) ) {
+		gameLocal.ServerSendChatMessage( clientNum, "server", "#str_41773" );
+		common->DPrintf( "client %d: packed vote rejected during a managed match\n",
+			clientNum );
+		return;
+	}
 	
 	if( !gameLocal.serverInfo.GetBool( "si_allowVoting" ) ) {
 		return;
 	}
 
-	// this is set to false if an invalid parameter is asked for-- time limit of -1, or frag limit of "jeff" or whatever.	
-	// if it's a multivote, it may still be valid, but this value is only checked if there are no vote parameters changed. 
+	// Packed votes are atomic: a malformed, out-of-range or no-op field rejects
+	// the complete request instead of applying an attacker-chosen valid subset.
 	bool validVote = true;
 
 	// sanity checks - setup the vote
@@ -3105,21 +11078,24 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 		return;
 	}
 
-	// flags (short)
-	voteData.m_fieldFlags = msg.ReadShort();
-
-	// clear any unallowed votes
-	int disallowedVotes = gameLocal.serverInfo.GetInt( "si_voteFlags" );
-	for( int i = 0; i < NUM_VOTES; i++ ) {
-		if ( disallowedVotes & (1 << i) ) {
-			voteData.m_fieldFlags &= ~(1 << i);
-		}
+	// Decode the exact shape declared on the wire before applying policy.  If
+	// policy bits were cleared first, their payload bytes remained unread and
+	// every following field was decoded at the wrong offset.
+	const int wireFieldFlags = msg.ReadShort();
+	if ( wireFieldFlags <= 0 || ( wireFieldFlags & ~VOTEFLAG_ALL ) != 0 ) {
+		common->Warning( "Ignoring packed vote from client %d with invalid field flags 0x%x", clientNum, wireFieldFlags );
+		return;
 	}
+	voteData.m_fieldFlags = wireFieldFlags;
 
 	// kick
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_KICK ) ) {
 		voteData.m_kick = msg.ReadByte();
-		if ( voteData.m_kick == gameLocal.localClientNum ) {
+		if ( !IsValidVotePlayerSlot( voteData.m_kick ) ) {
+			common->DPrintf( "client %d: called kick for invalid player slot %d\n", clientNum, voteData.m_kick );
+			validVote = false;
+			voteData.m_fieldFlags &= ( ~VOTEFLAG_KICK );
+		} else if ( voteData.m_kick == gameLocal.localClientNum ) {
 			gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104257" );
 			common->DPrintf( "client %d: called kick for the server host\n", clientNum );
 			validVote = false;
@@ -3130,6 +11106,10 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 	// map (string)
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_MAP ) ) {
 		char buffer[128];
+		if ( !HasBoundedMessageString( msg, sizeof( buffer ) ) ) {
+			common->Warning( "Ignoring packed vote from client %d with a missing or oversized map token", clientNum );
+			return;
+		}
 		msg.ReadString( buffer, sizeof( buffer ) );
 		voteData.m_map = buffer;
 		if ( 0 == idStr::Icmp( buffer, si_map.GetString() ) ) {
@@ -3150,13 +11130,18 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 		if( !mapDict ) {
 			validVote = false;
 			voteData.m_fieldFlags &= ( ~VOTEFLAG_MAP );
-			gameLocal.ServerSendChatMessage( clientNum, "server", "Selected map does not exist on the server" );
+			gameLocal.ServerSendChatMessage( clientNum, "server", "#str_41800" );
 		}
 	}
 
 	// gametype
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_GAMETYPE ) ) {
 		voteData.m_gameType = msg.ReadByte();
+		if ( voteData.m_gameType < 0 || voteData.m_gameType >= MPVoteGameTypeCount() ) {
+			common->DPrintf( "client %d: invalid packed gametype vote index %d\n", clientNum, voteData.m_gameType );
+			validVote = false;
+			voteData.m_fieldFlags &= ( ~VOTEFLAG_GAMETYPE );
+		}
 		const char *voteString = VoteGameTypeToString( voteData.m_gameType );
 		if ( !idStr::Icmp( voteString, gameLocal.serverInfo.GetString( "si_gameType" ) ) ) {
 			gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104259" );
@@ -3168,7 +11153,7 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 		if ( voteData.m_fieldFlags & VOTEFLAG_MAP ) {
 			const idDict *mapDict = MultiplayerResolveMapDecl( voteData.m_map.c_str() );
 			if ( !MPMapSupportsGameTypeName( mapDict, voteString ) ) {
-				gameLocal.ServerSendChatMessage( clientNum, "server", "gametype incompatible with map" );
+				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_41801" );
 				validVote = false;
 				voteData.m_fieldFlags &= ( ~VOTEFLAG_GAMETYPE );
 			}
@@ -3177,7 +11162,7 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 		if ( voteData.m_fieldFlags & VOTEFLAG_MAP ) {
 			const idDict *mapDict = MultiplayerResolveMapDecl( voteData.m_map.c_str() );
 			if ( !MPMapSupportsGameTypeName( mapDict, si_gameType.GetString() ) ) {
-				gameLocal.ServerSendChatMessage( clientNum, "server", "map incompatible with gametype" );
+				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_41802" );
 				validVote = false;
 				voteData.m_fieldFlags &= ( ~VOTEFLAG_MAP );
 			}
@@ -3218,7 +11203,7 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 	// capture limit
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_CAPTURELIMIT ) ) {
 		voteData.m_captureLimit = msg.ReadShort();
-		if ( voteData.m_captureLimit < si_captureLimit.GetMinValue() || voteData.m_captureLimit > si_fragLimit.GetMaxValue() ) {
+		if ( voteData.m_captureLimit < si_captureLimit.GetMinValue() || voteData.m_captureLimit > si_captureLimit.GetMaxValue() ) {
 			gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104402" );
 			common->DPrintf( "client %d: caplimit value out of range for vote: %d\n", clientNum, voteData.m_captureLimit );
 			validVote = false;
@@ -3259,17 +11244,27 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 
 	// buying
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_BUYING ) ) {
-		voteData.m_buying = msg.ReadShort();
+		voteData.m_buying = msg.ReadByte();
+		if ( voteData.m_buying != 0 && voteData.m_buying != 1 ) {
+			common->DPrintf( "client %d: invalid buying vote value %d\n", clientNum, voteData.m_buying );
+			validVote = false;
+			voteData.m_fieldFlags &= ( ~VOTEFLAG_BUYING );
+		}
 		if ( voteData.m_buying == si_isBuyingEnabled.GetInteger() ) {
 			gameLocal.ServerSendChatMessage( clientNum, "server", "#str_122013" );
 			validVote = false;
-			voteData.m_buying &= ( ~VOTEFLAG_BUYING );
+			voteData.m_fieldFlags &= ( ~VOTEFLAG_BUYING );
 		}
 	}
 
 	// autobalance teams
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_TEAMBALANCE ) ) {
 		voteData.m_teamBalance = msg.ReadByte();
+		if ( voteData.m_teamBalance != 0 && voteData.m_teamBalance != 1 ) {
+			common->DPrintf( "client %d: invalid team-balance vote value %d\n", clientNum, voteData.m_teamBalance );
+			validVote = false;
+			voteData.m_fieldFlags &= ( ~VOTEFLAG_TEAMBALANCE );
+		}
 		if ( voteData.m_teamBalance == si_autobalance.GetInteger() ) {
 			gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104403" );
 			validVote = false;
@@ -3280,11 +11275,33 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 	// control time
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_CONTROLTIME ) ) {
 		voteData.m_controlTime = msg.ReadShort();
+		if ( voteData.m_controlTime < si_controlTime.GetMinValue() || voteData.m_controlTime > si_controlTime.GetMaxValue() ) {
+			common->DPrintf( "client %d: control-time value out of range for vote: %d\n", clientNum, voteData.m_controlTime );
+			validVote = false;
+			voteData.m_fieldFlags &= ( ~VOTEFLAG_CONTROLTIME );
+		}
 		if ( voteData.m_controlTime == si_controlTime.GetInteger() ) {
 			gameLocal.ServerSendChatMessage( clientNum, "server", "#str_122017" );
 			validVote = false;
 			voteData.m_fieldFlags &= ( ~VOTEFLAG_CONTROLTIME );
 		}
+	}
+
+	if ( msg.GetRemainingReadBits() != 0 ) {
+		common->Warning( "Ignoring packed vote from client %d with %d trailing bits", clientNum, msg.GetRemainingReadBits() );
+		return;
+	}
+
+	// Policy is applied only after the complete, structurally valid payload has
+	// been consumed.  A disabled field can no longer desynchronize later reads.
+	const int disallowedVotes = gameLocal.serverInfo.GetInt( "si_voteFlags" ) & VOTEFLAG_ALL;
+	if ( ( wireFieldFlags & disallowedVotes ) != 0 ) {
+		common->DPrintf( "client %d: packed vote contains server-disabled fields 0x%x\n", clientNum, wireFieldFlags & disallowedVotes );
+		return;
+	}
+
+	if ( !validVote ) {
+		return;
 	}
 
 	// check for no changes at all
@@ -3311,6 +11328,14 @@ void idMultiplayerGame::ClientStartPackedVote( int clientNum, const voteStruct_t
 	assert( 0 != voteData.m_fieldFlags );
 
 	if ( !gameLocal.isListenServer && !gameLocal.isClient ) {
+		return;
+	}
+	if ( !IsValidVotePlayerSlot( clientNum ) ) {
+		common->Warning( "Ignoring packed vote notification from invalid client slot %d", clientNum );
+		return;
+	}
+	if ( ( voteData.m_fieldFlags & VOTEFLAG_KICK ) != 0 && !IsValidVotePlayerSlot( voteData.m_kick ) ) {
+		common->Warning( "Ignoring packed vote notification with invalid kick slot %d", voteData.m_kick );
 		return;
 	}
 
@@ -3344,12 +11369,12 @@ void idMultiplayerGame::ClientStartPackedVote( int clientNum, const voteStruct_t
 		int menuVoteLineCount = 0;
 		bool kickActive = false;
 		bool maxWindows = false;
-		idStr yesKey = common->KeysFromBinding("_impulse28");
+		idStr yesKey = common->KeysFromBindingForPrompt("_impulse28");
 
 		mainGui->SetStateInt( "vote_going", 1 );
 
 		//dynamic vote yes/no box
-		mpHud->SetStateString( "voteNoticeText", va( common->GetLocalizedString( "#str_107242" ), yesKey.c_str(), common->KeysFromBinding("_impulse29") ));
+		mpHud->SetStateString( "voteNoticeText", va( common->GetLocalizedString( "#str_107242" ), yesKey.c_str(), common->KeysFromBindingForPrompt("_impulse29") ));
 
 		// kick should always be the highest one
 		if ( 0 != ( currentVoteData.m_fieldFlags & VOTEFLAG_KICK ) ) {
@@ -3560,7 +11585,7 @@ void idMultiplayerGame::ServerStartPackedVote( int clientNum, const voteStruct_t
 	}
 
 	// #13705: clients passing a vote during server restart could abuse the voting system into passing the vote right away after the new map loads
-	if ( !playerState[ clientNum ].ingame ) {
+	if ( !IsEligibleVotePlayerSlot( clientNum ) ) {
 		common->Printf( "ignore vote called by client %d: not in game\n", clientNum );
 		return;
 	}
@@ -3571,10 +11596,12 @@ void idMultiplayerGame::ServerStartPackedVote( int clientNum, const voteStruct_t
 	vote = VOTE_MULTIFIELD;
 	currentVoteData = voteData;
 	voteTimeOut = gameLocal.time + 30000;	// 30 seconds?  might need to be longer because it requires fiddling with the GUI
+	voteEligibleCount = 0;
 	// mark players allowed to vote - only current ingame players, players joining during vote will be ignored
 	for ( int i = 0; i < gameLocal.numClients; i++ ) {
-		if ( gameLocal.entities[ i ] && gameLocal.entities[ i ]->IsType( idPlayer::GetClassType() ) ) {
+		if ( IsEligibleVotePlayerSlot( i ) ) {
 			playerState[ i ].vote = ( i == clientNum ) ? PLAYER_VOTE_YES : PLAYER_VOTE_WAIT;
+			voteEligibleCount++;
 		} else {
 			playerState[i].vote = PLAYER_VOTE_NONE;
 		}
@@ -3606,7 +11633,7 @@ void idMultiplayerGame::ServerStartPackedVote( int clientNum, const voteStruct_t
 		outMsg.WriteShort( idMath::ClampShort( voteData.m_captureLimit ) );
 	}
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_BUYING ) ) {
-		outMsg.WriteShort( idMath::ClampShort( voteData.m_buying ) );
+		outMsg.WriteByte( voteData.m_buying ? 1 : 0 );
 	}
 	if ( 0 != ( voteData.m_fieldFlags & VOTEFLAG_TEAMBALANCE ) ) {
 		outMsg.WriteByte( idMath::ClampChar( voteData.m_teamBalance ) );
@@ -3653,7 +11680,11 @@ void idMultiplayerGame::ExecutePackedVote( void ) {
 		ShuffleTeams();
 	}
 	if ( 0 != ( currentVoteData.m_fieldFlags & VOTEFLAG_KICK ) ) {
-		cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "kick %d", currentVoteData.m_kick ) );
+		if ( IsValidVotePlayerSlot( currentVoteData.m_kick ) && currentVoteData.m_kick != gameLocal.localClientNum ) {
+			cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "kick %d", currentVoteData.m_kick ) );
+		} else {
+			common->Warning( "Ignoring packed vote execution for invalid kick slot %d", currentVoteData.m_kick );
+		}
 	}
 	if ( 0 != ( currentVoteData.m_fieldFlags & VOTEFLAG_MAP ) ) {
 		si_map.SetString( currentVoteData.m_map.c_str() );
@@ -4049,7 +12080,7 @@ void idMultiplayerGame::CommonRun( void ) {
 	int oldHighScore = idMath::INT_MIN;
 
 	if( player && rankedPlayers.Num() ) {
-		if( gameLocal.gameType == GAME_DM ) {
+		if( gameLocal.gameType == GAME_DM || gameLocal.gameType == GAME_DUEL ) {
 			oldRank = GetPlayerRank( player, wasTied );
 			oldHighScore = rankedPlayers[ 0 ].Second();
 		} else if( gameLocal.IsTeamGame() ) {
@@ -4065,7 +12096,7 @@ void idMultiplayerGame::CommonRun( void ) {
 	}
 
 	if ( player && rankedPlayers.Num() && gameState->GetMPGameState() == GAMEON ) {
-		if ( gameLocal.gameType == GAME_DM ) {
+		if ( gameLocal.gameType == GAME_DM || gameLocal.gameType == GAME_DUEL ) {
 			// leader message
 			bool isTied = false;
 			int newRank = GetPlayerRank( player, isTied );
@@ -4104,7 +12135,7 @@ void idMultiplayerGame::CommonRun( void ) {
 			}
 		}
 
-		if( ( gameLocal.gameType == GAME_DM ) && rankedPlayers[ 0 ].Second() != oldHighScore && gameLocal.serverInfo.GetInt( "si_fragLimit" ) > 0 ) {
+		if( ( gameLocal.gameType == GAME_DM || gameLocal.gameType == GAME_DUEL ) && rankedPlayers[ 0 ].Second() != oldHighScore && gameLocal.serverInfo.GetInt( "si_fragLimit" ) > 0 ) {
 			// fraglimit warning
 			if( rankedPlayers[ 0 ].Second() == gameLocal.serverInfo.GetInt( "si_fragLimit" ) - 3 ) {
 				ScheduleAnnouncerSound( AS_GENERAL_THREE_FRAGS, gameLocal.time );
@@ -4254,6 +12285,16 @@ void idMultiplayerGame::ClientRun( void ) {
 		assert( !gameLocal.isServer );
 		pureReady = true;
 	}
+	if ( pendingRefereeChallengeValid ) {
+		mpRefereeAuthChallenge challenge = pendingRefereeChallenge;
+		pendingRefereeChallenge.Clear();
+		pendingRefereeChallengeValid = false;
+		CompleteRefereeAuthChallenge( challenge );
+		challenge.Clear();
+	} else if ( pendingRefereePasswordLength > 0 &&
+		gameLocal.time > pendingRefereePasswordDeadline ) {
+		ClearPendingRefereePassword();
+	}
 
 	CommonRun();
 }
@@ -4326,7 +12367,7 @@ void idMultiplayerGame::ReportZoneController(int team, int pCount, int situation
 			// Set the shaders and lights back to neutral.  
 			if ( zTrigger->spawnArgs.MatchPrefix( "colorTarget" ) ) {
 				const idKeyValue *arg;
-				int refLength = strlen( "colorTarget" );
+				const int refLength = sizeof( "colorTarget" ) - 1;
 				int num = zTrigger->spawnArgs.GetNumKeyVals();
 				for( int i = 0; i < num; i++ ) {
 					arg = zTrigger->spawnArgs.GetKeyVal( i );
@@ -4438,7 +12479,7 @@ void idMultiplayerGame::ReportZoneController(int team, int pCount, int situation
 
 	if ( zTrigger->spawnArgs.MatchPrefix( "colorTarget" ) ) {
 		const idKeyValue *arg;
-		int refLength = strlen( "colorTarget" );
+		const int refLength = sizeof( "colorTarget" ) - 1;
 		int num = zTrigger->spawnArgs.GetNumKeyVals();
 		for( int i = 0; i < num; i++ ) {
 			arg = zTrigger->spawnArgs.GetKeyVal( i );
@@ -5232,8 +13273,27 @@ void idMultiplayerGame::Run( void ) {
 	assert( gameLocal.isMultiplayer && gameLocal.isServer && gameState );
 
 	CommonRun();
+	if ( matchSession.GetPhase() == WARMUP || matchSession.GetPhase() == COUNTDOWN ) {
+		SynchronizeAllMatchParticipants();
+	}
 
 	CheckVote();
+
+	if ( IsGameplayFrozen() ) {
+		// The network/UI/operation side of CommonRun and inherited vote expiry
+		// remains live.  Gameplay-owned respawns, effects, powerups and lifecycle
+		// deadlines were rebased once at the frame boundary and must not run here.
+		gameState->SendState( serverReliableSender.To( -1 ) );
+		if ( gameLocal.time > pingUpdateTime ) {
+			for ( int i = 0; i < gameLocal.numClients; i++ ) {
+				playerState[i].ping = networkSystem->ServerGetClientPing( i );
+			}
+			pingUpdateTime = gameLocal.time + 1000;
+		}
+		AdvanceMatchViewRevision();
+		SendChangedMatchViews();
+		return;
+	}
 
 	CheckRespawns();
 
@@ -5255,8 +13315,8 @@ void idMultiplayerGame::Run( void ) {
 		}
 		pingUpdateTime = gameLocal.time + 1000;
 	}
-
-
+	AdvanceMatchViewRevision();
+	SendChangedMatchViews();
 }
 
 /*
@@ -5339,6 +13399,14 @@ void idMultiplayerGame::UpdateMainGui( void ) {
 	mainGui->SetStateString( "join_server_line_3", va( "%s\t%s", common->GetLocalizedString( "#str_107730" ), ResolveScoreboardMapName( gameLocal.serverInfo.GetString( "si_map" ), mapName ) ) );
 	mainGui->SetStateString( "join_server_line_4", va( "%s:\t%d/%d", common->GetLocalizedString( "#str_107663" ), playerCount, maxPlayers ) );
 	mainGui->SetStateString( "join_server_line_5", va( "%s:\t%d", limitLabel, limitValue ) );
+	RefreshLocalClientMatchView();
+	if ( ( clientMatchViewValid && clientMatchControlModel.IsReady() &&
+			clientMatchMenuProjectedViewRevision !=
+				clientMatchView.publicState.viewRevision ) ||
+		( ( !clientMatchViewValid || !clientMatchControlModel.IsReady() ) &&
+			clientMatchMenuProjectedViewRevision != 0 ) ) {
+		ProjectClientMatchControlMenu( false );
+	}
 	mainGui->StateChanged( gameLocal.time );
 #if defined( __linux__ )
 	// replacing the oh-so-useful s_reverse with sound backend prompt
@@ -5502,6 +13570,13 @@ idUserInterface* idMultiplayerGame::StartMenu( void ) {
 	if ( mainGui == NULL ) {
 		return NULL;
 	}
+	// Referee credentials are single-attempt local input.  Opening, closing or
+	// switching the menu revokes any unfinished challenge and removes the GUI
+	// copy before another frame can expose it.
+	ClearPendingRefereePassword();
+	pendingRefereeChallenge.Clear();
+	pendingRefereeChallengeValid = false;
+	mainGui->SetStateString( "match_referee_credential", "" );
 	//if we're the server, allow access to the admin tab right away. Otherwise, make sure we don't have it.
 	if( gameLocal.isServer	)	{
 		mainGui->SetStateInt( "password_valid", 1 );
@@ -5530,6 +13605,10 @@ idUserInterface* idMultiplayerGame::StartMenu( void ) {
 
 	nextMenu = 0;
 	if ( currentMenu == 1 ) {
+		// Opening the menu may follow a GUI reload even when the authoritative
+		// view is unchanged.  Force one projection, then UpdateMainGui can reuse
+		// that revision until a view/result/error/selection handler invalidates it.
+		clientMatchMenuProjectedViewRevision = 0;
 		UpdateMainGui();
 
 		// UpdateMainGui sets most things, but it doesn't set these because
@@ -5537,17 +13616,17 @@ idUserInterface* idMultiplayerGame::StartMenu( void ) {
 		// Currenty the gui doesn't update properly if they change anyway, so we'll leave it like this.
 
 		// player kick data
-		for ( i = 0; i < 16; i++ ) {
+		for ( i = 0; i < MAX_CLIENTS; i++ ) {
 			kickVoteMapNames[ i ].Clear();
 			kickVoteMap[ i ] = -1;
 		}
 
 		idStr kickList;
 		j = 0;
-		for ( i = 0; i < gameLocal.numClients; i++ ) {
+		for ( i = 0; i < gameLocal.numClients && i < MAX_CLIENTS; i++ ) {
 // RAVEN BEGIN
 // jnewquist: Use accessor for static class type 
-			if ( gameLocal.entities[ i ] && gameLocal.entities[ i ]->IsType( idPlayer::GetClassType() ) ) {
+			if ( IsValidVotePlayerSlot( i ) && j < MAX_CLIENTS ) {
 // RAVEN END
 				if ( kickList.Length() ) {
 					kickList += ";";
@@ -5668,6 +13747,12 @@ idMultiplayerGame::DisableMenu
 ================
 */
 void idMultiplayerGame::DisableMenu( void ) {
+	ClearPendingRefereePassword();
+	pendingRefereeChallenge.Clear();
+	pendingRefereeChallengeValid = false;
+	if ( mainGui != NULL ) {
+		mainGui->SetStateString( "match_referee_credential", "" );
+	}
 	if ( currentMenu == 1 ) {
 		mainGui->Activate( false, gameLocal.time );
 	} else if ( currentMenu == 2 ) {
@@ -5880,6 +13965,14 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 
 		if ( !idStr::Icmp( cmd,	";"	) )	{
 			continue;
+		} else if ( !idStr::Icmp( cmd, "matchControl" ) ) {
+			// The GUI emits one fixed token.  Arguments always come from the
+			// accepted typed row model or bounded choice states, never from the
+			// displayed list text.
+			if ( args.Argc() - icmd >= 1 ) {
+				HandleMatchControlCommand( args.Argv( icmd++ ) );
+			}
+			continue;
 		} else if ( !idStr::Icmp( cmd, "inGameMenu" ) ) {
 			if ( args.Argc() - icmd	>= 1 ) {
 				idStr igArg = args.Argv( icmd++ );
@@ -6062,7 +14155,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 			
 			// kick
 			int uiKickSelection = mainGui->State().GetInt( "playerList_sel_0" );
-			if ( -1 != uiKickSelection ) {
+			if ( uiKickSelection >= 0 && uiKickSelection < MAX_CLIENTS && IsValidVotePlayerSlot( kickVoteMap[ uiKickSelection ] ) ) {
 				voteData.m_kick = kickVoteMap[ uiKickSelection ];
 				voteData.m_fieldFlags |= VOTEFLAG_KICK;
 			}
@@ -6198,7 +14291,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 		} else if ( !idStr::Icmp( cmd, "click_playerList" ) ) {
 			// push data into the name field
 			int sel = mainGui->GetStateInt( "playerList_sel_0" );
-			if ( -1 == sel ) {
+			if ( sel < 0 || sel >= MAX_CLIENTS || !IsValidVotePlayerSlot( kickVoteMap[ sel ] ) ) {
 				mainGui->SetStateString( "playerKick", "" );
 			} else { 
 				mainGui->SetStateString( "playerKick", kickVoteMapNames[ sel ] );
@@ -6227,7 +14320,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 #else
 			// push data into the vote_ cvars so the UI can start at where we currently are
 			int players;
-			for ( players=0; players<gameLocal.numClients; players++ ) { 
+			for ( players = 0; players < gameLocal.numClients && players < MAX_CLIENTS; players++ ) {
 				mainGui->SetStateString( va( "playerList_item_%d", players ), kickVoteMapNames[players] );
 			}
 			if ( players < MAX_CLIENTS ) {
@@ -6362,7 +14455,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 		// handler for initializing the player list on the admin player tab
 		} else if ( !idStr::Icmp( cmd, "initServerAdminPlayer" ) ) {
 			int players;
-			for ( players=0; players<gameLocal.numClients; players++ ) { 
+			for ( players = 0; players < gameLocal.numClients && players < MAX_CLIENTS; players++ ) {
 				mainGui->SetStateString( va( "sa_playerList_item_%d", players ), kickVoteMapNames[players] );
 			}
 			if ( players < MAX_CLIENTS ) {
@@ -6391,7 +14484,15 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 				data.mapName = gameLocal.serverInfo.GetString( "si_map" );
 			}
 
-			data.gameType = MPVoteGameTypeToGameType( mainGui->GetStateInt( "admincurrentGametype" ) );
+			const int adminGameTypeIndex =
+				mainGui->GetStateInt( "admincurrentGametype" );
+			if ( adminGameTypeIndex < 0 ||
+				adminGameTypeIndex >= MPVoteGameTypeCount() ) {
+				common->Warning( "server admin GUI supplied invalid gametype index %d",
+					adminGameTypeIndex );
+				continue;
+			}
+			data.gameType = MPVoteGameTypeToGameType( adminGameTypeIndex );
 			data.captureLimit = mainGui->GetStateInt( "sa_captureLimit" );
 			data.fragLimit = mainGui->GetStateInt( "sa_fragLimit" );
 			data.tourneyLimit = mainGui->GetStateInt( "sa_tourneylimit" );
@@ -6411,7 +14512,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 		// handler for the kick button on the player tab of the server admin gui
 		} else if ( !idStr::Icmp( cmd, "handleServerAdminKick" ) ) {
 			int uiKickSelection = mainGui->State().GetInt( "sa_playerList_sel_0" );
-			if ( -1 != uiKickSelection ) {
+			if ( uiKickSelection >= 0 && uiKickSelection < MAX_CLIENTS && IsValidVotePlayerSlot( kickVoteMap[ uiKickSelection ] ) ) {
 				HandleServerAdminKickPlayer( kickVoteMap[ uiKickSelection ] );
 				DisableMenu();
 				return NULL;
@@ -6422,7 +14523,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 		} else if ( !idStr::Icmp( cmd, "handleServerAdminBan" ) ) {
 			//common->Printf( "HANDLE SERVER ADMIN BAN!\n" );
 			int uiBanSelection = mainGui->State().GetInt( "sa_playerList_sel_0" );
-			if ( -1 != uiBanSelection ) {
+			if ( uiBanSelection >= 0 && uiBanSelection < MAX_CLIENTS && IsValidVotePlayerSlot( kickVoteMap[ uiBanSelection ] ) ) {
 				HandleServerAdminBanPlayer( kickVoteMap[ uiBanSelection ] );
 				DisableMenu();
 				mainGui->DeleteStateVar( va( "sa_banList_item_%d", 0 ) );
@@ -6447,7 +14548,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 		} else if ( !idStr::Icmp( cmd, "handleServerAdminSwitchTeams" ) ) {
 			if ( gameLocal.IsTeamGame() ) {
 				int uiSwitchSelection = mainGui->State().GetInt( "sa_playerList_sel_0" );
-				if ( -1 != uiSwitchSelection ) {
+				if ( uiSwitchSelection >= 0 && uiSwitchSelection < MAX_CLIENTS && IsValidVotePlayerSlot( kickVoteMap[ uiSwitchSelection ] ) ) {
 					HandleServerAdminForceTeamSwitch( kickVoteMap[ uiSwitchSelection ] );
 					DisableMenu();
 					return NULL;
@@ -6922,7 +15023,6 @@ void idMultiplayerGame::UpdateHud( idUserInterface* _mphud ) {
 		_mphud->SetStateString( "main_notice_text", "" );
 		_mphud->SetStateBool( "main_notice_persist", false );
 	}
-
 // openQ4 BEGIN
 	// Match progression carried over from Quake Live.  These keys are always
 	// written so a .gui can bind to them unconditionally; the "show" flags say
@@ -7027,7 +15127,7 @@ void idMultiplayerGame::UpdateHud( idUserInterface* _mphud ) {
 	}
 	_mphud->SetStateBool( "infinity", ( !timeLimit && !inCountdownState ) || inNonTimedState );
 
-	if( gameLocal.gameType == GAME_DM ) {
+	if( gameLocal.gameType == GAME_DM || gameLocal.gameType == GAME_DUEL ) {
 		if( rankedPlayers.Num() ) {
 			_mphud->SetStateString( "player1_name", rankedPlayers[ 0 ].First()->GetUserInfo()->GetString( "ui_name" ) );
 			_mphud->SetStateString( "player1_score", va( "%d", GetScore( rankedPlayers[ 0 ].First() ) ) );
@@ -7181,7 +15281,7 @@ void idMultiplayerGame::UpdateHud( idUserInterface* _mphud ) {
 			if( localPlayer->GetArena() == MAX_ARENAS ) {
 				spectateText1 = common->GetLocalizedString( "#str_107686" );
 			} else {
-				spectateText1 = va( common->GetLocalizedString( "#str_107670" ), common->KeysFromBinding( "_impulse14" ), common->KeysFromBinding( "_impulse15" ) );
+				spectateText1 = va( common->GetLocalizedString( "#str_107670" ), common->KeysFromBindingForPrompt( "_impulse14" ), common->KeysFromBindingForPrompt( "_impulse15" ) );
 			}
 		}
 	} else {
@@ -7196,10 +15296,10 @@ void idMultiplayerGame::UpdateHud( idUserInterface* _mphud ) {
 			// spectating instructions
 			if( localPlayer->spectator != localPlayer->entityNumber ) {
 				//cycle & exit follow
-				spectateText1 = va( common->GetLocalizedString( "#str_107698" ), common->KeysFromBinding( "_attack" ), common->KeysFromBinding( "_moveup" )  );
+				spectateText1 = va( common->GetLocalizedString( "#str_107698" ), common->KeysFromBindingForPrompt( "_attack" ), common->KeysFromBindingForPrompt( "_moveup" )  );
 			} else {
 				//start follow
-				spectateText1 = va( common->GetLocalizedString( "#str_108024" ), common->KeysFromBinding( "_attack" )  );
+				spectateText1 = va( common->GetLocalizedString( "#str_108024" ), common->KeysFromBindingForPrompt( "_attack" )  );
 			}
 			
 		}
@@ -7227,6 +15327,7 @@ void idMultiplayerGame::UpdateHud( idUserInterface* _mphud ) {
 		gameLocal.mpGame.tourneyGUI.UpdateScores();
 	}
 
+	ProjectClientManagedMatchContext( _mphud );
 	_mphud->StateChanged( gameLocal.time );
 
 	statManager->UpdateInGameHud( _mphud, ( localPlayer->usercmd.buttons & BUTTON_INGAMESTATS ) != 0 );
@@ -7993,6 +16094,31 @@ idMultiplayerGame::ForceReady
 ================
 */
 void idMultiplayerGame::ForceReady( ) {
+	if ( matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH ) ) {
+		mpMatchOperationRequest_t request;
+		request.Clear();
+		request.opcode = MP_MATCH_OP_FORCE_READY;
+		request.argumentCount = 1;
+		request.arguments[ 0 ].fieldId = MP_MATCH_ARG_ENABLED;
+		request.arguments[ 0 ].value.SetBool( true );
+		if ( gameLocal.isListenServer && gameLocal.localClientNum >= 0 &&
+			SubmitMatchOperation( request ) ) {
+			return;
+		}
+
+		if ( !gameLocal.isListenServer ) {
+			mpOperationExecutionResult_t execution;
+			if ( ExecuteTrustedLocalMatchOperation( request, execution ) ) {
+				return;
+			}
+			gameLocal.Warning( "dedicated force-ready rejected (reason %d)",
+				execution.reason );
+			return;
+		}
+		gameLocal.Warning( "managed force-ready requires an authorized local "
+			"participant or the dedicated server console during warmup" );
+		return;
+	}
 
 	for( int i = 0 ; i < gameLocal.numClients ; i++ ) {
 		idEntity *ent = gameLocal.entities[ i ];
@@ -8023,6 +16149,122 @@ void idMultiplayerGame::ForceReady_f( const idCmdArgs &args ) {
 	gameLocal.mpGame.ForceReady();
 }
 
+/*
+================
+idMultiplayerGame::SeriesBind_f
+
+Explicit trusted-local recovery binding for Duel.  Slots are accepted only as
+current transport handles; the stored authority is additionally tied to the
+connection lifetime and never written to the recovery record.
+================
+*/
+void idMultiplayerGame::SeriesBind_f( const idCmdArgs &args ) {
+	if ( !gameLocal.isMultiplayer || gameLocal.isClient ) {
+		gameLocal.Printf( "matchSeriesBind: multiplayer server only\n" );
+		return;
+	}
+	if ( args.Argc() != 3 ) {
+		gameLocal.Printf( "usage: matchSeriesBind <a|b> <current-client-slot>\n" );
+		return;
+	}
+	int competitionSide = MP_SERIES_SIDE_NONE;
+	if ( idStr::Icmp( args.Argv( 1 ), "a" ) == 0 ||
+		idStr::Cmp( args.Argv( 1 ), "0" ) == 0 ) {
+		competitionSide = 0;
+	} else if ( idStr::Icmp( args.Argv( 1 ), "b" ) == 0 ||
+		idStr::Cmp( args.Argv( 1 ), "1" ) == 0 ) {
+		competitionSide = 1;
+	}
+	int clientNum = -1;
+	uint32_t generation = 0;
+	mpParticipantId participant;
+	if ( competitionSide == MP_SERIES_SIDE_NONE ||
+		!ParseBoundedVoteInteger( args.Argv( 2 ), MAX_CLIENTS, clientNum ) ||
+		!gameLocal.mpGame.matchSession.GetSlotGeneration( clientNum, generation ) ||
+		!gameLocal.mpGame.matchSession.ResolveSlotBinding( clientNum, generation,
+			participant ) ) {
+		gameLocal.Printf( "matchSeriesBind: binding rejected; use a current active "
+			"human Duel client during warmup\n" );
+		return;
+	}
+	mpMatchOperationRequest_t request;
+	request.Clear();
+	request.opcode = MP_MATCH_OP_SERIES_CONTESTANT_BIND;
+	request.hasParticipantTarget = true;
+	request.participantTarget = participant.SequencePart();
+	request.argumentCount = 1;
+	request.arguments[ 0 ].fieldId = MP_MATCH_ARG_COMPETITION_SIDE;
+	request.arguments[ 0 ].value.SetEnum( competitionSide == 0 ?
+		MP_MATCH_COMPETITION_SIDE_A : MP_MATCH_COMPETITION_SIDE_B );
+	mpOperationExecutionResult_t execution;
+	const bool submitted = gameLocal.isListenServer ?
+		gameLocal.mpGame.SubmitMatchOperation( request ) :
+		gameLocal.mpGame.ExecuteTrustedLocalMatchOperation( request, execution );
+	if ( !submitted ) {
+		gameLocal.Printf( "matchSeriesBind: typed binding rejected%s\n",
+			gameLocal.isListenServer ? "" : va( " (reason %d)", execution.reason ) );
+	}
+}
+
+/*
+================
+idMultiplayerGame::Broadcaster_f
+
+Trusted-local operator adapter for dedicated servers.  It shares the pure
+broadcaster-target predicate and session mutation used by the typed GUI path;
+it never grants general referee, rcon or filesystem authority.
+================
+*/
+void idMultiplayerGame::Broadcaster_f( const idCmdArgs &args ) {
+	if ( !gameLocal.isMultiplayer || gameLocal.isClient ) {
+		gameLocal.Printf( "matchBroadcaster: multiplayer server only\n" );
+		return;
+	}
+	if ( args.Argc() != 3 ) {
+		gameLocal.Printf( "usage: matchBroadcaster <current-client-slot> <on|off>\n" );
+		return;
+	}
+	int clientNum = -1;
+	bool enabled = false;
+	const bool validEnabled = idStr::Icmp( args.Argv( 2 ), "on" ) == 0 ||
+		idStr::Cmp( args.Argv( 2 ), "1" ) == 0;
+	const bool validDisabled = idStr::Icmp( args.Argv( 2 ), "off" ) == 0 ||
+		idStr::Cmp( args.Argv( 2 ), "0" ) == 0;
+	if ( validEnabled ) {
+		enabled = true;
+	}
+	uint32_t generation = 0;
+	mpParticipantId participant;
+	if ( !ParseBoundedVoteInteger( args.Argv( 1 ), MAX_CLIENTS, clientNum ) ||
+		( !validEnabled && !validDisabled ) ||
+		!gameLocal.mpGame.matchSession.GetSlotGeneration( clientNum, generation ) ||
+		!gameLocal.mpGame.matchSession.ResolveSlotBinding( clientNum, generation,
+			participant ) ) {
+		gameLocal.Printf( "matchBroadcaster: target rejected; use a current inactive "
+			"unrostered human spectator\n" );
+		return;
+	}
+	mpMatchOperationRequest_t request;
+	request.Clear();
+	request.opcode = MP_MATCH_OP_BROADCASTER_SET;
+	request.hasParticipantTarget = true;
+	request.participantTarget = participant.SequencePart();
+	request.argumentCount = 1;
+	request.arguments[ 0 ].fieldId = MP_MATCH_ARG_ENABLED;
+	request.arguments[ 0 ].value.SetBool( enabled );
+	mpOperationExecutionResult_t execution;
+	const bool submitted = gameLocal.isListenServer ?
+		gameLocal.mpGame.SubmitMatchOperation( request ) :
+		gameLocal.mpGame.ExecuteTrustedLocalMatchOperation( request, execution );
+	if ( !submitted ) {
+		gameLocal.Printf( "matchBroadcaster: typed role mutation rejected%s\n",
+			gameLocal.isListenServer ? "" : va( " (reason %d)", execution.reason ) );
+		return;
+	}
+	gameLocal.Printf( "matchBroadcaster: client %d broadcaster access %s\n",
+		clientNum, enabled ? "enabled" : "disabled" );
+}
+
 // openQ4 BEGIN
 /*
 ================
@@ -8046,15 +16288,30 @@ void idMultiplayerGame::ServerSetPlayerReady( int clientNum, bool isReady ) {
 		return;
 	}
 
+	// Managed matches accept readiness only through the versioned operation
+	// transport.  This function remains as a compatibility parser for casual
+	// clients using the historical one-byte message; allowing it to mutate a
+	// managed session would create a second authority path around revisions,
+	// capabilities and evidence.
+	if ( matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH ) ) {
+		gameLocal.Warning( "ignored legacy ready message from client %d during a managed match",
+			clientNum );
+		return;
+	}
+
 	ent = gameLocal.entities[ clientNum ];
 	if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
 		return;
 	}
 
 	player = static_cast< idPlayer * >( ent );
+	if ( !playerState[ clientNum ].ingame || player->wantSpectate || player->spectating || player->IsFakeClient() ) {
+		return;
+	}
 
 	// readying only means anything while a match is being set up
-	if ( gameState == NULL || gameState->GetMPGameState() != WARMUP ) {
+	if ( gameState == NULL || ( gameState->GetMPGameState() != WARMUP &&
+		gameState->GetMPGameState() != COUNTDOWN ) ) {
 		return;
 	}
 
@@ -8063,6 +16320,12 @@ void idMultiplayerGame::ServerSetPlayerReady( int clientNum, bool isReady ) {
 	}
 
 	player->SetReady( isReady );
+	SynchronizeMatchParticipant( clientNum );
+	if ( gameState->GetMPGameState() == COUNTDOWN && matchSession.GetPhase() == WARMUP ) {
+		gameState->NewState( WARMUP );
+		gameState->SetNextMPGameState( INACTIVE );
+		gameState->SetNextMPGameStateTime( 0 );
+	}
 
 	if ( !player->wantSpectate ) {
 		AddChatLine( common->GetLocalizedString( "#str_107180" ), gameLocal.userInfo[ clientNum ].GetString( "ui_name" ),
@@ -8079,9 +16342,6 @@ checkbox and the scoreboard icon still reflect the real state.
 ================
 */
 static void MPSendReady( bool isReady ) {
-	idBitMsg	outMsg;
-	byte		msgBuf[ 32 ];
-
 	if ( !gameLocal.isMultiplayer ) {
 		gameLocal.Printf( "ready: only valid in multiplayer\n" );
 		return;
@@ -8093,11 +16353,33 @@ static void MPSendReady( bool isReady ) {
 	}
 
 	cvarSystem->SetCVarString( "ui_ready", isReady ? "Ready" : "Not Ready" );
+	mpMatchOperationRequest_t request;
+	request.Clear();
+	request.opcode = MP_MATCH_OP_READY_SET;
+	request.argumentCount = 1;
+	request.arguments[ 0 ].fieldId = MP_MATCH_ARG_ENABLED;
+	request.arguments[ 0 ].value.SetBool( isReady );
+	if ( gameLocal.mpGame.SubmitMatchOperation( request ) ) {
+		return;
+	}
+
+	// A current managed server always publishes a recipient view.  If it has
+	// not arrived yet, fail closed instead of silently falling back to the old
+	// unversioned mutation route.  Casual compatibility remains available for
+	// mixed-version/LAN play.
+	if ( gameLocal.serverInfo.GetBool( "si_managedMatch", "0" ) ||
+		idStr::Icmp( gameLocal.serverInfo.GetString( "g_matchProfile", "casual" ),
+			"casual" ) != 0 ) {
+		gameLocal.Printf( "ready: waiting for authoritative match state\n" );
+		return;
+	}
 
 	if ( gameLocal.isClient ) {
+		idBitMsg outMsg;
+		byte msgBuf[ 32 ];
 		outMsg.Init( msgBuf, sizeof( msgBuf ) );
 		outMsg.WriteByte( GAME_RELIABLE_MESSAGE_READY );
-		outMsg.WriteBits( isReady ? 1 : 0, 1 );
+		outMsg.WriteByte( isReady ? 1 : 0 );
 		networkSystem->ClientSendReliableMessage( outMsg );
 	} else {
 		gameLocal.mpGame.ServerSetPlayerReady( gameLocal.localClientNum, isReady );
@@ -8241,6 +16523,7 @@ still only does one vote though, can easily be extended to do more
 void idMultiplayerGame::CallVote_f( const idCmdArgs &args ) { 
 	const char *szArg1 = args.Argv(1);
 	const char *szArg2 = args.Argv(2);
+	int parsedValue = 0;
 	if ( '\0' == *szArg1 ) {
 		common->Printf( "%s", common->GetLocalizedString( "#str_104404" ) );
 		common->Printf( "%s", common->GetLocalizedString( "#str_104405" ) );
@@ -8253,27 +16536,32 @@ void idMultiplayerGame::CallVote_f( const idCmdArgs &args ) {
 	if ( 0 == idStr::Icmp( szArg1, "restart" ) ) {
 		voteData.m_fieldFlags |= VOTEFLAG_RESTART;
 	} else if ( 0 == idStr::Icmp( szArg1, "timelimit" ) ) {
-		if ( '\0' == *szArg2 ) {
+		if ( !ParseVoteIntegerRange( szArg2, ( int )si_timeLimit.GetMinValue(), Min( ( int )si_timeLimit.GetMaxValue(), 255 ), parsedValue ) ) {
 			common->Printf( "%s", common->GetLocalizedString( "#str_104406" ) );
 			return;
 		}
 		voteData.m_fieldFlags |= VOTEFLAG_TIMELIMIT;
-		voteData.m_timeLimit = atoi( szArg2 );
+		voteData.m_timeLimit = parsedValue;
 	} else if ( 0 == idStr::Icmp( szArg1, "fraglimit" ) ) {
-		if ( '\0' == *szArg2 ) {
+		if ( !ParseVoteIntegerRange( szArg2, ( int )si_fragLimit.GetMinValue(), Min( ( int )si_fragLimit.GetMaxValue(), 32767 ), parsedValue ) ) {
 			common->Printf( "%s", common->GetLocalizedString( "#str_104407" ) );
 			return;
 		}
 		voteData.m_fieldFlags |= VOTEFLAG_FRAGLIMIT;
-		voteData.m_fragLimit = atoi( szArg2 );
+		voteData.m_fragLimit = parsedValue;
 	} else if ( 0 == idStr::Icmp( szArg1, "gametype" ) ) {
 		if ( '\0' == *szArg2 ) {
 			common->Printf( "%s", common->GetLocalizedString( "#str_104408" ) );
 			common->Printf( "%s", common->GetLocalizedString( "#str_104409" ) );
 			return;
 		}
+		const mpGameTypeInfo_t *gameTypeInfo = MPGameTypeByName( szArg2 );
+		if ( gameTypeInfo == NULL || !MPGameTypeIsSelectable( gameTypeInfo->type ) ) {
+			common->Printf( "%s", common->GetLocalizedString( "#str_104409" ) );
+			return;
+		}
 		voteData.m_fieldFlags |= VOTEFLAG_GAMETYPE;
-		voteData.m_gameType = gameLocal.mpGame.GameTypeToVote( szArg2 );
+		voteData.m_gameType = MPGameTypeToVoteGameType( gameTypeInfo->type );
 	}
 	else if ( 0 == idStr::Icmp( szArg1, "kick" ) ) {
 		if ( '\0' == *szArg2 ) {
@@ -8292,31 +16580,33 @@ void idMultiplayerGame::CallVote_f( const idCmdArgs &args ) {
 		voteData.m_fieldFlags |= VOTEFLAG_MAP;
 		voteData.m_map = szArg2;
 	} else if ( 0 == idStr::Icmp( szArg1, "buying" ) ) {
-		if ( '\0' == *szArg2 ) {
+		if ( !ParseVoteIntegerRange( szArg2, 0, 1, parsedValue ) ) {
 			common->Printf( "%s", common->GetLocalizedString( "#str_122012" ) );
 			return;
 		}
 		voteData.m_fieldFlags |= VOTEFLAG_BUYING;
-		voteData.m_buying = atoi( szArg2 );
+		voteData.m_buying = parsedValue;
 	} else if ( 0 == idStr::Icmp( szArg1, "capturelimit" ) ) {
-		if ( '\0' == *szArg2 ) {
+		if ( !ParseVoteIntegerRange( szArg2, ( int )si_captureLimit.GetMinValue(), Min( ( int )si_captureLimit.GetMaxValue(), 32767 ), parsedValue ) ) {
 			common->Printf( "%s", common->GetLocalizedString( "#str_104415" ) );
 			return;
 		}
 		voteData.m_fieldFlags |= VOTEFLAG_CAPTURELIMIT;
-		voteData.m_captureLimit = atoi( szArg2 );
+		voteData.m_captureLimit = parsedValue;
 	} else if ( 0 == idStr::Icmp( szArg1, "autobalance" ) ) {
-		if ( '\0' == *szArg2 ) {
+		if ( !ParseVoteIntegerRange( szArg2, 0, 1, parsedValue ) ) {
 			common->Printf( "%s", common->GetLocalizedString( "#str_104416" ) );
+			return;
 		}
 		voteData.m_fieldFlags |= VOTEFLAG_TEAMBALANCE;
-		voteData.m_teamBalance = atoi( szArg2 );
+		voteData.m_teamBalance = parsedValue;
 	} else if ( 0 == idStr::Icmp( szArg1, "controlTime" ) ) {
-		if ( '\0' == *szArg2 ) {
+		if ( !ParseVoteIntegerRange( szArg2, ( int )si_controlTime.GetMinValue(), Min( ( int )si_controlTime.GetMaxValue(), 32767 ), parsedValue ) ) {
 			common->Printf( "%s", common->GetLocalizedString( "#str_122002" ) ); // Squirrel@Ritual - Localized for 1.2 Patch
+			return;
 		}
 		voteData.m_fieldFlags |= VOTEFLAG_CONTROLTIME;
-		voteData.m_controlTime = atoi(szArg2 );
+		voteData.m_controlTime = parsedValue;
 	} else {
 		common->Printf( "%s", common->GetLocalizedString( "#str_104404" ) );
 		common->Printf( "%s", common->GetLocalizedString( "#str_104405" ) );
@@ -8373,18 +16663,22 @@ void idMultiplayerGame::ForceTeamChange_f( const idCmdArgs &args)	{
 		return;
 	}
 
-	idStr clientId;
-	int clientNum;
-
-	clientId = args.Argv( 1 );
-	if ( !clientId.IsNumeric() ) {
-		common->Printf( "usage: ForceTeamChange <client number>\n" );
+	if ( gameLocal.mpGame.IsManagedMatch() ) {
+		gameLocal.Warning( "ForceTeamChange is disabled during a managed match; use the typed Match Control team workflow" );
 		return;
 	}
 
-	clientNum = atoi( clientId );
+	int clientNum = -1;
+	const int clientLimit = Min( gameLocal.numClients, MAX_CLIENTS );
+	if ( args.Argc() != 2 ||
+		!ParseBoundedVoteInteger( args.Argv( 1 ), clientLimit, clientNum ) ) {
+		common->Printf( "usage: ForceTeamChange <client number>\n" );
+		return;
+	}
 	
-	if ( gameLocal.entities[ clientNum ] && gameLocal.entities[ clientNum ]->IsType( idPlayer::GetClassType() ) )
+	if ( clientNum >= 0 && clientNum < clientLimit &&
+		gameLocal.entities[ clientNum ] != NULL &&
+		gameLocal.entities[ clientNum ]->IsType( idPlayer::GetClassType() ) )
 	{
 		idPlayer *player = static_cast< idPlayer *>( gameLocal.entities[ clientNum ] );
 		player->GetUserInfo()->Set( "ui_team", player->team ? "Marine" : "Strogg" );
@@ -8466,13 +16760,12 @@ void idMultiplayerGame::ServerStartVote( int clientNum, vote_flags_t voteIndex, 
 	vote = voteIndex;
 	voteValue = value;
 	voteTimeOut = gameLocal.time + 20000;
+	voteEligibleCount = 0;
 	// mark players allowed to vote - only current ingame players, players joining during vote will be ignored
 	for ( i = 0; i < gameLocal.numClients; i++ ) {
-// RAVEN BEGIN
-// jnewquist: Use accessor for static class type 
-		if ( gameLocal.entities[ i ] && gameLocal.entities[ i ]->IsType( idPlayer::GetClassType() ) ) {
-// RAVEN END
+		if ( IsEligibleVotePlayerSlot( i ) ) {
 			playerState[ i ].vote = ( i == clientNum ) ? PLAYER_VOTE_YES : PLAYER_VOTE_WAIT;
+			voteEligibleCount++;
 		} else {
 			playerState[i].vote = PLAYER_VOTE_NONE;
 		}
@@ -8487,6 +16780,10 @@ idMultiplayerGame::ClientStartVote
 void idMultiplayerGame::ClientStartVote( int clientNum, const char *_voteString ) {
 	idBitMsg	outMsg;
 	byte		msgBuf[ MAX_GAME_MESSAGE_SIZE ];
+	if ( !IsValidVotePlayerSlot( clientNum ) ) {
+		common->Warning( "Ignoring vote notification from invalid client slot %d", clientNum );
+		return;
+	}
 
 	if ( !gameLocal.isClient ) {
 		outMsg.Init( msgBuf, sizeof( msgBuf ) );
@@ -8554,8 +16851,9 @@ void idMultiplayerGame::ClientUpdateVote( vote_result_t status, int yesCount, in
 			outMsg.WriteShort( idMath::ClampShort( voteData.m_fragLimit ) );
 			outMsg.WriteShort( idMath::ClampShort( voteData.m_tourneyLimit ) );
 			outMsg.WriteShort( idMath::ClampShort( voteData.m_captureLimit ) );
-			outMsg.WriteShort( idMath::ClampShort( voteData.m_buying ) );
+			outMsg.WriteByte( voteData.m_buying ? 1 : 0 );
 			outMsg.WriteByte( idMath::ClampChar( voteData.m_teamBalance ) );
+			outMsg.WriteShort( idMath::ClampShort( voteData.m_controlTime ) );
 		}
 		networkSystem->ServerSendReliableMessage( -1, outMsg );
 	} else {
@@ -8622,11 +16920,11 @@ void idMultiplayerGame::ClientUpdateVote( vote_result_t status, int yesCount, in
 
 // RAVEN BEGIN
 // shouchard:  remove vote notification
-	if ( VOTE_FAILED == status || VOTE_PASSED == status || VOTE_RESET == status ) {
+	const bool terminalPresentation = VOTE_FAILED == status ||
+		VOTE_PASSED == status || VOTE_RESET == status || VOTE_ABORTED == status;
+	if ( terminalPresentation ) {
 		ClearVote();
-	}
-
-	if ( mainGui ) {
+	} else if ( mainGui ) {
 		mainGui->SetStateString( "voteCount", va( common->GetLocalizedString( "#str_104435" ), (int)yesVotes, (int)noVotes ) );
 	}
 // RAVEN END
@@ -8658,6 +16956,16 @@ void idMultiplayerGame::CastVote( int clientNum, bool castVote ) {
 	idBitMsg	outMsg;
 	byte		msgBuf[ 128 ];
 
+	if ( !gameLocal.isClient &&
+		matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH ) ) {
+		if ( IsValidVotePlayerSlot( clientNum ) ) {
+			gameLocal.ServerSendChatMessage( clientNum, "server", "#str_41773" );
+		}
+		common->DPrintf( "client %d: legacy ballot rejected during a managed match\n",
+			clientNum );
+		return;
+	}
+
 	if ( clientNum == gameLocal.localClientNum ) {
 		voted = true;
 	}
@@ -8667,6 +16975,11 @@ void idMultiplayerGame::CastVote( int clientNum, bool castVote ) {
 		outMsg.WriteByte( GAME_RELIABLE_MESSAGE_CASTVOTE );
 		outMsg.WriteByte( castVote );
 		networkSystem->ClientSendReliableMessage( outMsg );
+		return;
+	}
+
+	if ( !IsValidVotePlayerSlot( clientNum ) || !playerState[ clientNum ].ingame ) {
+		common->Warning( "Ignoring cast vote from invalid client slot %d", clientNum );
 		return;
 	}
 
@@ -8704,20 +17017,48 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 // RAVEN BEGIN
 // shouchard:  added capture limit and autobalance
 	int				vote_captureLimit;
-	bool			vote_autobalance;
+	int				vote_autobalance;
 // RAVEN END
 	int			vote_controlTime;
 	char			value[ MAX_STRING_CHARS ];
 
 	assert( clientNum != -1 );
 	assert( !gameLocal.isClient );
+	if ( !IsEligibleVotePlayerSlot( clientNum ) ) {
+		common->Warning( "Ignoring vote from invalid client slot %d", clientNum );
+		return;
+	}
+	if ( matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH ) ) {
+		gameLocal.ServerSendChatMessage( clientNum, "server", "#str_41773" );
+		common->DPrintf( "client %d: legacy vote rejected during a managed match\n",
+			clientNum );
+		return;
+	}
 
 	if( !gameLocal.serverInfo.GetBool( "si_allowVoting" ) ) {
 		return;
 	}
 
 	voteIndex = (vote_flags_t)msg.ReadByte( );
+	if ( !HasBoundedMessageString( msg, sizeof( value ) ) ) {
+		common->Warning( "Ignoring legacy vote from client %d with a missing or oversized value", clientNum );
+		return;
+	}
 	msg.ReadString( value, sizeof( value ) );
+	if ( msg.GetRemainingReadBits() != 0 ) {
+		common->Warning( "Ignoring legacy vote from client %d with %d trailing bits", clientNum, msg.GetRemainingReadBits() );
+		return;
+	}
+
+	const int legacyFieldFlag = LegacyVoteFieldFlag( voteIndex );
+	if ( legacyFieldFlag == 0 ) {
+		common->DPrintf( "client %d: unsupported legacy vote index %d\n", clientNum, ( int )voteIndex );
+		return;
+	}
+	if ( gameLocal.serverInfo.GetInt( "si_voteFlags" ) & legacyFieldFlag ) {
+		common->DPrintf( "client %d: legacy vote index %d is disabled by si_voteFlags\n", clientNum, ( int )voteIndex );
+		return;
+	}
 
 	// sanity checks - setup the vote
 	if ( vote != VOTE_NONE ) {
@@ -8737,7 +17078,11 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 			break;
 		}
 		case VOTE_TIMELIMIT: {
-			vote_timeLimit = strtol( value, NULL, 10 );
+			if ( !ParseVoteIntegerRange( value, ( int )si_timeLimit.GetMinValue(), ( int )si_timeLimit.GetMaxValue(), vote_timeLimit ) ) {
+				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104269" );
+				common->DPrintf( "client %d: invalid timelimit vote value: '%s'\n", clientNum, value );
+				return;
+			}
 			if ( vote_timeLimit == gameLocal.serverInfo.GetInt( "si_timeLimit" ) ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104270" );
 				common->DPrintf( "client %d: already at the voted Time Limit\n", clientNum );
@@ -8753,7 +17098,11 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 			break;
 		}
 		case VOTE_FRAGLIMIT: {
-			vote_fragLimit = strtol( value, NULL, 10 );
+			if ( !ParseVoteIntegerRange( value, ( int )si_fragLimit.GetMinValue(), ( int )si_fragLimit.GetMaxValue(), vote_fragLimit ) ) {
+				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104266" );
+				common->DPrintf( "client %d: invalid fraglimit vote value: '%s'\n", clientNum, value );
+				return;
+			}
 			if ( vote_fragLimit == gameLocal.serverInfo.GetInt( "si_fragLimit" ) ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104267" );
 				common->DPrintf( "client %d: already at the voted Frag Limit\n", clientNum );
@@ -8771,8 +17120,10 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 		case VOTE_GAMETYPE: {
 // RAVEN BEGIN
 // shouchard:  removed magic numbers & added CTF type
-			vote_gameTypeIndex = strtol( value, NULL, 10 );
-			assert( vote_gameTypeIndex >= 0 && vote_gameTypeIndex < VOTE_GAMETYPE_COUNT );
+			if ( !ParseBoundedVoteInteger( value, MPVoteGameTypeCount(), vote_gameTypeIndex ) ) {
+				common->DPrintf( "client %d: invalid game type index for vote: '%s'\n", clientNum, value );
+				return;
+			}
 			idStr::Copynz( value, VoteGameTypeToString( vote_gameTypeIndex ), sizeof( value ) );
 			if ( !idStr::Icmp( value, gameLocal.serverInfo.GetString( "si_gameType" ) ) ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104259" );
@@ -8784,7 +17135,10 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 			break;
 		}
 		case VOTE_KICK: {
-			vote_clientNum = strtol( value, NULL, 10 );
+			if ( !ParseVotePlayerSlot( value, vote_clientNum ) ) {
+				common->DPrintf( "client %d: called kick for invalid player slot '%s'\n", clientNum, value );
+				return;
+			}
 			if ( vote_clientNum == gameLocal.localClientNum ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104257" );
 				common->DPrintf( "client %d: called kick for the server host\n", clientNum );
@@ -8837,7 +17191,11 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 			break;
 		}
 		case VOTE_BUYING: {
-			vote_buying = strtol( value, NULL, 10 );
+			if ( !ParseVoteIntegerRange( value, 0, 1, vote_buying ) ) {
+				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_122012" );
+				common->DPrintf( "client %d: invalid buying vote value: '%s'\n", clientNum, value );
+				return;
+			}
 			if ( vote_buying == gameLocal.serverInfo.GetInt( "si_isBuyingEnabled" ) ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_122013" );
 				common->DPrintf( "client %d: already at the voted buying mode\n", clientNum );
@@ -8850,13 +17208,17 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 // RAVEN BEGIN
 // shouchard:  added capture limit, round limit, and autobalance
 		case VOTE_CAPTURELIMIT: {
-			vote_captureLimit = strtol( value, NULL, 10 );
+			if ( !ParseVoteIntegerRange( value, ( int )si_captureLimit.GetMinValue(), ( int )si_captureLimit.GetMaxValue(), vote_captureLimit ) ) {
+				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104402" );
+				common->DPrintf( "client %d: invalid capture-limit vote value: '%s'\n", clientNum, value );
+				return;
+			}
 			if ( vote_captureLimit == gameLocal.serverInfo.GetInt( "si_captureLimit" ) ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104401" );
 				common->DPrintf( "client %d: already at the voted Capture Limit\n", clientNum );
 				return;					
 			}
-			if ( vote_captureLimit < si_captureLimit.GetMinValue() || vote_captureLimit > si_fragLimit.GetMaxValue() ) {
+			if ( vote_captureLimit < si_captureLimit.GetMinValue() || vote_captureLimit > si_captureLimit.GetMaxValue() ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104402" );
 				common->DPrintf( "client %d: fraglimit value out of range for vote: %s\n", clientNum, value );
 				return;
@@ -8872,8 +17234,12 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 			break;
 		}
 		case VOTE_AUTOBALANCE: {
-			vote_autobalance = (0 != strtol( value, NULL, 10 ) );
-			if ( vote_autobalance == gameLocal.serverInfo.GetBool( "si_autobalance" ) ) {
+			if ( !ParseVoteIntegerRange( value, 0, 1, vote_autobalance ) ) {
+				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104416" );
+				common->DPrintf( "client %d: invalid team-balance vote value: '%s'\n", clientNum, value );
+				return;
+			}
+			if ( vote_autobalance == gameLocal.serverInfo.GetInt( "si_autobalance" ) ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_104403" );
 				common->DPrintf( "client %d: already at the voted balance teams\n", clientNum );
 				return;					
@@ -8885,7 +17251,11 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 		}
 // RAVEN END
 		case VOTE_CONTROLTIME: {
-			vote_controlTime = strtol( value, NULL, 10 );
+			if ( !ParseVoteIntegerRange( value, ( int )si_controlTime.GetMinValue(), ( int )si_controlTime.GetMaxValue(), vote_controlTime ) ) {
+				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_122018" );
+				common->DPrintf( "client %d: invalid control-time vote value: '%s'\n", clientNum, value );
+				return;
+			}
 			if ( vote_controlTime == gameLocal.serverInfo.GetInt( "si_controlTime" ) ) {
 				gameLocal.ServerSendChatMessage( clientNum, "server", "#str_122017" );
 				common->DPrintf( "client %d: already at the voted Control Time\n", clientNum );
@@ -8915,6 +17285,58 @@ idMultiplayerGame::DisconnectClient
 ================
 */
 void idMultiplayerGame::DisconnectClient( int clientNum ) {
+	uint32_t matchSlotGeneration = 0;
+	mpParticipantId disconnectedParticipant = mpParticipantId::Invalid();
+	int disconnectedGameSide = MP_MATCH_SIDE_NONE;
+	int disconnectedCompetitionSide = MP_SERIES_SIDE_NONE;
+	if ( gameLocal.isServer && matchSessionOperational &&
+		clientNum >= 0 && clientNum < MAX_CLIENTS &&
+		matchSession.GetSlotGeneration( clientNum, matchSlotGeneration ) ) {
+		matchSession.ResolveSlotBinding( clientNum, matchSlotGeneration,
+			disconnectedParticipant );
+		const mpMatchParticipantState *disconnectedState =
+			matchSession.FindParticipant( disconnectedParticipant );
+		if ( disconnectedState != NULL ) {
+			disconnectedGameSide = disconnectedState->side;
+		}
+		disconnectedCompetitionSide = ResolveCompetitionSide(
+			disconnectedParticipant );
+		RecordMatchEvidenceParticipantStats( clientNum, disconnectedParticipant );
+		matchRefereeAuthentication.InvalidateSlot( clientNum );
+		if ( disconnectedParticipant.IsValid() &&
+			matchTeams.GetSessionId() == matchSession.GetSessionId() ) {
+			const mpMatchTeamsMutationResult_t removed =
+				matchTeams.RemoveParticipant( matchSession.GetSessionId(),
+					disconnectedParticipant,
+					mpMatchEngineTime::FromMilliseconds( Max( 0, gameLocal.time ) ),
+					matchTeams.GetRevision() );
+			if ( removed.WasRejected() ) {
+				gameLocal.Warning( "competitive team cleanup rejected for client %d "
+					"(reason %d)", clientNum, removed.reason );
+			}
+		}
+		matchSession.UnbindParticipant( clientNum, matchSlotGeneration,
+			matchSession.GetSessionRevision() );
+		ObserveMatchEvidence( disconnectedParticipant );
+		if ( gameState != NULL && gameState->GetMPGameState() == COUNTDOWN &&
+			matchSession.GetPhase() == WARMUP ) {
+			gameState->NewState( WARMUP );
+			gameState->SetNextMPGameState( INACTIVE );
+			gameState->SetNextMPGameStateTime( 0 );
+		}
+	}
+	if ( clientNum == gameLocal.localClientNum ) {
+		ClearClientMatchControlConnectionState( true );
+		clientMatchView.Clear();
+		clientMatchViewValid = false;
+		clientMatchControlModel.Clear();
+	}
+	if ( clientNum >= 0 && clientNum < MAX_CLIENTS ) {
+		ClearMatchOperationTransportSlot( clientNum );
+		// Series contestant bindings are connection-scoped.  Retain the recorded
+		// id on the series side so a later occupant of this slot cannot inherit it.
+		matchConnectionId[ clientNum ] = 0;
+	}
 	// gameLocal.entities[ clientNum ] could be null if server is shutting down
 	if( gameLocal.entities[ clientNum ] ) {
 		// only kill non-spectators
@@ -8927,9 +17349,12 @@ void idMultiplayerGame::DisconnectClient( int clientNum ) {
 	delete gameLocal.entities[ clientNum ];
 
 	UpdatePlayerRanks();
-	CheckAbortGame();
+	CheckAbortGame( disconnectedParticipant, disconnectedGameSide,
+		disconnectedCompetitionSide );
 
-	privatePlayers &= ~( 1 << clientNum );
+	if ( clientNum >= 0 && clientNum < 32 ) {
+		privatePlayers &= ~( 1u << clientNum );
+	}
 
 	// update serverinfo
 	UpdatePrivatePlayerCount();
@@ -8941,39 +17366,90 @@ idMultiplayerGame::CheckAbortGame
 ================
 */
 void idMultiplayerGame::CheckAbortGame( void ) {
-	// only checks for aborts -> game review below
-	if ( gameState->GetMPGameState() != COUNTDOWN && gameState->GetMPGameState() != GAMEON && gameState->GetMPGameState() != SUDDENDEATH ) {
+	CheckAbortGame( mpParticipantId::Invalid(), MP_MATCH_SIDE_NONE,
+		MP_SERIES_SIDE_NONE );
+}
+
+void idMultiplayerGame::CheckAbortGame( mpParticipantId departedParticipant,
+		int departedGameSide, int departedCompetitionSide ) {
+	if ( gameState == NULL ) {
+		return;
+	}
+	const mpGameState_t phase = gameState->GetMPGameState();
+	if ( phase != COUNTDOWN && phase != GAMEON && phase != SUDDENDEATH ) {
 		return;
 	}
 
-	// in tourney, if we don't have enough clients to play we need to cycle back to
-	// warmup to re-seed
-	if( gameLocal.gameType == GAME_TOURNEY ) {
-		if ( !EnoughClientsToPlay() ) {
-			gameState->NewState( WARMUP );
+	const bool enoughClients = EnoughClientsToPlay();
+	int forfeitingSide = MP_MATCH_SIDE_NONE;
+	int forfeitWinner = -1;
+	if ( !enoughClients && ( phase == GAMEON || phase == SUDDENDEATH ) ) {
+		forfeitWinner = ForfeitTeam();
+		if ( forfeitWinner == TEAM_MARINE ) {
+			forfeitingSide = TEAM_STROGG;
+		} else if ( forfeitWinner == TEAM_STROGG ) {
+			forfeitingSide = TEAM_MARINE;
 		}
+		if ( departedParticipant.IsValid() && gameLocal.IsTeamGame() &&
+			departedGameSide >= 0 && departedGameSide < MP_MATCH_SIDE_COUNT &&
+			forfeitingSide >= 0 && forfeitingSide < MP_MATCH_SIDE_COUNT &&
+			departedGameSide != forfeitingSide ) {
+			gameLocal.Warning( "empty-team forfeit did not align with the departing participant side" );
+			forfeitingSide = MP_MATCH_SIDE_NONE;
+			forfeitWinner = -1;
+		}
+
+		// Duel has no gameplay team.  A connection-scoped active-series binding
+		// is the only safe automatic loser identity; never infer it from a reused
+		// slot, a name or the current score.  If the opposing contestant is not
+		// still live, the map is aborted instead of awarding a phantom point.
+		if ( forfeitingSide == MP_MATCH_SIDE_NONE && !gameLocal.IsTeamGame() &&
+			matchSeries.GetState() == MP_SERIES_MAP_ACTIVE &&
+			departedParticipant.IsValid() &&
+			departedCompetitionSide >= 0 &&
+			departedCompetitionSide < MP_SERIES_SIDE_COUNT ) {
+			const int opponentSide = 1 - departedCompetitionSide;
+			const int opponentSlot = matchSeriesContestantSlot[ opponentSide ];
+			if ( opponentSlot >= 0 && opponentSlot < gameLocal.numClients &&
+				opponentSlot < MAX_CLIENTS &&
+				matchSeriesContestantConnection[ opponentSide ] != 0 &&
+				matchSeriesContestantConnection[ opponentSide ] ==
+					matchConnectionId[ opponentSlot ] &&
+				gameLocal.entities[ opponentSlot ] != NULL &&
+				gameLocal.entities[ opponentSlot ]->IsType( idPlayer::GetClassType() ) &&
+				CanPlay( static_cast<idPlayer *>( gameLocal.entities[ opponentSlot ] ) ) ) {
+				forfeitingSide = departedCompetitionSide;
+			}
+		}
+	}
+
+	const mpMatchTerminationDecision decision =
+		MPEvaluatePopulationTermination( phase, enoughClients, forfeitingSide );
+	if ( !decision.ShouldTransition() ) {
 		return;
 	}
 
-	// openQ4: forfeit, carried over from Quake Live.  Checked before the
-	// original abort rule, which required the time limit to have expired as
-	// well - so an untimed server that emptied out never ended at all.
-	if ( gameState->GetMPGameState() == GAMEON || gameState->GetMPGameState() == SUDDENDEATH ) {
-		int forfeitTeam = ForfeitTeam();
-
-		if ( forfeitTeam >= 0 ) {
-			CenterPrint( -1, "#str_41316", CPARM_TEAM, forfeitTeam );
-			AddChatLine( "%s", common->GetLocalizedString( "#str_41315" ) );
-			gameState->NewState( GAMEREVIEW );
-			return;
-		}
+	// The disconnected contestant identifies the losing side, not an authority
+	// principal.  Automatic population policy is therefore journaled as a system
+	// transition; typed referee/captain forfeits retain their real authorizer.
+	if ( !CommitMatchPhaseTransition( decision.targetPhase, decision.reason,
+			mpParticipantId::Invalid(), decision.forfeitingSide ) ) {
+		gameLocal.Warning( "population-loss match transition was rejected (%d -> %d, reason %d)",
+			phase, decision.targetPhase, decision.reason );
+		return;
 	}
-
-	if ( !EnoughClientsToPlay() ) {
-		// openQ4: an untimed match used to hang here forever
-		if ( TimeLimitHit() || GetMatchLengthMsec() <= 0 ) {
-			gameState->NewState( GAMEREVIEW );
+	if ( !gameState->NewState( decision.targetPhase ) ) {
+		gameLocal.Warning( "population-loss match transition could not be mirrored to gameplay" );
+		return;
+	}
+	if ( decision.targetPhase == WARMUP ) {
+		gameState->SetNextMPGameState( INACTIVE );
+		gameState->SetNextMPGameStateTime( 0 );
+	} else if ( decision.kind == MP_MATCH_TERMINATION_FORFEIT ) {
+		if ( gameLocal.IsTeamGame() && forfeitWinner >= 0 ) {
+			CenterPrint( -1, "#str_41316", CPARM_TEAM, forfeitWinner );
 		}
+		AddChatLine( "%s", common->GetLocalizedString( "#str_41315" ) );
 	}
 }
 
@@ -9002,24 +17478,28 @@ void idMultiplayerGame::ClearVote( int clientNum ) {
 	int end = MAX_CLIENTS;
 	
 	if( clientNum != -1 ) {
+		if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+			return;
+		}
 		start = clientNum;
 		end = clientNum + 1;
 	}
 	
 	for ( int i = start; i < end; i++ ) {
-		idPlayer *player = static_cast<idPlayer *>( gameLocal.entities[ i ] );
-		if ( !player || !player->mphud ) {
+		idEntity *entity = gameLocal.entities[ i ];
+		if ( entity == NULL || !entity->IsType( idPlayer::GetClassType() ) ) {
 			continue;
 		}
-	
+		idPlayer *player = static_cast<idPlayer *>( entity );
+		if ( player->mphud == NULL ) {
+			continue;
+		}
+
 		player->mphud->SetStateInt( "voteNotice", 0 );
-		player->mphud->SetStateString( "voteInfo_1", "" );
-		player->mphud->SetStateString( "voteInfo_2", "" );
-		player->mphud->SetStateString( "voteInfo_3", "" );
-		player->mphud->SetStateString( "voteInfo_4", "" );
-		player->mphud->SetStateString( "voteInfo_5", "" );
-		player->mphud->SetStateString( "voteInfo_6", "" );
-		player->mphud->SetStateString( "voteInfo_7", "" );		
+		player->mphud->SetStateString( "voteNoticeText", "" );
+		for ( int line = 1; line <= 7; ++line ) {
+			player->mphud->SetStateString( va( "voteInfo_%d", line ), "" );
+		}
 		player->mphud->StateChanged( gameLocal.time );
 	}
 	// clear the local demo player's vote too
@@ -9030,17 +17510,27 @@ void idMultiplayerGame::ClearVote( int clientNum ) {
 		}
 	
 		player->mphud->SetStateInt( "voteNotice", 0 );
-		player->mphud->SetStateString( "voteInfo_1", "" );
-		player->mphud->SetStateString( "voteInfo_2", "" );
-		player->mphud->SetStateString( "voteInfo_3", "" );
-		player->mphud->SetStateString( "voteInfo_4", "" );
-		player->mphud->SetStateString( "voteInfo_5", "" );
-		player->mphud->SetStateString( "voteInfo_6", "" );
-		player->mphud->SetStateString( "voteInfo_7", "" );		
+		player->mphud->SetStateString( "voteNoticeText", "" );
+		for ( int line = 1; line <= 7; ++line ) {
+			player->mphud->SetStateString( va( "voteInfo_%d", line ), "" );
+		}
 		player->mphud->StateChanged( gameLocal.time );
 	} while(0);
-	if ( mainGui ) {
+
+	const bool clearLocalPresentation = clientNum == -1 ||
+		clientNum == gameLocal.localClientNum;
+	if ( clearLocalPresentation ) {
+		voted = false;
+		voteString.Clear();
+	}
+	if ( clearLocalPresentation && mainGui ) {
 		mainGui->SetStateInt( "vote_going", 0 );
+		mainGui->SetStateInt( "playerVoted", 0 );
+		mainGui->SetStateString( "voteCount", "" );
+		mainGui->SetStateInt( "voteData_sel_0", -1 );
+		for ( int item = 0; item <= NUM_VOTES; ++item ) {
+			mainGui->DeleteStateVar( va( "voteData_item_%d", item ) );
+		}
 		mainGui->StateChanged( gameLocal.time );
 	}
 }
@@ -9057,7 +17547,19 @@ void idMultiplayerGame::MapRestart( void ) {
 	ClearAnnouncerSounds();
 
 	assert( !gameLocal.isClient );
-	if ( gameLocal.GameState() != GAMESTATE_SHUTDOWN && gameState->GetMPGameState() != WARMUP ) {
+	InitializeCompetitiveRules();
+	if ( !BeginMatchSession() ) {
+		gameLocal.Warning( "could not reset the authoritative competitive match session" );
+		return;
+	}
+	if ( gameLocal.GameState() != GAMESTATE_SHUTDOWN && gameState->GetMPGameState() == WARMUP ) {
+		// The legacy adapter is already warm, but this restart minted a new
+		// session. Establish the matching authoritative phase without replaying
+		// warmup's gameplay side effects.
+		if ( !CommitMatchPhaseTransition( WARMUP ) ) {
+			gameLocal.Warning( "could not enter warmup for the restarted match session" );
+		}
+	} else if ( gameLocal.GameState() != GAMESTATE_SHUTDOWN ) {
 		gameState->NewState( WARMUP );
 		// force an immediate state detection/update, otherwise if we update our state this
 		// same frame we'll miss transitions
@@ -9174,8 +17676,9 @@ void idMultiplayerGame::JoinTeam( const char* team ) {
 		for( int i = 0; i < gameLocal.numClients; i++ ) {
 			ent = gameLocal.entities[ i ];
 			if ( ent && ent->IsType( idPlayer::GetClassType() ) ) {
-				if ( !static_cast< idPlayer * >( ent )->spectating ) {
-					teamCount[ ((idPlayer*)ent)->team ]++;
+				idPlayer *candidate = static_cast< idPlayer * >( ent );
+				if ( !candidate->spectating && candidate->team >= 0 && candidate->team < TEAM_MAX ) {
+					teamCount[ candidate->team ]++;
 				}
 			}
 		}
@@ -9229,10 +17732,21 @@ void idMultiplayerGame::ProcessChatMessage( int clientNum, bool team, const char
 	idPlayer	*p;
 	idStr		suffixed_name;
 	idStr		prefixed_text;
+	const bool managedTeamCommunicationRequested = team && gameLocal.isServer &&
+		matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH );
+	bool		managedTeamCommunication = false;
+	int		managedCommunicationSide = MP_MATCH_SIDE_NONE;
+	mpMatchTeamCommunicationBinding_t managedSender;
 
 	assert( !gameLocal.isClient );
+	if ( managedTeamCommunicationRequested && clientNum < 0 ) {
+		return;
+	}
 
 	if ( clientNum >= 0 ) {
+		if ( clientNum >= gameLocal.numClients || clientNum >= MAX_CLIENTS ) {
+			return;
+		}
 		p = static_cast< idPlayer * >( gameLocal.entities[ clientNum ] );
 // RAVEN BEGIN
 // jnewquist: Use accessor for static class type 
@@ -9241,7 +17755,26 @@ void idMultiplayerGame::ProcessChatMessage( int clientNum, bool team, const char
 			return;
 		}
 
-		if ( p->spectating && ( p->wantSpectate || gameLocal.gameType == GAME_TOURNEY ) ) {
+		if ( managedTeamCommunicationRequested ) {
+			if ( !IsManagedTeamCommunicationActive() ||
+				!BuildManagedTeamCommunicationBinding( clientNum, managedSender ) ||
+				!MPMatchMayReceiveManagedTeamText( matchSession, managedSender,
+					managedSender ) ) {
+				return;
+			}
+			const mpMatchParticipantState *senderState =
+				matchSession.FindParticipant( managedSender.participant );
+			if ( senderState == NULL || senderState->side < 0 ||
+				senderState->side >= MP_MATCH_SIDE_COUNT ) {
+				return;
+			}
+			managedTeamCommunication = true;
+			managedCommunicationSide = senderState->side;
+			suffix = va( "%s%s",
+				managedCommunicationSide != 0 ? S_COLOR_STROGG : S_COLOR_MARINE,
+				managedCommunicationSide != 0 ? "Strogg^0" : "Marine^0" );
+			send_to = 2;
+		} else if ( p->spectating && ( p->wantSpectate || gameLocal.gameType == GAME_TOURNEY ) ) {
 			suffix = "spectating";
 			if ( team || ( !g_spectatorChat.GetBool() && ( gameState->GetMPGameState() == GAMEON || gameState->GetMPGameState() == SUDDENDEATH ) ) ) {
 				// to specs
@@ -9275,7 +17808,9 @@ void idMultiplayerGame::ProcessChatMessage( int clientNum, bool team, const char
 		suffixed_name = va( "^0%s^0", name );
 	}
 	if( p && send_to == 2 ) {
-		prefixed_text = va( "%s%s", p->team ? S_COLOR_STROGG : S_COLOR_MARINE, common->GetLocalizedString( text ) );
+		const bool stroggTeam = managedTeamCommunication ?
+			managedCommunicationSide != 0 : p->team != 0;
+		prefixed_text = va( "%s%s", stroggTeam ? S_COLOR_STROGG : S_COLOR_MARINE, common->GetLocalizedString( text ) );
 	} else {
 		prefixed_text = common->GetLocalizedString( text );
 	}
@@ -9317,7 +17852,19 @@ void idMultiplayerGame::ProcessChatMessage( int clientNum, bool team, const char
 				break;
 
 			case 2:
-				if ( !p || ( to->team == p->team && !to->IsPlayerMuted( p ) ) ) {
+				if ( managedTeamCommunication ) {
+					mpMatchTeamCommunicationBinding_t managedRecipient;
+					if ( !BuildManagedTeamCommunicationBinding( i, managedRecipient ) ||
+						!MPMatchMayReceiveManagedTeamText( matchSession, managedSender,
+							managedRecipient ) || to->IsPlayerMuted( p ) ) {
+						break;
+					}
+					if ( i == gameLocal.localClientNum ) {
+						PrintChatLine( va( "%s^0: %s\n", suffixed_name.c_str(), prefixed_text.c_str() ), true );
+					} else {
+						networkSystem->ServerSendReliableMessage( i, outMsg );
+					}
+				} else if ( !p || ( to->team == p->team && !to->IsPlayerMuted( p ) ) ) {
 					if ( !to->spectating ) {
 						if ( i == gameLocal.localClientNum ) {
 							PrintChatLine( va( "%s^0: %s\n", suffixed_name.c_str(), prefixed_text.c_str() ), true );
@@ -9333,7 +17880,8 @@ void idMultiplayerGame::ProcessChatMessage( int clientNum, bool team, const char
 	// Only accepted typed chat reaches the reply system.  Bot replies explicitly
 	// pass false when they come back through this function, which permits bots
 	// to react to ordinary bot chatter without creating reply ping-pong.
-	if ( triggerBotReplies && clientNum >= 0 && send_to != 1 ) {
+	if ( triggerBotReplies && clientNum >= 0 && send_to != 1 &&
+		!managedTeamCommunication ) {
 		botManager.OnChatMessage( clientNum, send_to == 2, common->GetLocalizedString( text ) );
 	}
 }
@@ -9501,7 +18049,9 @@ void idMultiplayerGame::EnterGame( int clientNum ) {
 			}
 
 			if( num == clientNum ) {
-				privatePlayers |= (1 << clientNum);
+				if ( clientNum >= 0 && clientNum < 32 ) {
+					privatePlayers |= ( 1u << clientNum );
+				}
 			}
 		}
 
@@ -9844,6 +18394,10 @@ idMultiplayerGame::HandleServerAdminKickPlayer
 ================
 */
 void idMultiplayerGame::HandleServerAdminKickPlayer( int clientNum ) {
+	if ( RejectManagedLegacyMutation( "server admin kick" ) ) {
+		return;
+	}
+
 	if ( clientNum < 0 || clientNum >= gameLocal.numClients ) {
 		common->DPrintf( "idMultiplayerGame::HandleServerAdminKickPlayer:  bad client num %d\n", clientNum );
 		return;
@@ -9862,6 +18416,10 @@ idMultiplayerGame::HandleServerAdminForceTeamSwitch
 ================
 */
 void idMultiplayerGame::HandleServerAdminForceTeamSwitch( int clientNum ) {
+	if ( RejectManagedLegacyMutation( "server admin team switch" ) ) {
+		return;
+	}
+
 	if ( !gameLocal.IsTeamGame() ) {
 		return;
 	}
@@ -9901,68 +18459,52 @@ idMultiplayerGame::HandleServerAdminCommands
 ================
 */
 bool idMultiplayerGame::HandleServerAdminCommands( serverAdminData_t &data ) {
+	if ( RejectManagedLegacyMutation( "server admin settings" ) ) {
+		return false;
+	}
+
 	bool restartNeeded = false;
 	bool nextMapNeeded = false;
 	bool anyChanges = false;
-	bool runPickMap = false;
-	int nGameType = 0;
 	idStr currentMap = si_map.GetString( );
 
-	const char *szGameType = gameLocal.serverInfo.GetString( "si_gametype" );
-	if ( 0 == idStr::Icmp( szGameType, "DM" ) ) {
-		nGameType = GAME_DM;
-	} else if ( 0 == idStr::Icmp( szGameType, "Team DM" ) ) {
-		nGameType = GAME_TDM;
-	} else if ( 0 == idStr::Icmp( szGameType, "CTF" ) ) {
-		nGameType = GAME_CTF;
-	} else if ( 0 == idStr::Icmp( szGameType, "Tourney" ) ) {
-		nGameType = GAME_TOURNEY;
-	} else if ( 0 == idStr::Icmp( szGameType, "Arena CTF" ) ) {
-		nGameType = GAME_ARENA_CTF;
-	} else if ( 0 == idStr::Icmp( szGameType, "DeadZone" ) ) {
-		nGameType = GAME_DEADZONE;
-	} else {
-		nGameType = GAME_SP;
+	const mpGameTypeInfo_t *currentGameType = MPGameTypeByName(
+		gameLocal.serverInfo.GetString( "si_gametype" ) );
+	if ( currentGameType == NULL ||
+		!MPGameTypeIsSelectable( currentGameType->type ) ) {
+		common->Warning( "server admin refused unknown or unavailable current gametype '%s'",
+			gameLocal.serverInfo.GetString( "si_gametype" ) );
+		return false;
 	}
-	if ( nGameType != data.gameType ) {
-		
-		switch ( data.gameType ) {
-			case GAME_TDM:			szGameType = "Team DM";		runPickMap = true; break;
-			case GAME_TOURNEY:		szGameType = "Tourney";		runPickMap = true; break;
-			case GAME_CTF:			szGameType = "CTF";			runPickMap = true; break;
-			case GAME_ARENA_CTF:	szGameType = "Arena CTF";	runPickMap = true; break;
+	if ( data.gameType <= GAME_SP || data.gameType >= NUM_GAME_TYPES ||
+		!MPGameTypeIsSelectable( data.gameType ) ) {
+		common->Warning( "server admin refused unknown or unavailable gametype id %d",
+			data.gameType );
+		return false;
+	}
+	const mpGameTypeInfo_t *requestedGameType = MPGameType( data.gameType );
+	const char *szGameType = requestedGameType->name;
+	const idDict *requestedMap = MultiplayerResolveMapDecl( data.mapName.c_str() );
+	if ( requestedMap == NULL ||
+		!MPMapSupportsGameType( requestedMap, requestedGameType->type ) ) {
+		common->Warning( "server admin refused map '%s' for gametype '%s'",
+			data.mapName.c_str(), szGameType );
+		return false;
+	}
 
-			// mekberg: hack, if we had 1f ctf the gui index wouldn't be off =(
-			case GAME_1F_CTF:		szGameType = "Arena CTF";	runPickMap = true; break;
-			case GAME_DEADZONE:		szGameType = "DeadZone";	runPickMap = true; break;
-			default:
-			case GAME_DM:			szGameType = "DM";			break;
-		}
-
-		//we're going to reset the map here, so make sure to kill the active vote.
-		ClientUpdateVote( VOTE_RESET, 0, 0, currentVoteData );
-		vote = VOTE_NONE;
+	const bool gameTypeChanged =
+		currentGameType->type != requestedGameType->type;
+	if ( gameTypeChanged ) {
 		restartNeeded = true;
 		anyChanges = true;
-
-		si_gameType.SetString( szGameType );
-		if( runPickMap && gameLocal.isServer )	{
-			//set the selected map to the admin data value, then make sure it can run the selected gametype.
-			si_map.SetString( data.mapName.c_str() );
-			if( PickMap( szGameType ) || idStr::Icmp( si_map.GetString( ), currentMap.c_str( ) ) )	{
-				nextMapNeeded = true;
-				restartNeeded = false;
-				data.mapName = idStr( si_map.GetString() );
-				data.restartMap = true;
-			}
-		}
 	} 
 
 	if ( gameLocal.serverInfo.GetBool( "si_isBuyingEnabled" ) != data.buying )
 		restartNeeded = true;
 
-	// Rcon these cvars if this isn't the server. We can trust the input from the gui that the
-	// gametype and map always match.
+	// The exact registry row and map declaration were validated before this
+	// branch, so a remote administrator cannot accidentally submit the old
+	// One Flag/Arena alias or a mismatched map-mode pair.
 	if ( !gameLocal.isServer ) {
 		cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rcon si_autoBalance %d",	data.autoBalance ) );
 		cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rcon si_isBuyingEnabled %d", data.buying ) );
@@ -9972,11 +18514,7 @@ bool idMultiplayerGame::HandleServerAdminCommands( serverAdminData_t &data ) {
 		cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rcon si_gameType %s",		szGameType ) );
 		cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rcon si_map %s",			data.mapName.c_str() ) );
 		cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rcon si_tourneyLimit %d",	data.tourneyLimit ) );
-		cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rcon si_minPlayers %d",	data.minPlayers ) );
 		cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rcon si_timeLimit %d",		data.timeLimit ) );
-		if( runPickMap ) {
-			cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "rcon verifyServerSettings" ) );
-		}
 		
 		if( data.shuffleTeams ) {
 			cmdSystem->BufferCommandText( CMD_EXEC_NOW, "rcon shuffleTeams" );
@@ -9993,6 +18531,13 @@ bool idMultiplayerGame::HandleServerAdminCommands( serverAdminData_t &data ) {
 		return true;
 	}
 
+	if ( gameTypeChanged ) {
+		// We're going to reset the map here, so make sure to kill the active vote.
+		ClientUpdateVote( VOTE_RESET, 0, 0, currentVoteData );
+		vote = VOTE_NONE;
+		si_gameType.SetString( szGameType );
+	}
+
 	if ( data.restartMap ) {
 		ClientUpdateVote( VOTE_RESET, 0, 0, currentVoteData );
 		vote = VOTE_NONE;
@@ -10006,7 +18551,7 @@ bool idMultiplayerGame::HandleServerAdminCommands( serverAdminData_t &data ) {
 	}
 
 	//this section won't be encountered if the gametype was changed. But that's ok.
-	if ( data.mapName.c_str() && idStr::Icmp( data.mapName.c_str(), si_map.GetString() ) ) {
+	if ( idStr::Icmp( data.mapName.c_str(), currentMap.c_str() ) ) {
 		ClientUpdateVote( VOTE_RESET, 0, 0, currentVoteData );
 		vote = VOTE_NONE;
 		si_map.SetString(data.mapName.c_str());
@@ -10113,6 +18658,18 @@ void idMultiplayerGame::ServerWriteInitialReliableMessages( const idMessageSende
 	sender.Send( outMsg );
 
 	gameState->SendInitialState( sender, clientNum );
+
+	if ( sender.GetChannelType() != CHANNEL_DEST_RELIABLE_REPEATER ) {
+		SynchronizeMatchParticipant( clientNum );
+		AdvanceMatchViewRevision();
+		outMsg.BeginWriting();
+		if ( WriteMatchViewMessage( clientNum, outMsg ) ) {
+			sender.Send( outMsg );
+			if ( clientNum >= 0 && clientNum < MAX_CLIENTS ) {
+				matchViewSentRevision[ clientNum ] = matchViewRevision;
+			}
+		}
+	}
 }
 
 /*
@@ -10746,6 +19303,13 @@ idMultiplayerGame::ShuffleTeams
 ===============
 */
 void idMultiplayerGame::ShuffleTeams( void ) {
+	if ( RejectManagedLegacyMutation( "shuffle teams" ) ) {
+		return;
+	}
+	if ( !gameLocal.IsTeamGame() ) {
+		return;
+	}
+
 	// turn off autobalance if its on
 	bool autoBalance = gameLocal.serverInfo.GetBool( "si_autoBalance" );
 	if( autoBalance ) {
@@ -10786,51 +19350,51 @@ void idMultiplayerGame::SetGameType( void ) {
 		gameState = NULL;
 	}
 
-	// openQ4: the descriptor table resolves the name; only the state class
-	// allocation stays as a switch, because that is the one thing a table of
-	// plain data cannot express.
-	const mpGameTypeInfo_t *info = MPGameTypeByName( gameLocal.serverInfo.GetString( "si_gameType" ) );
+	// The descriptor owns both exposure and construction.  A stale config or
+	// crafted serverInfo token must never terminate a public server; unavailable
+	// rows remain in the append-only wire table but safely fall back to DM.
+	const char *requestedGameType = gameLocal.serverInfo.GetString( "si_gameType" );
+	const mpGameTypeInfo_t *info = MPGameTypeByName( requestedGameType );
 
-	if ( info == NULL ) {
-		gameLocal.Error( "idMultiplayerGame::SetGameType() - Unknown gametype '%s'\n", gameLocal.serverInfo.GetString( "si_gameType" ) );
-		return;
+	if ( info == NULL || !MPGameTypeIsSelectable( info->type ) ) {
+		gameLocal.Warning( "idMultiplayerGame::SetGameType: gametype '%s' is unknown or unavailable; using DM", requestedGameType );
+		info = MPGameType( GAME_DM );
+		gameLocal.serverInfo.Set( "si_gameType", info->name );
+		cvarSystem->SetCVarString( "si_gameType", info->name );
 	}
 
 	gameLocal.gameType = info->type;
 
-	switch ( info->type ) {
-		case GAME_DM:
+	switch ( info->stateFactory ) {
+		case MP_GAMESTATE_DM:
 			gameState = new rvDMGameState();
 			break;
-		case GAME_DUEL:
+		case MP_GAMESTATE_DUEL:
 			gameState = new rvDuelGameState();
 			break;
-		case GAME_TOURNEY:
+		case MP_GAMESTATE_TOURNEY:
 			gameState = new rvTourneyGameState();
 			break;
-		case GAME_TDM:
+		case MP_GAMESTATE_TEAMDM:
 			gameState = new rvTeamDMGameState();
 			break;
-		case GAME_CTF:
-		case GAME_1F_CTF:
-		case GAME_ARENA_CTF:
-		case GAME_ARENA_1F_CTF:
+		case MP_GAMESTATE_CTF:
 			gameState = new rvCTFGameState();
 			break;
-		case GAME_DEADZONE:
+		case MP_GAMESTATE_DEADZONE:
 			gameState = new riDZGameState();
 			break;
-		case GAME_CA:
+		case MP_GAMESTATE_CA:
 			gameState = new rvClanArenaGameState();
 			break;
-		case GAME_FREEZETAG:
+		case MP_GAMESTATE_FREEZETAG:
 			gameState = new rvFreezeTagGameState();
 			break;
-		case GAME_REDROVER:
+		case MP_GAMESTATE_REDROVER:
 			gameState = new rvRedRoverGameState();
 			break;
 		default:
-			gameLocal.Error( "idMultiplayerGame::SetGameType() - gametype '%s' has no game state class\n", info->name );
+			gameLocal.Error( "idMultiplayerGame::SetGameType: validated gametype '%s' has invalid state factory %d", info->name, info->stateFactory );
 			return;
 	}
 
@@ -11086,11 +19650,11 @@ void idMultiplayerGame::UpdatePrivatePlayerCount( void ) {
 
 	int numPrivatePlayers = 0;
 	for( int i = 0; i < MAX_CLIENTS; i++ ) {
-		if( privatePlayers & (1 << i) ) {
+		if( privatePlayers & ( 1u << i ) ) {
 			if( gameLocal.entities[ i ] ) {
 				numPrivatePlayers++;
 			} else {
-				privatePlayers &= ~( 1 << i );
+				privatePlayers &= ~( 1u << i );
 			}
 		}
 	}
@@ -11100,13 +19664,18 @@ void idMultiplayerGame::UpdatePrivatePlayerCount( void ) {
 }
 
 void idMultiplayerGame::SetFlagEntity( idEntity* ent, int team ) {
-	assert( ( team == TEAM_STROGG || team == TEAM_MARINE ) );
+	if ( team < 0 || team >= TEAM_MAX ) {
+		gameLocal.Warning( "idMultiplayerGame::SetFlagEntity() - invalid team %d", team );
+		return;
+	}
 
 	flagEntities[ team ] = ent;
 }
 
 idEntity* idMultiplayerGame::GetFlagEntity( int team ) {
-	assert( team >= 0  && team < TEAM_MAX );
+	if ( team < 0 || team >= TEAM_MAX ) {
+		return NULL;
+	}
 
 	return flagEntities[ team ];
 }
@@ -11120,6 +19689,9 @@ void idMultiplayerGame::CheckTeamBalance_f( const idCmdArgs &args ) {
 	}
 	
 	idPlayer *localPlayer = gameLocal.GetLocalPlayer();
+	if ( localPlayer == NULL ) {
+		return;
+	}
 	
 	const char *team = args.Argv(1);
 	const char *yesEvent = args.Argv(2);
@@ -11138,8 +19710,9 @@ void idMultiplayerGame::CheckTeamBalance_f( const idCmdArgs &args ) {
 		idEntity *ent = gameLocal.entities[i];
 
 		if ( ent && ent->IsType( idPlayer::GetClassType() ) && gameLocal.mpGame.IsInGame( i ) ) {
-			if ( !static_cast< idPlayer * >( ent )->spectating && ent != localPlayer ) {
-				teamCount[ static_cast< idPlayer * >( ent )->team ]++;
+			idPlayer *candidate = static_cast< idPlayer * >( ent );
+			if ( !candidate->spectating && ent != localPlayer && candidate->team >= 0 && candidate->team < TEAM_MAX ) {
+				teamCount[ candidate->team ]++;
 			}
 		}
 	}
@@ -11380,6 +19953,11 @@ bool idMultiplayerGame::IsBuyingAllowedRightNow( void )
 
 void idMultiplayerGame::AddTeamPowerup(int powerup, int time, int team)
 {
+	if ( team < 0 || team >= TEAM_MAX ) {
+		gameLocal.Warning( "idMultiplayerGame::AddTeamPowerup() - invalid team %d", team );
+		return;
+	}
+
 	int i;
 	for ( i=0; i<MAX_TEAM_POWERUPS; i++ )
 	{
@@ -11436,6 +20014,10 @@ void idMultiplayerGame::UpdateTeamPowerups( void ) {
 
 void idMultiplayerGame::SetUpdateForTeamPowerups(int team)
 {
+	if ( team < 0 || team >= TEAM_MAX ) {
+		return;
+	}
+
 	int i;
 	for ( i=0; i<MAX_TEAM_POWERUPS; i++ )
 	{

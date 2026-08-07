@@ -536,6 +536,7 @@ public:
 	void						SetPlaybackRate( int currentTime, float newRate );
 	float						GetPlaybackRate( void ) const;
 	void						SetStartTime( int startTime );
+	void						ShiftTime( int deltaMsec );
 	int							GetStartTime( void ) const;
 	int							GetEndTime( void ) const;
 	int							GetFrameNumber( int currenttime ) const;
@@ -617,6 +618,9 @@ class idAnimator{
 	bool						HasAnim( const char *name ) const;
 
 	void						ServiceAnims( int fromtime, int totime );
+	// Shift every active animation clock without evaluating frame commands.
+	// Used by the centralized competitive pause pass.
+	void						ShiftTime( int deltaMsec );
 
 // RAVEN BEGIN
 // rjohnson: added flag to ignore AF when checking for animation

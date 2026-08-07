@@ -204,7 +204,7 @@ void idPlayerView::Restore( idRestoreGame *savefile ) {
 	savefile->ReadFloat( fadeRate );
 	savefile->ReadInt( fadeTime );
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( player ) );
+	savefile->ReadObject( player );
 	savefile->ReadRenderView( view );
 }
 
@@ -804,6 +804,67 @@ void idPlayerView::Fade( idVec4 color, int time ) {
 idPlayerView::ScreenFade
 =================
 */
+// openQ4 BEGIN
+/*
+===================
+idPlayerView::LiquidAtEye
+
+Which liquid the camera itself is inside, and the point where the underwater audio muffle is
+decided. Deliberately not idPhysics_Player::GetWaterLevel(): WATERLEVEL_HEAD needs the whole
+bounding box submerged, and the eye is 8 units below the top of that box standing and 16 crouched,
+so keying off it would leave the screen clear and the audio dry while the view was already under.
+===================
+*/
+int idPlayerView::LiquidAtEye( const renderView_t *view ) const {
+	int liquidContents = 0;
+
+	if ( view ) {
+		liquidContents = gameLocal.LiquidContentsAtPoint( view->vieworg, player );
+	}
+
+	idSoundWorld *gameSoundWorld = soundSystem->GetSoundWorldFromId( SOUNDWORLD_GAME );
+	if ( gameSoundWorld ) {
+		gameSoundWorld->SetUnderwater( liquidContents != 0 );
+	}
+
+	return liquidContents;
+}
+
+/*
+===================
+idPlayerView::LiquidOverlay
+
+A full screen tint in the colour of whatever the player is swimming in, the way the older Quake
+games shade the view underwater. Drawn over the world but under the HUD.
+===================
+*/
+void idPlayerView::LiquidOverlay( int liquidContents ) {
+	if ( !liquidContents || g_liquidScreenTint.GetFloat() <= 0.0f ) {
+		return;
+	}
+
+	idVec4 tint;
+	if ( liquidContents & CONTENTS_LAVA ) {
+		tint.Set( 0.65f, 0.14f, 0.02f, 0.65f );
+	} else if ( liquidContents & CONTENTS_SLIME ) {
+		tint.Set( 0.16f, 0.36f, 0.06f, 0.55f );
+	} else {
+		tint.Set( 0.03f, 0.26f, 0.44f, 0.45f );
+	}
+
+	tint[3] *= idMath::ClampFloat( 0.0f, 1.0f, g_liquidScreenTint.GetFloat() );
+	if ( tint[3] <= 0.0f ) {
+		return;
+	}
+
+	const bool previousUIViewportMode = renderSystem->GetUseUIViewportFor2D();
+	renderSystem->SetUseUIViewportFor2D( false );
+	renderSystem->SetColor4( tint[0], tint[1], tint[2], tint[3] );
+	renderSystem->DrawStretchPic( 0, 0, 640, 480, 0, 0, 1, 1, declManager->FindMaterial( "_white" ) );
+	renderSystem->SetUseUIViewportFor2D( previousUIViewportMode );
+}
+// openQ4 END
+
 void idPlayerView::ScreenFade() {
 	int		msec;
 	float	t;
@@ -879,6 +940,10 @@ void idPlayerView::RenderPlayerView( idUserInterface *hud ) {
 	// place the sound origin for the player
 	soundSystem->PlaceListener( view->vieworg, view->viewaxis, player->entityNumber + 1, gameLocal.time, "Undefined" );
 
+// openQ4 BEGIN
+	const int eyeLiquidContents = LiquidAtEye( view );
+// openQ4 END
+
 	if ( g_skipViewEffects.GetBool() ) {
 		SingleView( hud, view );
 	} else {
@@ -891,6 +956,10 @@ void idPlayerView::RenderPlayerView( idUserInterface *hud ) {
 		} else {
 			SingleView( hud, view, RF_NO_GUI | RF_PRIMARY_VIEW );
 		}
+
+// openQ4 BEGIN
+		LiquidOverlay( eyeLiquidContents );
+// openQ4 END
 
 		// Now draw GUI's.
 		if ( !guiRendered ) {

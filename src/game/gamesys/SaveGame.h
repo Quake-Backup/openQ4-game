@@ -10,10 +10,13 @@ Save game related helper classes.
 
 const int INITIAL_RELEASE_BUILD_NUMBER = 1262;
 const int OPENQ4_SAVEGAME_COMPATIBILITY_MAGIC = 'O' | ( 'Q' << 8 ) | ( '4' << 16 ) | ( 'S' << 24 );
-const int OPENQ4_SAVEGAME_COMPATIBILITY_VERSION = 2;
+const int OPENQ4_SAVEGAME_COMPATIBILITY_VERSION = 3;
+const int OPENQ4_SAVEGAME_PREVIOUS_COMPATIBILITY_VERSION = 2;
 const int OPENQ4_SAVEGAME_SYNC_MAGIC = 'O' | ( 'Q' << 8 ) | ( '4' << 16 ) | ( 'Y' << 24 );
 const int OPENQ4_SAVEGAME_FOOTER_MAGIC = 'O' | ( 'Q' << 8 ) | ( '4' << 16 ) | ( 'F' << 24 );
 const int OPENQ4_SAVEGAME_FOOTER_VERSION = 1;
+const int OPENQ4_SAVEGAME_INTEGRITY_MAGIC = 'O' | ( 'Q' << 8 ) | ( '4' << 16 ) | ( 'I' << 24 );
+const int OPENQ4_SAVEGAME_INTEGRITY_VERSION = 1;
 
 #if defined( __has_include )
 #if __has_include( "openq4_savegame_compat_generated.h" )
@@ -28,6 +31,8 @@ const int OPENQ4_SAVEGAME_FOOTER_VERSION = 1;
 #ifndef OPENQ4_SAVEGAME_COMPAT_SOURCE_FILE_COUNT
 #define OPENQ4_SAVEGAME_COMPAT_SOURCE_FILE_COUNT 0
 #endif
+
+const char *OpenQ4SaveGameWireABI( void );
 
 class idSaveGame {
 public:
@@ -148,6 +153,15 @@ public:
 	void					ReadMat3( idMat3 &mat );
 	void					ReadAngles( idAngles &angles );
 	void					ReadObject( idClass *&obj );
+	void					ReadObject( idClass *&obj, const idTypeInfo &expectedType, const char *detail );
+	template< class T >
+	void					ReadObject( T *&obj ) {
+		obj = NULL;
+		idClass *restoredObject = NULL;
+		const idTypeInfo &expectedType = T::GetClassType();
+		ReadObject( restoredObject, expectedType, expectedType.classname );
+		obj = static_cast<T *>( restoredObject );
+	}
 	void					ReadStaticObject( idClass &obj );
 	void					ReadDict( idDict *dict );
 	void					ReadMaterial( const idMaterial *&material );
@@ -194,6 +208,7 @@ public:
 
 	//						Used to retrieve the saved game buildNumber from within class Restore methods
 	int						GetBuildNumber( void );
+	int						GetOpenQ4SaveGameCompatibilityVersion( void ) const;
 	bool					HasOpenQ4SaveGameCompatibilityStamp( void ) const;
 	bool					IsOpenQ4SaveGameCompatible( void ) const;
 	const char *			GetOpenQ4SaveGameCompatibilityError( void ) const;

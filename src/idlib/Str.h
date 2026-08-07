@@ -2,6 +2,8 @@
 #ifndef __STR_H__
 #define __STR_H__
 
+#include "StrAllocation.h"
+
 /*
 ===============================================================================
 
@@ -336,7 +338,7 @@ public:
 	friend int			sprintf( idStr &dest, const char *fmt, ... );
 	friend int			vsprintf( idStr &dest, const char *fmt, va_list ap );
 
-	void				ReAllocate( int amount, bool keepold );				// reallocate string data buffer
+	void				ReAllocate( size_t amount, bool keepold );			// reallocate string data buffer
 	void				FreeData( void );									// free allocated string memory
 
 						// format value in the given measurement with the best unit, returns the best unit
@@ -363,7 +365,7 @@ protected:
 	char				baseBuffer[ STR_ALLOC_BASE ];
 
 	void				Init( void );										// initialize string using base buffer
-	void				EnsureAlloced( int amount, bool keepold = true );	// ensure string data buffer is large anough
+	void				EnsureAlloced( size_t amount, bool keepold = true );	// ensure string data buffer is large anough
 
 // RAVEN BEGIN
 public:
@@ -380,8 +382,8 @@ char *					va( const char *fmt, ... ) id_attribute((format(printf,1,2)));
 char*					fe( int errorId );
 // RAVEN END
 
-ID_INLINE void idStr::EnsureAlloced( int amount, bool keepold ) {
-	if ( amount > alloced ) {
+ID_INLINE void idStr::EnsureAlloced( size_t amount, bool keepold ) {
+	if ( amount > static_cast<size_t>( alloced ) ) {
 		ReAllocate( amount, keepold );
 	}
 }
@@ -405,7 +407,7 @@ ID_INLINE idStr::idStr( const idStr &text ) {
 
 	Init();
 	l = text.Length();
-	EnsureAlloced( l + 1 );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( l ), 1 ) );
 	strcpy( data, text.data );
 	len = l;
 }
@@ -424,12 +426,13 @@ ID_INLINE idStr::idStr( const idStr &text, int start, int end ) {
 		start = 0;
 	}
 
-	l = end - start;
-	if ( l < 0 ) {
+	if ( end <= start ) {
 		l = 0;
+	} else {
+		l = end - start;
 	}
 
-	EnsureAlloced( l + 1 );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( l ), 1 ) );
 
 	for ( i = 0; i < l; i++ ) {
 		data[ i ] = text[ start + i ];
@@ -444,8 +447,9 @@ ID_INLINE idStr::idStr( const char *text ) {
 
 	Init();
 	if ( text ) {
-		l = strlen( text );
-		EnsureAlloced( l + 1 );
+		const size_t textLength = strlen( text );
+		EnsureAlloced( idStrAllocationDetail::SaturatingAdd( textLength, 1 ) );
+		l = idLib::SizeToInt( textLength, "idStr::idStr" );
 		strcpy( data, text );
 		len = l;
 	}
@@ -453,7 +457,7 @@ ID_INLINE idStr::idStr( const char *text ) {
 
 ID_INLINE idStr::idStr( const char *text, int start, int end ) {
 	int i;
-	int l = strlen( text );
+	int l = idLib::SizeToInt( strlen( text ), "idStr::idStr" );
 
 	Init();
 	if ( end > l ) {
@@ -465,12 +469,13 @@ ID_INLINE idStr::idStr( const char *text, int start, int end ) {
 		start = 0;
 	}
 
-	l = end - start;
-	if ( l < 0 ) {
+	if ( end <= start ) {
 		l = 0;
+	} else {
+		l = end - start;
 	}
 
-	EnsureAlloced( l + 1 );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( l ), 1 ) );
 
 	for ( i = 0; i < l; i++ ) {
 		data[ i ] = text[ start + i ];
@@ -502,7 +507,7 @@ ID_INLINE idStr::idStr( const int i ) {
 
 	Init();
 	l = sprintf( text, "%d", i );
-	EnsureAlloced( l + 1 );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( l ), 1 ) );
 	strcpy( data, text );
 	len = l;
 }
@@ -513,7 +518,7 @@ ID_INLINE idStr::idStr( const unsigned u ) {
 
 	Init();
 	l = sprintf( text, "%u", u );
-	EnsureAlloced( l + 1 );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( l ), 1 ) );
 	strcpy( data, text );
 	len = l;
 }
@@ -526,7 +531,7 @@ ID_INLINE idStr::idStr( const float f ) {
 	l = idStr::snPrintf( text, sizeof( text ), "%f", f );
 	while( l > 0 && text[l-1] == '0' ) text[--l] = '\0';
 	while( l > 0 && text[l-1] == '.' ) text[--l] = '\0';
-	EnsureAlloced( l + 1 );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( l ), 1 ) );
 	strcpy( data, text );
 	len = l;
 }
@@ -565,7 +570,7 @@ ID_INLINE void idStr::operator=( const idStr &text ) {
 	int l;
 
 	l = text.Length();
-	EnsureAlloced( l + 1, false );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( l ), 1 ), false );
 	memcpy( data, text.data, l );
 	data[l] = '\0';
 	len = l;
@@ -716,7 +721,7 @@ ID_INLINE int idStr::Cmpn( const char *text, int n ) const {
 
 ID_INLINE int idStr::CmpPrefix( const char *text ) const {
 	assert( text );
-	return idStr::Cmpn( data, text, strlen( text ) );
+	return idStr::Cmpn( data, text, idLib::SizeToInt( strlen( text ), "idStr::CmpPrefix" ) );
 }
 
 ID_INLINE int idStr::Icmp( const char *text ) const {
@@ -731,7 +736,7 @@ ID_INLINE int idStr::Icmpn( const char *text, int n ) const {
 
 ID_INLINE int idStr::IcmpPrefix( const char *text ) const {
 	assert( text );
-	return idStr::Icmpn( data, text, strlen( text ) );
+	return idStr::Icmpn( data, text, idLib::SizeToInt( strlen( text ), "idStr::IcmpPrefix" ) );
 }
 
 // RAVEN BEGIN
@@ -754,7 +759,7 @@ ID_INLINE int idStr::IcmpnPath( const char *text, int n ) const {
 
 ID_INLINE int idStr::IcmpPrefixPath( const char *text ) const {
 	assert( text );
-	return idStr::IcmpnPath( data, text, strlen( text ) );
+	return idStr::IcmpnPath( data, text, idLib::SizeToInt( strlen( text ), "idStr::IcmpPrefixPath" ) );
 }
 
 ID_INLINE int idStr::Length( void ) const {
@@ -785,7 +790,7 @@ ID_INLINE void idStr::Clear( void ) {
 }
 
 ID_INLINE void idStr::Append( const char a ) {
-	EnsureAlloced( len + 2 );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( len ), 2 ) );
 	data[ len ] = a;
 	len++;
 	data[ len ] = '\0';
@@ -795,8 +800,11 @@ ID_INLINE void idStr::Append( const idStr &text ) {
 	int newLen;
 	int i;
 
-	newLen = len + text.Length();
-	EnsureAlloced( newLen + 1 );
+	const size_t newLength = idStrAllocationDetail::SaturatingAdd(
+		static_cast<size_t>( len ), static_cast<size_t>( text.Length() )
+	);
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( newLength, 1 ) );
+	newLen = idLib::SizeToInt( newLength, "idStr::Append" );
 	for ( i = 0; i < text.len; i++ ) {
 		data[ len + i ] = text[ i ];
 	}
@@ -809,8 +817,9 @@ ID_INLINE void idStr::Append( const char *text ) {
 	int i;
 
 	if ( text ) {
-		newLen = len + strlen( text );
-		EnsureAlloced( newLen + 1 );
+		const size_t newLength = idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( len ), strlen( text ) );
+		EnsureAlloced( idStrAllocationDetail::SaturatingAdd( newLength, 1 ) );
+		newLen = idLib::SizeToInt( newLength, "idStr::Append" );
 		for ( i = 0; text[ i ]; i++ ) {
 			data[ len + i ] = text[ i ];
 		}
@@ -823,9 +832,17 @@ ID_INLINE void idStr::Append( const char *text, int l ) {
 	int newLen;
 	int i;
 
-	if ( text && l ) {
-		newLen = len + l;
-		EnsureAlloced( newLen + 1 );
+	if ( l < 0 ) {
+		idLib::Error( "idStr::Append: negative length" );
+		return;
+	}
+
+	if ( text && l > 0 ) {
+		const size_t newLength = idStrAllocationDetail::SaturatingAdd(
+			static_cast<size_t>( len ), static_cast<size_t>( l )
+		);
+		EnsureAlloced( idStrAllocationDetail::SaturatingAdd( newLength, 1 ) );
+		newLen = idLib::SizeToInt( newLength, "idStr::Append" );
 		for ( i = 0; text[ i ] && i < l; i++ ) {
 			data[ len + i ] = text[ i ];
 		}
@@ -844,7 +861,7 @@ ID_INLINE void idStr::Insert( const char a, int index ) {
 	}
 
 	l = 1;
-	EnsureAlloced( len + l + 1 );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( len ), 2 ) );
 	for ( i = len; i >= index; i-- ) {
 		data[i+l] = data[i];
 	}
@@ -853,7 +870,7 @@ ID_INLINE void idStr::Insert( const char a, int index ) {
 }
 
 ID_INLINE void idStr::Insert( const char *text, int index ) {
-	int i, l;
+	int i, l, newLen;
 
 	if ( index < 0 ) {
 		index = 0;
@@ -861,15 +878,17 @@ ID_INLINE void idStr::Insert( const char *text, int index ) {
 		index = len;
 	}
 
-	l = strlen( text );
-	EnsureAlloced( len + l + 1 );
+	const size_t newLength = idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( len ), strlen( text ) );
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( newLength, 1 ) );
+	newLen = idLib::SizeToInt( newLength, "idStr::Insert" );
+	l = newLen - len;
 	for ( i = len; i >= index; i-- ) {
 		data[i+l] = data[i];
 	}
 	for ( i = 0; i < l; i++ ) {
 		data[index+i] = text[i];
 	}
-	len += l;
+	len = newLen;
 }
 
 ID_INLINE void idStr::ToLower( void ) {
@@ -922,7 +941,12 @@ ID_INLINE void idStr::CapLength( int newlen ) {
 }
 
 ID_INLINE void idStr::Fill( const char ch, int newlen ) {
-	EnsureAlloced( newlen + 1 );
+	if ( newlen < 0 ) {
+		idLib::Error( "idStr::Fill: negative length" );
+		return;
+	}
+
+	EnsureAlloced( idStrAllocationDetail::SaturatingAdd( static_cast<size_t>( newlen ), 1 ) );
 	len = newlen;
 	memset( data, ch, len );
 	data[ len ] = 0;

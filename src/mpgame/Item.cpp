@@ -7,6 +7,7 @@
 #pragma hdrstop
 
 #include "Game_local.h"
+#include "mp/match/MatchDeadline.h"
 
 
 /*
@@ -984,6 +985,7 @@ bool idItem::Pickup( idPlayer *player ) {
 			PostEventSec( &EV_RespawnFx, respawn - 0.5f );
 		}
 		PostEventSec( &EV_RespawnItem, respawn );
+		gameLocal.mpGame.ObserveCompetitiveItemPickup( this, respawn );
 	} else if ( !spawnArgs.GetBool( "inv_objective" ) && !no_respawn ) {
 		// give some time for the pickup sound to play
 		// FIXME: Play on the owner
@@ -1274,6 +1276,7 @@ void idItem::Event_Respawn( void ) {
 		UpdateModelTransform();
 		PlayEffect( "fx_idle", renderEntity.origin, renderEntity.axis, true );
 	}
+	gameLocal.mpGame.ObserveCompetitiveItemAvailable( this );
 }
 
 /*
@@ -1464,6 +1467,11 @@ void idItemPowerup::Think( void ) {
 	if( i >= gameLocal.numClients ) {
 		PostEventMS( &EV_RespawnItem, 0 );
 	}
+}
+
+void idItemPowerup::ThinkMatchPaused( int deltaMsec ) {
+	idItem::ThinkMatchPaused( deltaMsec );
+	mpMatchShiftOptionalDeadline( droppedTime, deltaMsec );
 }
 
 /*

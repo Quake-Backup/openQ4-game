@@ -13,6 +13,9 @@ GAME_TREES = ("game", "mpgame")
 RESTORE_GUARD_ERROR_PATTERN = re.compile(
     r'(?:savefile|saveFile|savegame)\s*(?:->|\.)\s*Error\s*\(\s*"([^"]+)"'
 )
+RAW_SAVE_WRITE_PATTERN = re.compile(
+    r"\b(?:savefile|saveFile|savegame)\s*(?:->|\.)\s*Write\s*\("
+)
 EXPECTED_SAVEGAME_CAPS = {
     "MAX_SAVEGAME_ENTITY_REFS": 1024,
     "MAX_SAVEGAME_CLIENT_ENTITY_REFS": 1024,
@@ -43,6 +46,7 @@ EXPECTED_SAVEGAME_CAPS = {
     "MAX_SAVEGAME_TRAM_VISIBLE_ENEMIES": 256,
     "MAX_SAVEGAME_TRAM_GATE_DOORS": 32,
     "MAX_SAVEGAME_TRIGGER_FUNCTIONS": 256,
+    "MAX_SAVEGAME_MOVER_BUDDIES": 128,
     "MAX_SAVEGAME_MOVER_GUI_TARGETS": 128,
     "MAX_SAVEGAME_SHAKING_TARGET_HISTORY": 256,
     "MAX_SAVEGAME_CHAIN_LIGHTNING_TARGETS": 64,
@@ -55,6 +59,21 @@ EXPECTED_SAVEGAME_CAPS = {
     "MAX_SAVEGAME_TARGET_INFLUENCE_ITEMS": 1024,
     "MAX_SAVEGAME_ACTOR_ENEMIES": 512,
     "MAX_SAVEGAME_ACTOR_ATTACHMENTS": 256,
+}
+
+EXPECTED_RAW_SAVE_WRITE_COUNTS = {
+    "BrittleFracture.cpp": 1,
+    "SecurityCamera.cpp": 1,
+    "ai/Monster_ConvoyHover.cpp": 2,
+    "anim/Anim_Blend.cpp": 5,
+    "physics/Clip.cpp": 1,
+    "physics/Physics_AF.cpp": 2,
+    "script/Script_Interpreter.cpp": 1,
+    "script/Script_Program.cpp": 1,
+    "vehicle/Vehicle.cpp": 1,
+    "vehicle/VehicleDriver.cpp": 2,
+    "vehicle/VehicleParts.cpp": 1,
+    "vehicle/VehiclePosition.cpp": 5,
 }
 
 
@@ -380,6 +399,7 @@ def validate_restore_fuzz_model() -> None:
         ("tram visible enemy count", "MAX_SAVEGAME_TRAM_VISIBLE_ENEMIES"),
         ("tram gate door count", "MAX_SAVEGAME_TRAM_GATE_DOORS"),
         ("trigger function count", "MAX_SAVEGAME_TRIGGER_FUNCTIONS"),
+        ("mover buddy count", "MAX_SAVEGAME_MOVER_BUDDIES"),
         ("mover GUI target count", "MAX_SAVEGAME_MOVER_GUI_TARGETS"),
         ("shaking target history count", "MAX_SAVEGAME_SHAKING_TARGET_HISTORY"),
         ("chain lightning target count", "MAX_SAVEGAME_CHAIN_LIGHTNING_TARGETS"),
@@ -491,6 +511,63 @@ def validate_restore_io_guards(tree: str) -> None:
     )
 
 
+def validate_object_reference_guards(tree: str) -> None:
+    source = read(f"src/{tree}/gamesys/SaveGame.cpp")
+    header = read(f"src/{tree}/gamesys/SaveGame.h")
+    event_source = read(f"src/{tree}/gamesys/Event.cpp")
+
+    for token in (
+        "ReadObject( idClass *&obj, const idTypeInfo &expectedType, const char *detail )",
+        "const idTypeInfo &expectedType = T::GetClassType();",
+        "ReadObject( restoredObject, expectedType, expectedType.classname );",
+    ):
+        require(header, token, f"{tree} typed restored-object API")
+
+    for token in (
+        "class idScopedUnrestoredObjectCleanup",
+        "for ( int i = 1; i < objectList.Num(); i++ )",
+        "objectList.Clear();",
+        "SaveGame_DeleteUnrestoredObjects( objects );",
+        "idScopedUnrestoredObjectCleanup cleanup( objects );",
+        "cleanup.Release();",
+        "non-NULL object of type '%s' is not registered in the savegame object list",
+        "if ( index != 0 && obj == NULL )",
+        "unresolved object index",
+        "if ( obj != NULL && !obj->IsType( expectedType ) )",
+        "has type '%s', expected '%s'",
+    ):
+        require(source, token, f"{tree} restored-object integrity guard")
+
+    reject_regex(
+        source,
+        r"idSaveGame::WriteObject\s*-\s*WriteObject FindIndex failed",
+        f"{tree} missing saved objects must not silently serialize as NULL",
+    )
+    require_regex(
+        source,
+        r"objectTypes\.SetNum\s*\(\s*num\s*\+\s*1\s*\)\s*;.*?"
+        r"for\s*\(\s*i\s*=\s*1\s*;\s*i\s*<\s*objectTypes\.Num\s*\(\s*\)\s*;\s*i\+\+\s*\).*?"
+        r"objectTypes\s*\[\s*i\s*\]\s*=\s*type\s*;.*?"
+        r"objects\.SetNum\s*\(\s*num\s*\+\s*1\s*\)",
+        f"{tree} complete object type table is validated before allocation",
+    )
+    for token in (
+        "savefile->ReadObject( event->object, *event->typeinfo, event->eventdef->GetName() );",
+        "if ( event->object == NULL )",
+        "has a NULL target object",
+    ):
+        require(event_source, token, f"{tree} restored event target validation")
+
+    unsafe_object_cast = r"reinterpret_cast\s*<\s*idClass\s*\*&\s*>"
+    for pattern in ("*.cpp", "*.h"):
+        for path in sorted((ROOT / "src" / tree).rglob(pattern)):
+            reject_regex(
+                path.read_text(encoding="utf-8"),
+                unsafe_object_cast,
+                f"{tree} typed restored-object call in {path.relative_to(ROOT)}",
+            )
+
+
 def validate_game_local_restore_guards(tree: str) -> None:
     source = read(f"src/{tree}/Game_local.cpp")
 
@@ -515,6 +592,23 @@ def validate_game_local_restore_guards(tree: str) -> None:
         r"for\s*\(\s*i\s*=\s*0\s*;\s*i\s*<\s*numClients\s*;\s*i\+\+\s*\)\s*\{.*?"
         r"savegame\.ReadDict\s*\(\s*&persistentPlayerInfo\s*\[\s*i\s*\]\s*\)\s*;",
         f"{tree} persistent player dictionaries are gated by the restored client count",
+    )
+
+    require_regex(
+        source,
+        r"lastAIAlertActor\.Save\s*\(\s*&savegame\s*\)\s*;\s*"
+        r"lastAIAlertEntity\.Save\s*\(\s*&savegame\s*\)\s*;\s*"
+        r"savegame\.WriteInt\s*\(\s*lastAIAlertEntityTime\s*\)\s*;\s*"
+        r"savegame\.WriteInt\s*\(\s*lastAIAlertActorTime\s*\)\s*;",
+        f"{tree} AI alert save order",
+    )
+    require_regex(
+        source,
+        r"lastAIAlertActor\.Restore\s*\(\s*&savegame\s*\)\s*;\s*"
+        r"lastAIAlertEntity\.Restore\s*\(\s*&savegame\s*\)\s*;\s*"
+        r"savegame\.ReadInt\s*\(\s*lastAIAlertEntityTime\s*\)\s*;\s*"
+        r"savegame\.ReadInt\s*\(\s*lastAIAlertActorTime\s*\)\s*;",
+        f"{tree} AI alert restore order",
     )
 
 
@@ -566,8 +660,73 @@ def validate_brittle_fracture_guards(tree: str) -> None:
         require(source, token, f"{tree} brittle-fracture savegame corruption guard")
 
 
+def validate_ai_manager_restore_guards(tree: str) -> None:
+    source = read(f"src/{tree}/ai/AI_Manager.cpp")
+
+    for token in (
+        "static const int MAX_SAVEGAME_AI_TEAM_MEMBERS = 4096;",
+        "static const int MAX_SAVEGAME_AI_AVOIDS = 4096;",
+        "teams[i].Clear ( );",
+    ):
+        require(source, token, f"{tree} AI manager savegame collection guard")
+
+    require_regex(
+        source,
+        r"const\s+int\s+memberCount\s*=\s*teams\[i\]\.Num\s*\(\s*\)\s*;\s*"
+        r"if\s*\(\s*memberCount\s*>\s*MAX_SAVEGAME_AI_TEAM_MEMBERS\s*\)\s*\{\s*"
+        r"gameLocal\.Error\s*\(\s*\"rvAIManager::Save: invalid member count %d for team %d\"[^;]*;\s*\}\s*"
+        r"savefile->WriteInt\s*\(\s*memberCount\s*\)",
+        f"{tree} AI team member count is validated before serialization",
+    )
+    require_regex(
+        source,
+        r"if\s*\(\s*avoids\.Num\s*\(\s*\)\s*>\s*MAX_SAVEGAME_AI_AVOIDS\s*\)\s*\{\s*"
+        r"gameLocal\.Error\s*\(\s*\"rvAIManager::Save: invalid avoid count %d\"[^;]*;\s*\}\s*"
+        r"savefile->WriteInt\s*\(\s*avoids\.Num\s*\(\s*\)\s*\)",
+        f"{tree} AI avoid count is validated before serialization",
+    )
+    require_regex(
+        source,
+        r"savefile->ReadInt\s*\(\s*j\s*\)\s*;\s*"
+        r"if\s*\(\s*j\s*<\s*0\s*\|\|\s*j\s*>\s*MAX_SAVEGAME_AI_TEAM_MEMBERS\s*\)\s*\{\s*"
+        r"savefile->Error\s*\(\s*\"rvAIManager::Restore: invalid member count %d for team %d\"[^;]*;\s*\}\s*"
+        r"for\s*\(\s*;\s*j\s*>\s*0\s*;\s*j\s*--\s*\)",
+        f"{tree} AI team member count is validated before iteration",
+    )
+    require_regex(
+        source,
+        r"savefile->ReadInt\s*\(\s*j\s*\)\s*;\s*"
+        r"if\s*\(\s*j\s*<\s*0\s*\|\|\s*j\s*>\s*MAX_SAVEGAME_AI_AVOIDS\s*\)\s*\{\s*"
+        r"savefile->Error\s*\(\s*\"rvAIManager::Restore: invalid avoid count %d\"[^;]*;\s*\}\s*"
+        r"avoids\.SetNum\s*\(\s*j\s*\)",
+        f"{tree} AI avoid count is validated before allocation",
+    )
+
+
+def validate_state_restore_guards(tree: str) -> None:
+    source = read(f"src/{tree}/gamesys/State.cpp")
+
+    require_regex(
+        source,
+        r"saveFile->ReadString\s*\(\s*name\s*\)\s*;\s*"
+        r"state\s*=\s*owner->FindState\s*\(\s*name\s*\)\s*;\s*"
+        r"if\s*\(\s*state\s*==\s*NULL\s*\)\s*\{\s*"
+        r"saveFile->Error\s*\(\s*\"stateCall_t::Restore: unknown state '%s' for owner class '%s'\"\s*,\s*"
+        r"name\.c_str\s*\(\s*\)\s*,\s*owner->GetClassname\s*\(\s*\)\s*\)\s*;\s*\}\s*"
+        r"saveFile->ReadInt\s*\(\s*flags\s*\)",
+        f"{tree} restored state names are validated before state payload use",
+    )
+
+
 def validate_representative_count_guards(tree: str) -> None:
     required_sources = {
+        f"src/{tree}/Mover.cpp": (
+            "if ( buddies.Num() > MAX_SAVEGAME_MOVER_BUDDIES )",
+            "idMover_Binary::Save: invalid buddy count",
+            "buddies.Clear();",
+            "if ( num < 0 || num > MAX_SAVEGAME_MOVER_BUDDIES )",
+            "idMover_Binary::Restore: invalid buddy count",
+        ),
         f"src/{tree}/Player.cpp": (
             "if ( num < 0 || num > MAX_SAVEGAME_INVENTORY_ITEMS )",
             "invalid item count",
@@ -635,6 +794,249 @@ def validate_sp_mp_restore_guard_parity() -> None:
         raise AssertionError("SP/MP restore guard parity drifted:\n" + "\n".join(details))
 
 
+def validate_portable_layout_migrations(tree: str) -> None:
+    savegame_header = read(f"src/{tree}/gamesys/SaveGame.h")
+    savegame_source = read(f"src/{tree}/gamesys/SaveGame.cpp")
+    accessor = "GetOpenQ4SaveGameCompatibilityVersion( void ) const"
+    require(savegame_header, accessor, f"{tree} savegame version accessor declaration")
+    require(savegame_source, accessor, f"{tree} savegame version accessor definition")
+
+    version_branch = (
+        "GetOpenQ4SaveGameCompatibilityVersion() == "
+        "OPENQ4_SAVEGAME_COMPATIBILITY_VERSION"
+    )
+    migrations = {
+        "Entity.cpp": (
+            "packedFlags |= fl.quickBurn ? BIT( 19 ) : 0;",
+            "savefile->WriteInt( packedFlags );",
+            "savefile->ReadInt( packedFlags );",
+            "savefile->Read( &fl, sizeof( fl ) );",
+        ),
+        "Player.cpp": (
+            "packedFlags |= pfl.noFallingDamage ? BIT( 21 ) : 0;",
+            "savefile->WriteInt( packedFlags );",
+            "savefile->ReadInt( packedFlags );",
+            "savefile->Read( &pfl, sizeof( pfl ) );",
+        ),
+        "Weapon.cpp": (
+            "packedWeaponFlags |= wfl.hasWindupAnim ? BIT( 8 ) : 0;",
+            "savefile->WriteInt( packedStateFlags );",
+            "savefile->ReadInt( packedWeaponFlags );",
+            "savefile->Read( &wsfl, sizeof( wsfl ) );",
+            "savefile->Read( &wfl, sizeof( wfl ) );",
+        ),
+        "Projectile.cpp": (
+            "packedFlags |= projectileFlags.isTracer ? BIT( 4 ) : 0;",
+            "savefile->WriteInt( packedFlags );",
+            "savefile->ReadInt( packedFlags );",
+            "savefile->Read( &projectileFlags, sizeof( projectileFlags ) );",
+        ),
+        "Mover.cpp": (
+            "savefile->WriteVec3( move.dir );",
+            "savefile->WriteAngles( rot.rot );",
+            "idMover::Restore: invalid movement stage",
+            "idMover::Restore: invalid rotation stage",
+            "savefile->Read( &move, sizeof( move ) );",
+            "savefile->Read( &rot, sizeof( rot ) );",
+        ),
+        "IK.cpp": (
+            "savefile->WriteJoint( footJoints[i] );",
+            "savefile->WriteMat3( upperLegToHipJoint[i] );",
+            "savefile->Read( footJoints, sizeof( footJoints ) );",
+            "savefile->Read( upperLegToHipJoint, sizeof( upperLegToHipJoint ) );",
+            "idIK_Walk::Restore: invalid leg count",
+            "idIK_Reach::Restore: invalid arm count",
+        ),
+        "gamesys/State.cpp": (
+            "packedFlags |= fl.executing ? BIT( 2 ) : 0;",
+            "saveFile->WriteInt( packedFlags );",
+            "saveFile->ReadInt( packedFlags );",
+            "saveFile->Read( &fl, sizeof( fl ) );",
+        ),
+        "physics/Physics_RigidBody.cpp": (
+            "savefile->WriteVec6( state.pushVelocity );",
+            "savefile->ReadVec6( state.pushVelocity );",
+            "savefile->Read( &state.pushVelocity, sizeof( state.pushVelocity ) );",
+        ),
+        "ai/AI_Actions.cpp": (
+            "packedFlags |= fl.noSimpleThink ? BIT( 6 ) : 0;",
+            "savefile->Read( &fl, sizeof( fl ) );",
+        ),
+        "ai/AI_Move.cpp": (
+            "packedFlags |= fl.noRangedInterrupt ? BIT( 22 ) : 0;",
+            "savefile->Read( &fl, sizeof( fl ) );",
+        ),
+        "ai/AI.cpp": (
+            "packedFlags |= aifl.killerGuard ? BIT( 20 ) : 0;",
+            "packedFlags |= combat.fl.crouchViewClear ? BIT( 8 ) : 0;",
+            "packedFlags |= passive.fl.fidget ? BIT( 2 ) : 0;",
+            "packedFlags |= enemy.fl.visible ? BIT( 4 ) : 0;",
+            "savefile->Read( &aifl, sizeof( aifl ) );",
+            "savefile->Read( &combat.fl, sizeof( combat.fl ) );",
+            "savefile->Read( &passive.fl, sizeof( passive.fl ) );",
+            "savefile->Read( &enemy.fl, sizeof( enemy.fl ) );",
+        ),
+    }
+
+    for relative_path, tokens in migrations.items():
+        source = read(f"src/{tree}/{relative_path}")
+        require(source, version_branch, f"{tree} v2/v3 layout branch in {relative_path}")
+        for token in tokens:
+            require(source, token, f"{tree} portable layout migration in {relative_path}")
+
+    packed_layouts = (
+        (
+            "Entity.cpp",
+            "fl",
+            "packedFlags",
+            (
+                "notarget", "noknockback", "takedamage", "hidden", "bindOrientated",
+                "solidForTeam", "forcePhysicsUpdate", "selected", "neverDormant", "isDormant",
+                "hasAwakened", "networkSync", "networkStale", "triggerAnim", "usable",
+                "isAIObstacle", "persistAcrossInstances", "exitedVehicle", "allowAutoBlink", "quickBurn",
+            ),
+        ),
+        (
+            "Player.cpp",
+            "pfl",
+            "packedFlags",
+            (
+                "forward", "backward", "strafeLeft", "strafeRight", "attackHeld", "weaponFired",
+                "jump", "crouch", "onGround", "onLadder", "dead", "run", "pain", "hardLanding",
+                "softLanding", "reload", "teleport", "turnLeft", "turnRight", "hearingLoss",
+                "objectiveFailed", "noFallingDamage",
+            ),
+        ),
+        (
+            "Projectile.cpp",
+            "projectileFlags",
+            "packedFlags",
+            (
+                "detonate_on_world", "detonate_on_actor", "detonate_on_bounce",
+                "randomShaderSpin", "isTracer",
+            ),
+        ),
+        (
+            "Weapon.cpp",
+            "wsfl",
+            "packedStateFlags",
+            (
+                "attack", "reload", "netReload", "netEndReload", "raiseWeapon", "lowerWeapon",
+                "flashlight", "zoom",
+            ),
+        ),
+        (
+            "Weapon.cpp",
+            "wfl",
+            "packedWeaponFlags",
+            (
+                "attackAltHitscan", "attackHitscan", "hide", "disabled", "hasBloodSplat",
+                "silent_fire", "zoomHideCrosshair", "flashlightOn", "hasWindupAnim",
+            ),
+        ),
+        (
+            "ai/AI_Actions.cpp",
+            "fl",
+            "packedFlags",
+            ("disabled", "noPain", "noTurn", "isAttack", "isMelee", "overrideLegs", "noSimpleThink"),
+        ),
+        (
+            "ai/AI_Move.cpp",
+            "fl",
+            "packedFlags",
+            (
+                "done", "moving", "crouching", "running", "blocked", "obstacleInPath",
+                "goalUnreachable", "onGround", "flyTurning", "idealRunning", "disabled",
+                "ignoreObstacles", "allowDirectional", "allowAnimMove", "allowPrevAnimMove",
+                "allowHiddenMove", "allowPushMovables", "allowSlideToGoal", "noRun", "noWalk",
+                "noTurn", "noGravity", "noRangedInterrupt",
+            ),
+        ),
+        (
+            "ai/AI.cpp",
+            "aifl",
+            "packedFlags",
+            (
+                "awake", "damage", "pain", "dead", "activated", "jump", "hitEnemy", "pushed",
+                "disableAttacks", "scriptedEndWithIdle", "scriptedNeverDormant", "scripted",
+                "simpleThink", "ignoreFlashlight", "action", "lookAtPlayer", "disableLook",
+                "undying", "tetherMover", "meleeSuperhero", "killerGuard",
+            ),
+        ),
+        (
+            "ai/AI.cpp",
+            "combat.fl",
+            "packedFlags",
+            (
+                "ignoreEnemies", "alert", "aware", "tetherNoBreak", "tetherAutoBreak",
+                "tetherOutOfRange", "seenEnemyDirectly", "noChatter", "crouchViewClear",
+            ),
+        ),
+        (
+            "ai/AI.cpp",
+            "passive.fl",
+            "packedFlags",
+            ("disabled", "multipleIdles", "fidget"),
+        ),
+        (
+            "ai/AI.cpp",
+            "enemy.fl",
+            "packedFlags",
+            ("lockOrigin", "dead", "inFov", "sighted", "visible"),
+        ),
+        (
+            "gamesys/State.cpp",
+            "fl",
+            "packedFlags",
+            ("stateCleared", "stateInterrupted", "executing"),
+        ),
+    )
+    for relative_path, prefix, packed_name, fields in packed_layouts:
+        source = read(f"src/{tree}/{relative_path}")
+        for bit, field in enumerate(fields):
+            require(
+                source,
+                f"{packed_name} |= {prefix}.{field} ? BIT( {bit} ) : 0;",
+                f"{tree} packed write schema for {prefix}.{field}",
+            )
+            require(
+                source,
+                f"{prefix}.{field} = ( {packed_name} & BIT( {bit} ) ) != 0;",
+                f"{tree} packed restore schema for {prefix}.{field}",
+            )
+
+    actual_raw_writes: dict[str, int] = {}
+    source_root = ROOT / "src" / tree
+    for path in sorted(source_root.rglob("*.cpp")):
+        count = len(RAW_SAVE_WRITE_PATTERN.findall(path.read_text(encoding="utf-8")))
+        if count:
+            relative_path = str(path.relative_to(source_root)).replace("\\", "/")
+            actual_raw_writes[relative_path] = count
+    if actual_raw_writes != EXPECTED_RAW_SAVE_WRITE_COUNTS:
+        raise AssertionError(
+            f"{tree} raw save-write inventory drifted:\n"
+            f"expected={EXPECTED_RAW_SAVE_WRITE_COUNTS}\nactual={actual_raw_writes}"
+        )
+
+
+def validate_packed_flag_wire_model() -> None:
+    for width in (3, 5, 7, 8, 9, 20, 21, 22, 23):
+        mask = (1 << width) - 1
+        samples = (0, mask, mask & 0x55555555, mask & 0xAAAAAAAA)
+        for sample in samples:
+            fields = tuple(bool(sample & (1 << bit)) for bit in range(width))
+            packed = sum((1 << bit) for bit, enabled in enumerate(fields) if enabled)
+            if packed != sample:
+                raise AssertionError(
+                    f"packed flag model failed for width={width}: {packed:#x} != {sample:#x}"
+                )
+            restored = tuple(bool(packed & (1 << bit)) for bit in range(width))
+            if restored != fields:
+                raise AssertionError(f"packed flag restore model failed for width={width}")
+            if struct.unpack("<i", struct.pack("<i", packed))[0] != packed:
+                raise AssertionError(f"packed flag fixed-width encoding failed for width={width}")
+
+
 def validate_ci_wiring() -> None:
     workflow = read(".github/workflows/commit-validation.yml")
     for token in (
@@ -646,14 +1048,19 @@ def validate_ci_wiring() -> None:
 
 def main() -> None:
     validate_restore_fuzz_model()
+    validate_packed_flag_wire_model()
     for tree in GAME_TREES:
         validate_domain_caps(tree)
         validate_restore_io_guards(tree)
+        validate_object_reference_guards(tree)
         validate_game_local_restore_guards(tree)
         validate_entity_restore_guards(tree)
         validate_brittle_fracture_guards(tree)
+        validate_ai_manager_restore_guards(tree)
+        validate_state_restore_guards(tree)
         validate_representative_count_guards(tree)
         reject_nested_count_regressions(tree)
+        validate_portable_layout_migrations(tree)
     validate_sp_mp_restore_guard_parity()
     validate_ci_wiring()
     print("savegame_corruption_contract: ok")

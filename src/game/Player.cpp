@@ -1580,7 +1580,7 @@ bool idInventory::Give( idPlayer *owner, const idDict &spawnArgs, const char *st
 				len = end - pos;
 				end++;
 			} else {
-				len = strlen( pos );
+				len = idLib::SizeToInt( strlen( pos ), "idInventory::Give" );
 			}
 
 			idStr weaponName( pos, 0, len );
@@ -1862,6 +1862,13 @@ idPlayer::idPlayer() {
 	airless					= false;
 	airTics					= 0;
 	lastAirDamage			= 0;
+
+// openQ4 BEGIN
+	previousWaterLevel		= WATERLEVEL_NONE;
+	previousWaterType		= 0;
+	nextLiquidDamageTime	= 0;
+	drownDamage				= 1;
+// openQ4 END
 
 	gibDeath				= false;
 	gibsLaunched			= false;
@@ -2322,6 +2329,15 @@ void idPlayer::Init( void ) {
 	airTics = pm_airTics.GetFloat();
 	airless = false;
 
+// openQ4 BEGIN
+	previousWaterLevel = WATERLEVEL_NONE;
+	previousWaterType = 0;
+	// A short grace period: the settle frames at the end of a map load run the player's think, and
+	// hurting the player there happens before the level is really playable.
+	nextLiquidDamageTime = gameLocal.time + 1000;
+	drownDamage = 1;
+// openQ4 END
+
 	gibDeath = false;
 	gibsLaunched = false;
 	gibDir.Zero();
@@ -2781,6 +2797,12 @@ void idPlayer::Spawn( void ) {
 	declManager->FindType( DECL_ENTITYDEF, "damage_hardfall", false, false );
 	declManager->FindType( DECL_ENTITYDEF, "damage_softfall", false, false );
 	declManager->FindType( DECL_ENTITYDEF, "damage_noair", false, false );
+// openQ4 BEGIN
+	declManager->FindType( DECL_ENTITYDEF, "damage_openq4_drown", false, false );
+	declManager->FindType( DECL_ENTITYDEF, "damage_openq4_lava", false, false );
+	declManager->FindType( DECL_ENTITYDEF, "damage_openq4_slime", false, false );
+	declManager->FindType( DECL_ENTITYDEF, "liquid_openq4", false, false );
+// openQ4 END
 	declManager->FindType( DECL_ENTITYDEF, "damage_suicide", false, false );
 	declManager->FindType( DECL_ENTITYDEF, "damage_telefrag", false, false );
 	declManager->FindType( DECL_ENTITYDEF, "dmg_shellshock", false, false );
@@ -2856,6 +2878,7 @@ idPlayer::Save
 */
 void idPlayer::Save( idSaveGame *savefile ) const {
 	int i;
+	int packedFlags;
 
 	savefile->WriteUsercmd( usercmd );
 
@@ -2880,7 +2903,30 @@ void idPlayer::Save( idSaveGame *savefile ) const {
 	savefile->WriteInt( lastSavingThrowTime );
 
 	// idBoolFields don't need to be saved, just re-linked in Restore
-	savefile->Write( &pfl, sizeof( pfl ) );
+	packedFlags = 0;
+	packedFlags |= pfl.forward ? BIT( 0 ) : 0;
+	packedFlags |= pfl.backward ? BIT( 1 ) : 0;
+	packedFlags |= pfl.strafeLeft ? BIT( 2 ) : 0;
+	packedFlags |= pfl.strafeRight ? BIT( 3 ) : 0;
+	packedFlags |= pfl.attackHeld ? BIT( 4 ) : 0;
+	packedFlags |= pfl.weaponFired ? BIT( 5 ) : 0;
+	packedFlags |= pfl.jump ? BIT( 6 ) : 0;
+	packedFlags |= pfl.crouch ? BIT( 7 ) : 0;
+	packedFlags |= pfl.onGround ? BIT( 8 ) : 0;
+	packedFlags |= pfl.onLadder ? BIT( 9 ) : 0;
+	packedFlags |= pfl.dead ? BIT( 10 ) : 0;
+	packedFlags |= pfl.run ? BIT( 11 ) : 0;
+	packedFlags |= pfl.pain ? BIT( 12 ) : 0;
+	packedFlags |= pfl.hardLanding ? BIT( 13 ) : 0;
+	packedFlags |= pfl.softLanding ? BIT( 14 ) : 0;
+	packedFlags |= pfl.reload ? BIT( 15 ) : 0;
+	packedFlags |= pfl.teleport ? BIT( 16 ) : 0;
+	packedFlags |= pfl.turnLeft ? BIT( 17 ) : 0;
+	packedFlags |= pfl.turnRight ? BIT( 18 ) : 0;
+	packedFlags |= pfl.hearingLoss ? BIT( 19 ) : 0;
+	packedFlags |= pfl.objectiveFailed ? BIT( 20 ) : 0;
+	packedFlags |= pfl.noFallingDamage ? BIT( 21 ) : 0;
+	savefile->WriteInt( packedFlags );
 
 	inventory.Save( savefile );
 	
@@ -2997,6 +3043,13 @@ void idPlayer::Save( idSaveGame *savefile ) const {
  	savefile->WriteBool( airless );
 	savefile->WriteInt( airTics );
 	savefile->WriteInt( lastAirDamage );
+
+// openQ4 BEGIN
+	savefile->WriteInt( (int)previousWaterLevel );
+	savefile->WriteInt( previousWaterType );
+	savefile->WriteInt( nextLiquidDamageTime );
+	savefile->WriteInt( drownDamage );
+// openQ4 END
 
 	savefile->WriteBool( gibDeath );
 	savefile->WriteBool( gibsLaunched );
@@ -3119,6 +3172,7 @@ idPlayer::Restore
 void idPlayer::Restore( idRestoreGame *savefile ) {
 	int	  i;
 	int   num;
+	int   packedFlags;
 
 	savefile->ReadUsercmd( usercmd );
 
@@ -3149,7 +3203,33 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
  	savefile->ReadInt( foo );
 	savefile->ReadInt( lastSavingThrowTime );
 
-	savefile->Read( &pfl, sizeof( pfl ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedFlags );
+		pfl.forward = ( packedFlags & BIT( 0 ) ) != 0;
+		pfl.backward = ( packedFlags & BIT( 1 ) ) != 0;
+		pfl.strafeLeft = ( packedFlags & BIT( 2 ) ) != 0;
+		pfl.strafeRight = ( packedFlags & BIT( 3 ) ) != 0;
+		pfl.attackHeld = ( packedFlags & BIT( 4 ) ) != 0;
+		pfl.weaponFired = ( packedFlags & BIT( 5 ) ) != 0;
+		pfl.jump = ( packedFlags & BIT( 6 ) ) != 0;
+		pfl.crouch = ( packedFlags & BIT( 7 ) ) != 0;
+		pfl.onGround = ( packedFlags & BIT( 8 ) ) != 0;
+		pfl.onLadder = ( packedFlags & BIT( 9 ) ) != 0;
+		pfl.dead = ( packedFlags & BIT( 10 ) ) != 0;
+		pfl.run = ( packedFlags & BIT( 11 ) ) != 0;
+		pfl.pain = ( packedFlags & BIT( 12 ) ) != 0;
+		pfl.hardLanding = ( packedFlags & BIT( 13 ) ) != 0;
+		pfl.softLanding = ( packedFlags & BIT( 14 ) ) != 0;
+		pfl.reload = ( packedFlags & BIT( 15 ) ) != 0;
+		pfl.teleport = ( packedFlags & BIT( 16 ) ) != 0;
+		pfl.turnLeft = ( packedFlags & BIT( 17 ) ) != 0;
+		pfl.turnRight = ( packedFlags & BIT( 18 ) ) != 0;
+		pfl.hearingLoss = ( packedFlags & BIT( 19 ) ) != 0;
+		pfl.objectiveFailed = ( packedFlags & BIT( 20 ) ) != 0;
+		pfl.noFallingDamage = ( packedFlags & BIT( 21 ) ) != 0;
+	} else {
+		savefile->Read( &pfl, sizeof( pfl ) );
+	}
 
 	inventory.Restore( savefile );
 
@@ -3278,6 +3358,13 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 	savefile->ReadInt( airTics );
 	savefile->ReadInt( lastAirDamage );
 
+// openQ4 BEGIN
+	savefile->ReadInt( (int &)previousWaterLevel );
+	savefile->ReadInt( previousWaterType );
+	savefile->ReadInt( nextLiquidDamageTime );
+	savefile->ReadInt( drownDamage );
+// openQ4 END
+
 	savefile->ReadBool( gibDeath );
 	savefile->ReadBool( gibsLaunched );
 	savefile->ReadVec3( gibDir );
@@ -3292,12 +3379,12 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 
 	savefile->ReadFloat( influenceFov );
 	savefile->ReadInt( influenceActive );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( influenceEntity ) );
+	savefile->ReadObject( influenceEntity );
 	savefile->ReadMaterial( influenceMaterial );
 	savefile->ReadFloat( influenceRadius );
 	savefile->ReadSkin( influenceSkin );
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( privateCameraView ) );
+	savefile->ReadObject( privateCameraView );
 
 	for( i = 0; i < NUM_LOGGED_VIEW_ANGLES; i++ ) {
 		savefile->ReadAngles( loggedViewAngles[ i ] );
@@ -3417,6 +3504,12 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 	declManager->FindType( DECL_ENTITYDEF, "damage_hardfall", false, false );
 	declManager->FindType( DECL_ENTITYDEF, "damage_softfall", false, false );
 	declManager->FindType( DECL_ENTITYDEF, "damage_noair", false, false );
+// openQ4 BEGIN
+	declManager->FindType( DECL_ENTITYDEF, "damage_openq4_drown", false, false );
+	declManager->FindType( DECL_ENTITYDEF, "damage_openq4_lava", false, false );
+	declManager->FindType( DECL_ENTITYDEF, "damage_openq4_slime", false, false );
+	declManager->FindType( DECL_ENTITYDEF, "liquid_openq4", false, false );
+// openQ4 END
 	declManager->FindType( DECL_ENTITYDEF, "damage_suicide", false, false );
 	declManager->FindType( DECL_ENTITYDEF, "damage_telefrag", false, false );
 	declManager->FindType( DECL_ENTITYDEF, "dmg_shellshock", false, false );
@@ -3750,6 +3843,10 @@ void idPlayer::SpawnToPoint( const idVec3 &spawn_origin, const idAngles &spawn_a
 
 	lastImpulsePlayer = NULL;
 	lastImpulseTime = 0;
+
+// openQ4 BEGIN
+	SpawnLiquidTestVolume();
+// openQ4 END
 }
 
 /*
@@ -5156,7 +5253,7 @@ bool idPlayer::Give( const char *statname, const char *value, bool dropped, bool
 					len = end - pos;
 					end++;
 				} else {
-					len = strlen( pos );
+					len = idLib::SizeToInt( strlen( pos ), "idPlayer::Give" );
 				}
 
 				idStr weaponMod ( pos, 0, len );
@@ -8897,8 +8994,227 @@ void idPlayer::UpdateViewAngles( void ) {
 idPlayer::UpdateAir
 ==============
 */
+// openQ4 BEGIN
+/*
+==============
+GetLiquidPresentationDict
+
+Every liquid sound and effect is keyed off one def so a mod can retarget the whole set without
+touching code. A missing def, or a missing key inside it, is not an error - that part of the
+presentation is simply silent, which keeps the system working against stock Quake 4 assets.
+==============
+*/
+static const idDict *GetLiquidPresentationDict( void ) {
+	return gameLocal.FindEntityDefDict( "liquid_openq4", false );
+}
+
+/*
+==============
+LiquidTypeSuffix
+
+Maps content bits to the name used in the presentation keys, e.g. "fx_splash_lava".
+==============
+*/
+static const char *LiquidTypeSuffix( int waterType ) {
+	if ( waterType & CONTENTS_LAVA ) {
+		return "lava";
+	}
+	if ( waterType & CONTENTS_SLIME ) {
+		return "slime";
+	}
+	return "water";
+}
+
+/*
+==============
+idPlayer::PlayLiquidSound
+
+Thin wrappers over the shared liquid presentation, which monsters use as well.
+==============
+*/
+void idPlayer::PlayLiquidSound( const char *key, const s_channelType channel ) {
+	gameLocal.PlayLiquidSoundOn( this, key, channel );
+}
+
+/*
+==============
+idPlayer::PlayLiquidEffect
+==============
+*/
+void idPlayer::PlayLiquidEffect( const char *key, const idVec3 &origin ) {
+	gameLocal.PlayLiquidEffectAt( key, origin );
+}
+
+/*
+==============
+idPlayer::SpawnLiquidTestVolume
+
+Dev aid. No Quake 4 map contains a liquid volume - nothing in the retail data declares liquid
+contents at all - so g_liquidTestVolume drops one around the player as they spawn, which is the
+only way to exercise any of this in a stock map. Set it to water, slime or lava; empty disables it.
+==============
+*/
+void idPlayer::SpawnLiquidTestVolume( void ) {
+	const char *liquid = g_liquidTestVolume.GetString();
+	if ( !liquid || !liquid[0] || gameLocal.isClient ) {
+		return;
+	}
+
+	const float half = g_liquidTestVolumeSize.GetFloat() * 0.5f;
+	const idVec3 origin = GetPhysics()->GetOrigin();
+
+	idDict dict;
+	dict.Set( "classname", "func_liquid_openq4" );
+	dict.Set( "liquid", liquid );
+	dict.Set( "origin", origin.ToString() );
+	dict.Set( "mins", idVec3( -half, -half, -half ).ToString() );
+	dict.Set( "maxs", idVec3(  half,  half,  half ).ToString() );
+
+	idEntity *volume = NULL;
+	if ( gameLocal.SpawnEntityDef( dict, &volume ) && volume ) {
+		gameLocal.Printf( "liquid: test volume '%s' %g units spawned at %s\n",
+					   liquid, half * 2.0f, origin.ToString() );
+	} else {
+		gameLocal.Warning( "g_liquidTestVolume: failed to spawn a '%s' volume", liquid );
+	}
+}
+
+/*
+==============
+idPlayer::SetLiquidBubbles
+
+A looping bubble trail from the head while the player is under. Quake 2 does this for a submerged
+player; Quake 3 dropped it. Bound to the head joint so it follows the swimmer.
+==============
+*/
+void idPlayer::SetLiquidBubbles( bool active, const char *liquid ) {
+	const idDict *liquidDict = GetLiquidPresentationDict();
+	if ( !liquidDict ) {
+		return;
+	}
+
+	const idDecl *effect = gameLocal.GetEffect( *liquidDict, va( "fx_bubbles_%s", liquid ) );
+	if ( !effect ) {
+		return;
+	}
+
+	if ( !active ) {
+		StopEffect( effect );
+		return;
+	}
+
+	// not every player model has a head joint; fall back to the body origin rather than binding
+	// the trail to an invalid joint
+	const jointHandle_t head = animator.GetJointHandle( "head" );
+	if ( head != INVALID_JOINT ) {
+		PlayEffect( effect, head, vec3_origin, mat3_identity, true, vec3_origin, true );
+	} else {
+		PlayEffect( effect, GetEyePosition(), GetPhysics()->GetAxis(), true, vec3_origin, true );
+	}
+}
+
+/*
+==============
+idPlayer::UpdateLiquid
+
+Quake 3's PM_WaterEvents, plus the sizzle half of P_WorldEffects. Drowning is not here: it lives in
+UpdateAir, which owns the air reservoir shared with vacuum areas.
+==============
+*/
+void idPlayer::UpdateLiquid( void ) {
+	if ( noclip || spectating ) {
+		if ( previousWaterLevel == WATERLEVEL_HEAD ) {
+			SetLiquidBubbles( false, LiquidTypeSuffix( previousWaterType ) );
+		}
+		previousWaterLevel = WATERLEVEL_NONE;
+		previousWaterType = 0;
+		return;
+	}
+
+	// a client only runs full movement for the player it predicts, so remote players would never
+	// appear to enter the water. The server decides the events and broadcasts them instead.
+	if ( gameLocal.isClient ) {
+		return;
+	}
+
+	// idPlayer::SpawnToPoint runs a Think while the map is still spawning, so a player who starts
+	// inside a liquid would splash and burn before the level has finished loading - and damaging
+	// the player at that point wedges the load. Track the level, emit nothing, and let the first
+	// real frame own the events.
+	if ( gameLocal.GameState() != GAMESTATE_ACTIVE ) {
+		previousWaterLevel = physicsObj.GetWaterLevel();
+		previousWaterType = physicsObj.GetWaterType();
+		nextLiquidDamageTime = gameLocal.time + g_liquidDamageInterval.GetInteger();
+		return;
+	}
+
+	const waterLevel_t waterLevel = physicsObj.GetWaterLevel();
+	const int waterType = physicsObj.GetWaterType();
+
+	// on the way out the player has already left the volume, so the sound has to be chosen from
+	// what they were standing in a moment ago
+	const char *enteredLiquid = LiquidTypeSuffix( waterType );
+	const char *leftLiquid = LiquidTypeSuffix( previousWaterType );
+
+	// the splash belongs at the surface the player crossed, not at their feet
+	const idBounds &bounds = GetPhysics()->GetBounds();
+	idVec3 splashOrigin = GetPhysics()->GetOrigin();
+	splashOrigin.z += ( bounds[1].z - bounds[0].z ) * 0.5f;
+
+	if ( previousWaterLevel == WATERLEVEL_NONE && waterLevel != WATERLEVEL_NONE ) {
+		PlayLiquidSound( va( "snd_enter_%s", enteredLiquid ), SND_CHANNEL_BODY );
+		PlayLiquidEffect( va( "fx_splash_%s", enteredLiquid ), splashOrigin );
+	} else if ( previousWaterLevel != WATERLEVEL_NONE && waterLevel == WATERLEVEL_NONE ) {
+		PlayLiquidSound( va( "snd_leave_%s", leftLiquid ), SND_CHANNEL_BODY );
+		PlayLiquidEffect( va( "fx_splash_%s", leftLiquid ), splashOrigin );
+	}
+
+	if ( previousWaterLevel != WATERLEVEL_HEAD && waterLevel == WATERLEVEL_HEAD ) {
+		PlayLiquidSound( va( "snd_under_%s", enteredLiquid ), SND_CHANNEL_BODY );
+		SetLiquidBubbles( true, enteredLiquid );
+	} else if ( previousWaterLevel == WATERLEVEL_HEAD && waterLevel != WATERLEVEL_HEAD ) {
+		PlayLiquidSound( va( "snd_clear_%s", leftLiquid ), SND_CHANNEL_BODY );
+		SetLiquidBubbles( false, leftLiquid );
+	}
+
+	if ( g_debugLiquid.GetBool() && ( waterLevel != previousWaterLevel || waterType != previousWaterType ) ) {
+		gameLocal.Printf( "liquid: level %d -> %d, type 0x%x (%s), air %d/%d\n",
+					   (int)previousWaterLevel, (int)waterLevel, waterType,
+					   gameLocal.LiquidTypeName( waterType ), airTics, pm_airTics.GetInteger() );
+	}
+
+	previousWaterLevel = waterLevel;
+	previousWaterType = waterType;
+
+	// lava and slime burn at any depth, scaled by how much of the player is submerged, exactly as
+	// Quake 3's "30 * waterlevel" and "10 * waterlevel" do
+	if ( waterLevel == WATERLEVEL_NONE || health <= 0 ) {
+		return;
+	}
+	if ( !( waterType & ( CONTENTS_LAVA | CONTENTS_SLIME ) ) ) {
+		return;
+	}
+	if ( gameLocal.time < nextLiquidDamageTime ) {
+		return;
+	}
+	nextLiquidDamageTime = gameLocal.time + g_liquidDamageInterval.GetInteger();
+
+	if ( g_debugLiquid.GetBool() ) {
+		gameLocal.Printf( "liquid: burn tick in %s at level %d, health %d\n",
+					   gameLocal.LiquidTypeName( waterType ), (int)waterLevel, health );
+	}
+
+	if ( waterType & CONTENTS_LAVA ) {
+		Damage( NULL, NULL, vec3_origin, "damage_openq4_lava", (float)waterLevel, INVALID_JOINT );
+	}
+	if ( waterType & CONTENTS_SLIME ) {
+		Damage( NULL, NULL, vec3_origin, "damage_openq4_slime", (float)waterLevel, INVALID_JOINT );
+	}
+}
+// openQ4 END
+
 void idPlayer::UpdateAir( void ) {
-	
+
 	if ( health <= 0 ) {
 		return;
 	}
@@ -8923,6 +9239,38 @@ void idPlayer::UpdateAir( void ) {
 		}
 	}
 
+// openQ4 BEGIN
+	// A submerged head is just another way to be out of air, so drowning reuses the vacuum air
+	// reservoir along with its HUD readout and its sounds. Underwater the reservoir drains faster,
+	// so a full bar is pm_waterAir frames of swimming but still pm_air frames of vacuum.
+	const bool drowning = ( physicsObj.GetWaterLevel() == WATERLEVEL_HEAD ) && !noclip && !spectating;
+	int airDrain = 1;
+
+	if ( drowning ) {
+		// Drain the whole reservoir over pm_waterAir frames. A plain division truncates - with the
+		// stock 1800 and 720 it gives 2 instead of 2.5, and twelve seconds of air becomes fifteen -
+		// so spread the remainder across frames the way Bresenham spreads a line, which needs no
+		// saved carry.
+		const int waterAir = pm_waterAirTics.GetInteger() > 0 ? pm_waterAirTics.GetInteger() : 1;
+		const int fullAir = pm_airTics.GetInteger() > 0 ? pm_airTics.GetInteger() : 1;
+		const int remainder = fullAir % waterAir;
+
+		airDrain = fullAir / waterAir;
+		if ( remainder && ( ( gameLocal.framenum * remainder ) % waterAir ) < remainder ) {
+			airDrain++;
+		}
+		if ( airDrain < 1 ) {
+			airDrain = 1;
+		}
+		newAirless = true;
+	}
+
+	if ( g_debugLiquid.GetBool() && drowning && ( gameLocal.framenum % 60 ) == 0 ) {
+		gameLocal.Printf( "liquid: submerged, air %d/%d draining %d per frame, health %d\n",
+					   airTics, pm_airTics.GetInteger(), airDrain, health );
+	}
+// openQ4 END
+
 	if ( newAirless ) {
 		if ( !airless ) {
  			StartSound( "snd_decompress", SND_CHANNEL_ANY, SSF_GLOBAL, false, NULL );
@@ -8931,9 +9279,34 @@ void idPlayer::UpdateAir( void ) {
 				hud->HandleNamedEvent( "noAir" );
 			}
 		}
-		airTics--;
+		airTics -= airDrain;
 		if ( airTics < 0 ) {
 			airTics = 0;
+// openQ4 BEGIN
+			// Drowning has its own damage def and Quake 3's rising ramp: it starts at the def's
+			// own damage and climbs by that much each second until it reaches g_drownDamageMax.
+			if ( drowning ) {
+				if ( !gameLocal.isClient && gameLocal.time > lastAirDamage + 1000 ) {
+					const idDict *drownDef = gameLocal.FindEntityDefDict( "damage_openq4_drown", false );
+					const float baseDamage = drownDef ? drownDef->GetFloat( "damage", "2" ) : 2.0f;
+					float wantedDamage = baseDamage * drownDamage;
+					if ( wantedDamage > g_drownDamageMax.GetFloat() ) {
+						wantedDamage = g_drownDamageMax.GetFloat();
+					}
+
+					if ( g_debugLiquid.GetBool() ) {
+						gameLocal.Printf( "liquid: drowning for %g, health %d\n", wantedDamage, health );
+					}
+
+					PlayLiquidSound( "snd_drown", SND_CHANNEL_VOICE );
+					Damage( NULL, NULL, vec3_origin, "damage_openq4_drown",
+							baseDamage > 0.0f ? wantedDamage / baseDamage : 1.0f, 0 );
+
+					drownDamage++;
+					lastAirDamage = gameLocal.time;
+				}
+			} else {
+// openQ4 END
 			// check for damage
 			const idDict *damageDef = gameLocal.FindEntityDefDict( "damage_noair", false );
 			int dmgTiming = 1000 * ((damageDef) ? damageDef->GetFloat( "delay", "3.0" ) : 3.0f );
@@ -8941,8 +9314,11 @@ void idPlayer::UpdateAir( void ) {
 				Damage( NULL, NULL, vec3_origin, "damage_noair", 1.0f, 0 );
 				lastAirDamage = gameLocal.time;
 			}
+// openQ4 BEGIN
+			}
+// openQ4 END
 		}
-		
+
 	} else {
 		if ( airless ) {
  			StartSound( "snd_recompress", SND_CHANNEL_ANY, SSF_GLOBAL, false, NULL );
@@ -8955,6 +9331,10 @@ void idPlayer::UpdateAir( void ) {
 		if ( airTics > pm_airTics.GetInteger() ) {
 			airTics = pm_airTics.GetInteger();
 		}
+// openQ4 BEGIN
+		// surfacing resets the drowning ramp
+		drownDamage = 1;
+// openQ4 END
 	}
 
 	airless = newAirless;
@@ -10681,8 +11061,12 @@ void idPlayer::Think( void ) {
 		UpdateWeapon();
 	}
 
+// openQ4 BEGIN
+	UpdateLiquid();
+// openQ4 END
+
 	UpdateAir();
-	
+
 	UpdateHud();
 
 	UpdatePowerUps();

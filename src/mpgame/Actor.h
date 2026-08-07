@@ -143,6 +143,7 @@ public:
 	virtual bool			LoadAF( const char* keyname = NULL, bool purgeAF = false );
 	void					SetupBody( void );
 
+	virtual void			ThinkMatchPaused( int deltaMsec );
 	virtual void			CheckBlink( void );
 
 	virtual bool			GetPhysicsToVisualTransform( idVec3 &origin, idMat3 &axis );

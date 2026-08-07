@@ -8,6 +8,14 @@
 idCVar si_voiceChat( "si_voiceChat", "1", CVAR_GAME | CVAR_BOOL | PC_CVAR_ARCHIVE | CVAR_SERVERINFO | CVAR_INFO, "enables or disables voice chat through the server" );
 idCVar g_voiceChatDebug( "g_voiceChatDebug", "0", CVAR_GAME | CVAR_INTEGER | CVAR_NOCHEAT, "display info on voicechat net traffic" );
 
+static bool ManagedVoiceTransportAllows( idPlayer *from, idPlayer *to,
+		bool echo ) {
+	if ( from == NULL || to == NULL || to->IsPlayerMuted( from ) ) {
+		return false;
+	}
+	return from != to || echo;
+}
+
 void idMultiplayerGame::ReceiveAndForwardVoiceData( int clientNum, const idBitMsg &inMsg, int messageType ) {
 	assert( clientNum >= 0 && clientNum < MAX_CLIENTS );
 
@@ -15,9 +23,35 @@ void idMultiplayerGame::ReceiveAndForwardVoiceData( int clientNum, const idBitMs
 	int			i;
 	byte		msgBuf[MAX_VOICE_PACKET_SIZE + 2];
 	idPlayer *	from;
-	
-	from = ( idPlayer * )gameLocal.entities[clientNum];
-	if( !gameLocal.serverInfo.GetBool( "si_voiceChat" ) || !from ) {
+	const bool managedTeamCommunicationRequested = gameLocal.isServer &&
+		matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH );
+	bool managedTeamCommunication = false;
+	mpMatchTeamCommunicationBinding_t managedSender;
+
+	if ( clientNum < 0 || clientNum >= gameLocal.numClients ||
+		clientNum >= MAX_CLIENTS ||
+		!gameLocal.serverInfo.GetBool( "si_voiceChat" ) ) {
+		return;
+	}
+	idEntity *fromEntity = gameLocal.entities[ clientNum ];
+	if ( fromEntity == NULL ||
+		!fromEntity->IsType( idPlayer::GetClassType() ) ) {
+		return;
+	}
+	from = static_cast<idPlayer *>( fromEntity );
+
+	if ( managedTeamCommunicationRequested ) {
+		if ( !IsManagedTeamCommunicationActive() ||
+			!BuildManagedTeamCommunicationBinding( clientNum, managedSender ) ||
+			!MPMatchMayReceiveManagedTeamVoice( matchSession, managedSender,
+				managedSender ) ) {
+			return;
+		}
+		managedTeamCommunication = true;
+	}
+
+	const int payloadBytes = inMsg.GetRemainingData();
+	if ( payloadBytes <= 0 || payloadBytes > MAX_VOICE_PACKET_SIZE ) {
 		return;
 	}
 
@@ -25,44 +59,64 @@ void idMultiplayerGame::ReceiveAndForwardVoiceData( int clientNum, const idBitMs
 	outMsg.Init( msgBuf, sizeof( msgBuf ) );
 	outMsg.WriteByte( GAME_UNRELIABLE_MESSAGE_VOICEDATA_SERVER );
 	outMsg.WriteByte( clientNum );
-	outMsg.WriteData( inMsg.GetReadData(), inMsg.GetRemainingData() );
+	outMsg.WriteData( inMsg.GetReadData(), payloadBytes );
 
 	if( g_voiceChatDebug.GetInteger() & 2 ) {
-		common->Printf( "VC: Received %d bytes, forwarding...\n", inMsg.GetRemainingData() );
+		common->Printf( "VC: Received %d bytes, forwarding...\n", payloadBytes );
 	}
 
 	// Forward to appropriate parties
 	for( i = 0; i < gameLocal.numClients; i++ )  {
-		idPlayer* to = ( idPlayer * )gameLocal.entities[i];
-		if( to && to->GetUserInfo() && to->GetUserInfo()->GetBool( "s_voiceChatReceive" ) )
+		idEntity *toEntity = gameLocal.entities[ i ];
+		if ( toEntity == NULL ||
+			!toEntity->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+		idPlayer *to = static_cast<idPlayer *>( toEntity );
+		if ( to->GetUserInfo() == NULL ||
+			!to->GetUserInfo()->GetBool( "s_voiceChatReceive" ) ||
+			i == gameLocal.localClientNum ) {
+			continue;
+		}
+
+		bool mayReceive = false;
+		if ( managedTeamCommunication ) {
+			mpMatchTeamCommunicationBinding_t managedRecipient;
+			mayReceive = BuildManagedTeamCommunicationBinding( i,
+				managedRecipient ) &&
+				MPMatchMayReceiveManagedTeamVoice( matchSession, managedSender,
+					managedRecipient ) &&
+				ManagedVoiceTransportAllows( from, to, !!( messageType & 1 ) );
+		} else {
+			mayReceive = CanTalk( from, to, !!( messageType & 1 ) );
+		}
+		if ( !mayReceive ) {
+			continue;
+		}
+
+		if( messageType & 2 )
 		{
-			if( i != gameLocal.localClientNum && CanTalk( from, to, !!( messageType & 1 ) ) )
+			// If "from" is testing - then only send back to him
+			if( from == to )
 			{
-				if( messageType & 2 )
+				gameLocal.SendUnreliableMessage( outMsg, to->entityNumber );
+			}
+		}
+		else
+		{
+			if( to->AllowedVoiceDest( from->entityNumber ) )
+			{
+				gameLocal.SendUnreliableMessage( outMsg, to->entityNumber );
+				if( g_voiceChatDebug.GetInteger() & 2 )
 				{
-					// If "from" is testing - then only send back to him
-					if( from == to )
-					{
-						gameLocal.SendUnreliableMessage( outMsg, to->entityNumber );
-					}
+					common->Printf( " ... to client %d\n", to->entityNumber );
 				}
-				else
+			}
+			else
+			{
+				if( g_voiceChatDebug.GetInteger() )
 				{
-					if( to->AllowedVoiceDest( from->entityNumber ) )
-					{
-						gameLocal.SendUnreliableMessage( outMsg, to->entityNumber );
-						if( g_voiceChatDebug.GetInteger() & 2 )
-						{
-							common->Printf( " ... to client %d\n", to->entityNumber );
-						}
-					}
-					else
-					{
-						if( g_voiceChatDebug.GetInteger() )
-						{
-							common->Printf( " ... suppressed packet to client %d\n", to->entityNumber );
-						}
-					}
+					common->Printf( " ... suppressed packet to client %d\n", to->entityNumber );
 				}
 			}
 		}
@@ -71,19 +125,29 @@ void idMultiplayerGame::ReceiveAndForwardVoiceData( int clientNum, const idBitMs
 #ifdef _USE_VOICECHAT
 	// Listen servers need to manually call the receive function
 	if ( gameLocal.isListenServer ) {
-		// Skip over control byte
-		outMsg.ReadByte();
-        
 		idPlayer* to = gameLocal.GetLocalPlayer();
-		if( to->GetUserInfo()->GetBool( "s_voiceChatReceive" ) )
-		{
-			if( CanTalk( from, to, !!( messageType & 1 ) ) )
-			{
+		if ( to != NULL && to->GetUserInfo() != NULL &&
+			to->GetUserInfo()->GetBool( "s_voiceChatReceive" ) ) {
+			bool mayReceive = false;
+			if ( managedTeamCommunication ) {
+				mpMatchTeamCommunicationBinding_t managedRecipient;
+				mayReceive = BuildManagedTeamCommunicationBinding(
+					gameLocal.localClientNum, managedRecipient ) &&
+					MPMatchMayReceiveManagedTeamVoice( matchSession, managedSender,
+						managedRecipient ) &&
+					ManagedVoiceTransportAllows( from, to,
+						!!( messageType & 1 ) );
+			} else {
+				mayReceive = CanTalk( from, to, !!( messageType & 1 ) );
+			}
+			if ( mayReceive ) {
 				if( messageType & 2 )
 				{
 					// If "from" is testing - then only send back to him
 					if( from == to )
 					{
+						// Skip over the unreliable-message control byte.
+						outMsg.ReadByte();
 						ReceiveAndPlayVoiceData( outMsg );
 					}
 				}
@@ -95,6 +159,8 @@ void idMultiplayerGame::ReceiveAndForwardVoiceData( int clientNum, const idBitMs
 						{
 							common->Printf( " ... to local client %d\n", gameLocal.localClientNum );
 						}
+						// Skip over the unreliable-message control byte.
+						outMsg.ReadByte();
 						ReceiveAndPlayVoiceData( outMsg );
 					}
 				}

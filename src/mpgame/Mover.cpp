@@ -4,6 +4,7 @@
 
 #include "Game_local.h"
 #include "ai/AI_Manager.h"
+#include "mp/match/MatchDeadline.h"
 
 // a mover will update any gui entities in it's target list with 
 // a key/val pair of "mover" "state" from below.. guis can represent
@@ -178,8 +179,16 @@ void idMover::Save( idSaveGame *savefile ) const {
 
 	savefile->WriteStaticObject( physicsObj );
 
-	savefile->Write( &move, sizeof( move ) );
-	savefile->Write( &rot, sizeof( rot ) );
+	savefile->WriteInt( move.stage );
+	savefile->WriteInt( move.acceleration );
+	savefile->WriteInt( move.movetime );
+	savefile->WriteInt( move.deceleration );
+	savefile->WriteVec3( move.dir );
+	savefile->WriteInt( rot.stage );
+	savefile->WriteInt( rot.acceleration );
+	savefile->WriteInt( rot.movetime );
+	savefile->WriteInt( rot.deceleration );
+	savefile->WriteAngles( rot.rot );
 
 	savefile->WriteInt( move_thread );
 	savefile->WriteInt( rotate_thread );
@@ -247,13 +256,35 @@ idMover::Restore
 */
 void idMover::Restore( idRestoreGame *savefile ) {
 	int i, num;
+	int savedStage;
 	bool hasSpline = false;
 
 	savefile->ReadStaticObject( physicsObj );
 	RestorePhysics( &physicsObj );
 
-	savefile->Read( &move, sizeof( move ) );
-	savefile->Read( &rot, sizeof( rot ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( savedStage );
+		if ( savedStage < ACCELERATION_STAGE || savedStage > FINISHED_STAGE ) {
+			savefile->Error( "idMover::Restore: invalid movement stage %d", savedStage );
+		}
+		move.stage = static_cast<moveStage_t>( savedStage );
+		savefile->ReadInt( move.acceleration );
+		savefile->ReadInt( move.movetime );
+		savefile->ReadInt( move.deceleration );
+		savefile->ReadVec3( move.dir );
+		savefile->ReadInt( savedStage );
+		if ( savedStage < ACCELERATION_STAGE || savedStage > FINISHED_STAGE ) {
+			savefile->Error( "idMover::Restore: invalid rotation stage %d", savedStage );
+		}
+		rot.stage = static_cast<moveStage_t>( savedStage );
+		savefile->ReadInt( rot.acceleration );
+		savefile->ReadInt( rot.movetime );
+		savefile->ReadInt( rot.deceleration );
+		savefile->ReadAngles( rot.rot );
+	} else {
+		savefile->Read( &move, sizeof( move ) );
+		savefile->Read( &rot, sizeof( rot ) );
+	}
 
 	savefile->ReadInt( move_thread );
 	savefile->ReadInt( rotate_thread );
@@ -498,6 +529,21 @@ void idMover::Think( void ) {
 	}
 
 	idEntity::Think( );
+}
+
+void idMover::ThinkMatchPaused( int deltaMsec ) {
+	idEntity::ThinkMatchPaused( deltaMsec );
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+
+	if ( attenuate ) {
+		mpMatchShiftTimeOrigin( lastTime, deltaMsec );
+	}
+	if ( physicsObj.GetSpline() != NULL ) {
+		mpMatchShiftTimeOrigin( splineStartTime, deltaMsec );
+	}
+	splineStateThread.ShiftMatchTime( deltaMsec );
 }
 
 // abahr
@@ -2308,7 +2354,7 @@ void idElevator::UpdateFloorInfo ( void ) {
 
 	floorInfo.Clear ( );
 
-	len1 = strlen( "floorPos_" );
+	len1 = sizeof( "floorPos_" ) - 1;
 	const idKeyValue *kv = spawnArgs.MatchPrefix( "floorPos_", NULL );
 	while( kv ) {
 		str = kv->GetKey().Right( kv->GetKey().Length() - len1 );
@@ -2428,6 +2474,11 @@ void idElevator::Think( void ) {
 	} 
 	RunPhysics();
 	Present();
+}
+
+void idElevator::ThinkMatchPaused( int deltaMsec ) {
+	idMover::ThinkMatchPaused( deltaMsec );
+	mpMatchShiftOptionalDeadline( lastTouchTime, deltaMsec );
 }
 
 /*
@@ -3074,6 +3125,9 @@ void idMover_Binary::Save( idSaveGame *savefile ) const {
 	savefile->WriteInt( move_thread );
 	savefile->WriteInt( updateStatus );
 
+	if ( buddies.Num() > MAX_SAVEGAME_MOVER_BUDDIES ) {
+		gameLocal.Error( "idMover_Binary::Save: invalid buddy count %d", buddies.Num() );
+	}
 	savefile->WriteInt( buddies.Num() );
 	for ( i = 0; i < buddies.Num(); i++ ) {
 		savefile->WriteString( buddies[ i ] );
@@ -3106,8 +3160,8 @@ void idMover_Binary::Restore( idRestoreGame *savefile ) {
 	savefile->ReadVec3( pos2 );
 	savefile->ReadInt( (int &)moverState );
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( moveMaster ) );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( activateChain ) );
+	savefile->ReadObject( moveMaster );
+	savefile->ReadObject( activateChain );
 
 	savefile->ReadInt( soundPos1 );
 	savefile->ReadInt( sound1to2 );
@@ -3133,7 +3187,11 @@ void idMover_Binary::Restore( idRestoreGame *savefile ) {
 	savefile->ReadInt( move_thread );
 	savefile->ReadInt( updateStatus );
 
+	buddies.Clear();
 	savefile->ReadInt( num );
+	if ( num < 0 || num > MAX_SAVEGAME_MOVER_BUDDIES ) {
+		savefile->Error( "idMover_Binary::Restore: invalid buddy count %d", num );
+	}
 	for ( i = 0; i < num; i++ ) {
 		savefile->ReadString( temp );
 		buddies.Append( temp );
@@ -3999,6 +4057,13 @@ void idMover_Binary::ReadFromSnapshot( const idBitMsgDelta &msg ) {
 	}
 }
 
+void idMover_Binary::ThinkMatchPaused( int deltaMsec ) {
+	idEntity::ThinkMatchPaused( deltaMsec );
+	if ( moverState == MOVER_1TO2 || moverState == MOVER_2TO1 ) {
+		mpMatchShiftTimeOrigin( stateStartTime, deltaMsec );
+	}
+}
+
 /*
 ================
 idMover_Binary::SetPortalState
@@ -4148,7 +4213,7 @@ void idDoor::Restore( idRestoreGame *savefile ) {
 	savefile->ReadString( syncLock );
 	savefile->ReadInt( normalAxisIndex );
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( companionDoor ) );
+	savefile->ReadObject( companionDoor );
 
 // RAVEN BEGIN
 // abahr:
@@ -4314,6 +4379,11 @@ void idDoor::Think( void ) {
 			}
 		}
 	}
+}
+
+void idDoor::ThinkMatchPaused( int deltaMsec ) {
+	idMover_Binary::ThinkMatchPaused( deltaMsec );
+	mpMatchShiftOptionalDeadline( nextSndTriggerTime, deltaMsec );
 }
 
 /*

@@ -133,6 +133,7 @@ public:
 	// Virtual overrides
 	void				Spawn						( void );
 	virtual void		Think						( void );
+	void				ShiftMatchTime				( int deltaMsec );
 	virtual void		CleanupWeapon				( void ) {}
 	virtual void		WriteToSnapshot				( idBitMsgDelta &msg ) const;
 	virtual void		ReadFromSnapshot			( const idBitMsgDelta &msg );

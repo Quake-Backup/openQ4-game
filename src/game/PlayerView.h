@@ -88,6 +88,15 @@ private:
 	void				InfluenceVision( idUserInterface *hud, const renderView_t *view );
 	void				ScreenFade();
 
+// openQ4 BEGIN
+	// Liquid view treatment. Keyed off the eye position rather than the player's water level,
+	// because WATERLEVEL_HEAD only trips once the whole bounding box is under - the camera sits
+	// eight units lower than that standing, sixteen crouched, so the screen would stay clear
+	// while the view was visibly submerged.
+	int					LiquidAtEye( const renderView_t *view ) const;
+	void				LiquidOverlay( int liquidContents );
+// openQ4 END
+
 	screenBlob_t *		GetScreenBlob();
 
 	screenBlob_t		screenBlobs[MAX_SCREEN_BLOBS];

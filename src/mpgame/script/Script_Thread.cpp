@@ -428,9 +428,9 @@ idThread::Restore
 ================
 */
 void idThread::Restore( idRestoreGame *savefile ) {
-	savefile->ReadObject( reinterpret_cast<idClass *&>( currentThread ) );
+	savefile->ReadObject( currentThread );
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( waitingForThread ) );
+	savefile->ReadObject( waitingForThread );
 	savefile->ReadInt( waitingFor );
 	savefile->ReadInt( waitingUntil );
 	interpreter.Restore( savefile );
@@ -656,7 +656,7 @@ void idThread::KillThread( const char *name ) {
 	if ( ptr ) {
 		len = ptr - name;
 	} else {
-		len = strlen( name );
+		len = idLib::SizeToInt( strlen( name ), "idThread::KillThread" );
 	}
 
 	// kill only those threads whose name matches name
@@ -1860,7 +1860,7 @@ idThread::Event_StrLen
 void idThread::Event_StrLen( const char *string ) {
 	int len;
 
-	len = strlen( string );
+	len = idLib::SizeToInt( strlen( string ), "idThread::Event_StrLen" );
 	idThread::ReturnInt( len );
 }
 
@@ -1877,7 +1877,7 @@ void idThread::Event_StrLeft( const char *string, int num ) {
 		return;
 	}
 
-	len = strlen( string );
+	len = idLib::SizeToInt( strlen( string ), "idThread::Event_StrLeft" );
 	if ( len < num ) {
 		idThread::ReturnString( string );
 		return;
@@ -1900,7 +1900,7 @@ void idThread::Event_StrRight( const char *string, int num ) {
 		return;
 	}
 
-	len = strlen( string );
+	len = idLib::SizeToInt( strlen( string ), "idThread::Event_StrRight" );
 	if ( len < num ) {
 		idThread::ReturnString( string );
 		return;
@@ -1922,7 +1922,7 @@ void idThread::Event_StrSkip( const char *string, int num ) {
 		return;
 	}
 
-	len = strlen( string );
+	len = idLib::SizeToInt( strlen( string ), "idThread::Event_StrSkip" );
 	if ( len < num ) {
 		idThread::ReturnString( "" );
 		return;
@@ -1947,7 +1947,7 @@ void idThread::Event_StrMid( const char *string, int start, int num ) {
 	if ( start < 0 ) {
 		start = 0;
 	}
-	len = strlen( string );
+	len = idLib::SizeToInt( strlen( string ), "idThread::Event_StrMid" );
 	if ( start > len ) {
 		start = len;
 	}

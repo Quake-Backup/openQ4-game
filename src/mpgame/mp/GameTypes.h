@@ -14,6 +14,8 @@
 #ifndef __MP_GAMETYPES_H__
 #define __MP_GAMETYPES_H__
 
+#include "GameTypeIds.h"
+
 /*
 ===============================================================================
 
@@ -58,14 +60,33 @@ const int GTF_ANY_OBJECTIVE	= ( GTF_FLAG | GTF_OBELISK | GTF_CONTROLPOINT | GTF_
 ===============================================================================
 */
 
+// Construction is declared beside every descriptor so a mode cannot be
+// advertised without an authoritative game-state implementation.  This is a
+// module-local implementation detail rather than a wire value.
+typedef enum {
+	MP_GAMESTATE_NONE = 0,
+	MP_GAMESTATE_DM,
+	MP_GAMESTATE_TOURNEY,
+	MP_GAMESTATE_TEAMDM,
+	MP_GAMESTATE_CTF,
+	MP_GAMESTATE_DEADZONE,
+	MP_GAMESTATE_DUEL,
+	MP_GAMESTATE_CA,
+	MP_GAMESTATE_FREEZETAG,
+	MP_GAMESTATE_REDROVER,
+	MP_GAMESTATE_FACTORY_COUNT
+} mpGameStateFactory_t;
+
 typedef struct mpGameTypeInfo_s {
-	gameType_t		type;			// wire value; the table is indexed by it
-	const char *	name;			// si_gameType token
-	const char *	abbrev;			// short tag used by logs and stat reporting
-	const char *	localizedName;	// #str_ id shown in menus, HUD and scoreboard
-	const char *	entityFilter;	// si_entityFilter used when spawning map entities
-	const char *	mapDeclKey;		// map decl key that advertises support for this mode
-	int				flags;
+	gameType_t			type;			// wire value; the table is indexed by it
+	const char *		name;			// si_gameType token
+	const char *		abbrev;			// short tag used by logs and stat reporting
+	const char *		localizedName;	// #str_ id shown in menus, HUD and scoreboard
+	const char *		entityFilter;	// si_entityFilter used when spawning map entities
+	const char *		mapDeclKey;		// map decl key that advertises support for this mode
+	int					flags;
+	mpGameStateFactory_t	stateFactory;	// data-driven SetGameType dispatch
+	bool				selectable;		// exposed to cvar completion, menus and votes
 } mpGameTypeInfo_t;
 
 // NULL-terminated si_gameType token list; kept adjacent to the table it mirrors
@@ -77,6 +98,7 @@ const mpGameTypeInfo_t *	MPGameTypeByName( const char *name );
 int							MPGameTypeFlags( int type );
 const char *				MPGameTypeName( int type );
 const char *				MPGameTypeLocalizedName( int type );
+bool						MPGameTypeIsSelectable( int type );
 
 // true when every flag in mask is set on the gametype
 bool						MPGameTypeHasAll( int type, int mask );

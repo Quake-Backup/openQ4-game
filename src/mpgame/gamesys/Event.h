@@ -93,6 +93,9 @@ public:
 	static bool					EventIsPosted( const idClass *obj, const idEventDef *evdef );
 // RAVEN END
 	static void					ClearEventList( void );
+	// Transactionally shift every posted gameplay event by one frozen frame.
+	// Returns false without mutation if any timestamp would overflow.
+	static bool					ShiftEvents( int deltaMsec );
 	static void					ServiceEvents( void );
 	static void					Init( void );
 	static void					Shutdown( void );

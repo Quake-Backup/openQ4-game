@@ -55,10 +55,18 @@ idCVar si_dropWeaponsInBuyingModes(	"si_dropWeaponsInBuyingModes",	"0",		CVAR_GA
 // RITUAL END
 // RAVEN BEGIN
 // ddynerman: new gametype strings
-idCVar si_gameType(					"si_gameType",				si_gameTypeArgs[ 0 ],	CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE, "game type - singleplayer, DM, Tourney, Team DM, CTF, Arena CTF, or DeadZone", si_gameTypeArgs, idCmdSystem::ArgCompletion_String<si_gameTypeArgs> );
+idCVar si_gameType(					"si_gameType",				si_gameTypeArgs[ 0 ],	CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE, "validated game type token; completion lists only implemented public modes", si_gameTypeArgs, idCmdSystem::ArgCompletion_String<si_gameTypeArgs> );
 idCVar si_map(						"si_map",					"mp/q4dm1",				CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE, "map to be played next on server", idCmdSystem::ArgCompletion_MapName );
 idCVar si_mapCycle(					"si_mapCycle",				"",						CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE, "map cycle list semicolon delimited" );
 idCVar si_arenaCampaign(				"si_arenaCampaign",			"0",					CVAR_GAME | CVAR_SERVERINFO | CVAR_INTEGER, "single-player arena campaign match token, 0 for a normal multiplayer match", 0, 20 );
+// openQ4's competitive framework intentionally exposes one profile selector
+// and one read-only canonical identity instead of a second forest of live
+// match cvars.  Legacy si_* values are imported/mirrored only at boundaries.
+idCVar g_matchProfile(				"g_matchProfile",			"casual",				CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE, "typed match-rules profile token" );
+idCVar si_matchRules(				"si_matchRules",			"",					CVAR_GAME | CVAR_SERVERINFO | CVAR_ROM, "committed match-rules profile, schema and digest" );
+idCVar g_refPassword(				"g_refPassword",			"",					CVAR_GAME, "one-shot server-only referee credential; converted to a verifier and cleared at session start" );
+idCVar g_matchEvidence(				"g_matchEvidence",			"2",					CVAR_GAME | PC_CVAR_ARCHIVE | CVAR_INTEGER, "competitive match evidence: 0 off, 1 final reports, 2 journal and reports", 0, 2 );
+idCVar g_matchSeriesRecoveryId(		"g_matchSeriesRecoveryId",	"0",					CVAR_GAME | PC_CVAR_ARCHIVE, "server-owned active competition-series recovery identity" );
 // bdube: raise player limit
 idCVar si_maxPlayers(				"si_maxPlayers",			"12",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "max number of players allowed on the server", 1, 16 );
 // ddynerman: min players to start
@@ -486,7 +494,17 @@ idCVar pm_thirdPersonClip(			"pm_thirdPersonClip",		"1",			CVAR_GAME | CVAR_BOOL
 idCVar pm_thirdPerson(				"pm_thirdPerson",			"0",			CVAR_GAME | CVAR_BOOL, "enables third person view" );
 idCVar pm_thirdPersonDeath(			"pm_thirdPersonDeath",		"0",			CVAR_GAME | CVAR_BOOL, "enables third person view when player dies" );
 idCVar pm_modelView(				"pm_modelView",				"0",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "draws camera from POV of player model (1 = always, 2 = when dead)", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
-idCVar pm_airTics(					"pm_air",					"1800",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how long in milliseconds the player can go without air before he starts taking damage" );
+idCVar pm_airTics(					"pm_air",					"1800",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how many 60Hz frames the player can spend in a vacuum before taking damage" );
+
+// openQ4 BEGIN
+idCVar pm_waterAirTics(				"pm_waterAir",				"720",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how many 60Hz frames the player can stay submerged before drowning, 720 is Quake 3's twelve seconds" );
+idCVar g_liquidDamageInterval(		"g_liquidDamageInterval",	"500",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "milliseconds between lava and slime damage ticks" );
+idCVar g_drownDamageMax(			"g_drownDamageMax",			"15",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "maximum damage per drowning tick, the ramp starts at the damage def's value and climbs to this" );
+idCVar g_liquidScreenTint(			"g_liquidScreenTint",		"1",			CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "strength of the full screen tint while the camera is under a liquid surface, 0 disables it", 0.0f, 1.0f );
+idCVar g_debugLiquid(				"g_debugLiquid",			"0",			CVAR_GAME | CVAR_BOOL, "print player liquid state changes and liquid damage to the console" );
+idCVar g_liquidTestVolume(          "g_liquidTestVolume",       "",             CVAR_GAME, "dev aid: spawn a liquid volume around the player on spawn - water, slime or lava, empty to disable" );
+idCVar g_liquidTestVolumeSize(      "g_liquidTestVolumeSize",   "640",          CVAR_GAME | CVAR_FLOAT, "cube size of the g_liquidTestVolume box" );
+// openQ4 END
 
 // RAVEN BEGIN
 // asalmon: parameters for aim assistance on Xenon - or a non-final pc build so Caryn can edit the guis
@@ -680,9 +698,10 @@ idCVar si_voteFlags(				"si_voteFlags",				"0",			CVAR_GAME | CVAR_SERVERINFO | 
 																					"bit  5 (+32)   change map\n"
 																					"bit  6 (+64)   change gametype\n"
 																					"bit  7 (+128)  time limit\n"
-																					"bit  8 (+256)  tourney limit\n"
-																					"bit  9 (+512)  capture limit\n"
-																					"bit 10 (+1024) frag limit" );
+																	"bit  8 (+256)  tourney limit\n"
+																	"bit  9 (+512)  capture limit\n"
+																	"bit 10 (+1024) frag limit\n"
+																	"bit 11 (+2048) control time" );
 
 idCVar g_mapCycle(					"g_mapCycle",				"mapcycle",		CVAR_GAME | CVAR_ARCHIVE, "map cycling script for multiplayer games - see mapcycle.scriptcfg" );
 

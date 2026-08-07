@@ -736,6 +736,7 @@ idEntity::Save
 */
 void idEntity::Save( idSaveGame *savefile ) const {
 	int				i, j;
+	int				packedFlags;
 	rvClientEntity* cent;
 
 	savefile->WriteInt( entityNumber );
@@ -775,7 +776,28 @@ void idEntity::Save( idSaveGame *savefile ) const {
 //	savefile->WriteInt( mLastLongThinkTime );			// Debug vars - don't save
 //	savefile->WriteVec4( mLastLongThinkColor );			// Debug vars - don't save
 
-	savefile->Write( &fl, sizeof( fl ) );
+	packedFlags = 0;
+	packedFlags |= fl.notarget ? BIT( 0 ) : 0;
+	packedFlags |= fl.noknockback ? BIT( 1 ) : 0;
+	packedFlags |= fl.takedamage ? BIT( 2 ) : 0;
+	packedFlags |= fl.hidden ? BIT( 3 ) : 0;
+	packedFlags |= fl.bindOrientated ? BIT( 4 ) : 0;
+	packedFlags |= fl.solidForTeam ? BIT( 5 ) : 0;
+	packedFlags |= fl.forcePhysicsUpdate ? BIT( 6 ) : 0;
+	packedFlags |= fl.selected ? BIT( 7 ) : 0;
+	packedFlags |= fl.neverDormant ? BIT( 8 ) : 0;
+	packedFlags |= fl.isDormant ? BIT( 9 ) : 0;
+	packedFlags |= fl.hasAwakened ? BIT( 10 ) : 0;
+	packedFlags |= fl.networkSync ? BIT( 11 ) : 0;
+	packedFlags |= fl.networkStale ? BIT( 12 ) : 0;
+	packedFlags |= fl.triggerAnim ? BIT( 13 ) : 0;
+	packedFlags |= fl.usable ? BIT( 14 ) : 0;
+	packedFlags |= fl.isAIObstacle ? BIT( 15 ) : 0;
+	packedFlags |= fl.persistAcrossInstances ? BIT( 16 ) : 0;
+	packedFlags |= fl.exitedVehicle ? BIT( 17 ) : 0;
+	packedFlags |= fl.allowAutoBlink ? BIT( 18 ) : 0;
+	packedFlags |= fl.quickBurn ? BIT( 19 ) : 0;
+	savefile->WriteInt( packedFlags );
 
 	savefile->WriteRenderEntity( renderEntity );
 	savefile->WriteInt( modelDefHandle );
@@ -826,6 +848,7 @@ idEntity::Restore
 void idEntity::Restore( idRestoreGame *savefile ) {
 	int				i, j;
 	int				num;
+	int				packedFlags;
 	rvClientEntity	*temp;
 	idStr			funcname;
 
@@ -854,7 +877,7 @@ void idEntity::Restore( idRestoreGame *savefile ) {
 
 	// renderView_t *			renderView;
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( cameraTarget ) );
+	savefile->ReadObject( cameraTarget );
 
 	targets.Clear();
 	savefile->ReadInt( num );
@@ -873,7 +896,7 @@ void idEntity::Restore( idRestoreGame *savefile ) {
 		savefile->Error( "idEntity::Restore: invalid bound client entity count %d for entity '%s'", num, name.c_str() );
 	}
 	for( i = 0; i < num; i++ ) {
-		savefile->ReadObject( reinterpret_cast<idClass *&>( temp ) );
+		savefile->ReadObject( temp );
 		if( temp ) {
 			temp->bindNode.AddToEnd( clientEntities );
 		}
@@ -882,7 +905,31 @@ void idEntity::Restore( idRestoreGame *savefile ) {
 //	savefile->ReadInt( mLastLongThinkTime );			// Debug vars - don't save
 //	savefile->ReadVec4( mLastLongThinkColor );			// Debug vars - don't save
 
-	savefile->Read( &fl, sizeof( fl ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedFlags );
+		fl.notarget = ( packedFlags & BIT( 0 ) ) != 0;
+		fl.noknockback = ( packedFlags & BIT( 1 ) ) != 0;
+		fl.takedamage = ( packedFlags & BIT( 2 ) ) != 0;
+		fl.hidden = ( packedFlags & BIT( 3 ) ) != 0;
+		fl.bindOrientated = ( packedFlags & BIT( 4 ) ) != 0;
+		fl.solidForTeam = ( packedFlags & BIT( 5 ) ) != 0;
+		fl.forcePhysicsUpdate = ( packedFlags & BIT( 6 ) ) != 0;
+		fl.selected = ( packedFlags & BIT( 7 ) ) != 0;
+		fl.neverDormant = ( packedFlags & BIT( 8 ) ) != 0;
+		fl.isDormant = ( packedFlags & BIT( 9 ) ) != 0;
+		fl.hasAwakened = ( packedFlags & BIT( 10 ) ) != 0;
+		fl.networkSync = ( packedFlags & BIT( 11 ) ) != 0;
+		fl.networkStale = ( packedFlags & BIT( 12 ) ) != 0;
+		fl.triggerAnim = ( packedFlags & BIT( 13 ) ) != 0;
+		fl.usable = ( packedFlags & BIT( 14 ) ) != 0;
+		fl.isAIObstacle = ( packedFlags & BIT( 15 ) ) != 0;
+		fl.persistAcrossInstances = ( packedFlags & BIT( 16 ) ) != 0;
+		fl.exitedVehicle = ( packedFlags & BIT( 17 ) ) != 0;
+		fl.allowAutoBlink = ( packedFlags & BIT( 18 ) ) != 0;
+		fl.quickBurn = ( packedFlags & BIT( 19 ) ) != 0;
+	} else {
+		savefile->Read( &fl, sizeof( fl ) );
+	}
 
 // RAVEN BEGIN
 	savefile->ReadRenderEntity( renderEntity, &spawnArgs );
@@ -899,13 +946,13 @@ void idEntity::Restore( idRestoreGame *savefile ) {
 	RestorePhysics( &defaultPhysicsObj );
 
 	idEntity *templol = 0;
-	savefile->ReadObject( reinterpret_cast<idClass *&>( templol ) );
+	savefile->ReadObject( templol );
 	bindMaster = templol;
 
 	savefile->ReadJoint( bindJoint );
 	savefile->ReadInt( bindBody );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( teamMaster ) );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( teamChain ) );
+	savefile->ReadObject( teamMaster );
+	savefile->ReadObject( teamChain );
 
 	savefile->ReadInt( numPVSAreas );
 	if ( numPVSAreas < -1 || numPVSAreas > MAX_PVS_AREAS ) {
@@ -1007,6 +1054,35 @@ idEntity::Think
 void idEntity::Think( void ) {
 	RunPhysics();
 	Present();
+}
+
+void idEntity::ThinkMatchPaused( int deltaMsec ) {
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+	// Parametric physics rebases trajectory/interpolation starts here; physics
+	// implementations driven only by frame delta intentionally implement this
+	// as a no-op.  No collision evaluation or contacts run on a frozen frame.
+	if ( physics != NULL ) {
+		const int physicsTime = physics->GetTime();
+		const int maxInt = 0x7fffffff;
+		physics->UpdateTime( physicsTime > maxInt - deltaMsec ?
+			maxInt : physicsTime + deltaMsec );
+	}
+
+	const float deltaSeconds = MS2SEC( deltaMsec );
+	// Shader time is engine time plus TIMEOFFSET.  Moving the offset backwards
+	// preserves the exact sampled frame while engine/network time advances.
+	renderEntity.shaderParms[ SHADERPARM_TIMEOFFSET ] -= deltaSeconds;
+	if ( renderEntity.shaderParms[ SHADERPARM_TIME_OF_DEATH ] > 0.0f ) {
+		renderEntity.shaderParms[ SHADERPARM_TIME_OF_DEATH ] += deltaSeconds;
+	}
+	// The render world owns a submitted copy.  Update only an existing visible
+	// definition: adding/presenting a new definition here could invoke subclass
+	// callbacks or wake dormant gameplay while the simulation is frozen.
+	if ( modelDefHandle != -1 && renderEntity.hModel != NULL && !IsHidden() ) {
+		gameRenderWorld->UpdateEntityDef( modelDefHandle, &renderEntity );
+	}
 }
 
 /*
@@ -3667,6 +3743,9 @@ inflictor, attacker, dir, and point can be NULL for environmental effects
 */
 void idEntity::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &dir, 
 					  const char *damageDefName, const float damageScale, const int location ) {
+	if ( gameLocal.isMultiplayer && gameLocal.mpGame.IsGameplayFrozen() ) {
+		return;
+	}
 	if ( forwardDamageEnt.IsValid() ) {
 		forwardDamageEnt->Damage( inflictor, attacker, dir, damageDefName, damageScale, location );
 		return;
@@ -4164,7 +4243,7 @@ bool idEntity::HandleGuiCommands( idEntity *entityGui, const char *cmds ) {
 	if ( entityGui && cmds && *cmds ) {
 		idLexer src;
 		idToken token, token2, token3, token4;
-		src.LoadMemory( cmds, strlen( cmds ), "guiCommands" );
+		src.LoadMemory( cmds, idLib::SizeToInt( strlen( cmds ), "idEntity::HandleGuiCommands" ), "guiCommands" );
 		while( 1 ) {
 
 			if ( !src.ReadToken( &token ) ) {
@@ -4714,7 +4793,8 @@ idCurve_Spline<idVec3> *idEntity::GetSpline( void ) const {
 // mwhitlock: Dynamic memory consolidation
 	RV_PUSH_HEAP_MEM(this);
 // RAVEN END
-	idStr str = kv->GetKey().Right( kv->GetKey().Length() - strlen( curveTag ) );
+	idStr str = kv->GetKey().Right( kv->GetKey().Length() -
+		idLib::SizeToInt( strlen( curveTag ), "idEntity::GetSpline" ) );
 	if ( str.Icmp( "CatmullRomSpline" ) == 0 ) {
 		spline = new idCurve_CatmullRomSpline<idVec3>();
 	} else if ( str.Icmp( "nubs" ) == 0 ) {
@@ -6459,6 +6539,11 @@ void idAnimatedEntity::Think( void ) {
 	RunPhysics();
 	UpdateAnimation();
 	Present();
+}
+
+void idAnimatedEntity::ThinkMatchPaused( int deltaMsec ) {
+	idEntity::ThinkMatchPaused( deltaMsec );
+	animator.ShiftTime( deltaMsec );
 }
 
 /*

@@ -8,6 +8,7 @@ Various utility objects and functions.
 #pragma hdrstop
 
 #include "Game_local.h"
+#include "mp/match/MatchDeadline.h"
 
 // RAVEN BEGIN
 // nmckenzie: added ai
@@ -618,6 +619,13 @@ void idDamagable::Spawn( void ) {
 	} else {
 		GetPhysics()->SetContents( CONTENTS_SOLID );
 	}
+}
+
+void idDamagable::ThinkMatchPaused( int deltaMsec ) {
+	idEntity::ThinkMatchPaused( deltaMsec );
+	mpMatchShiftOptionalDeadline( invincibleTime, deltaMsec );
+	mpMatchShiftOptionalDeadline( stageEndTime, deltaMsec );
+	mpMatchShiftOptionalDeadline( nextTriggerTime, deltaMsec );
 }
 
 /*
@@ -1592,7 +1600,7 @@ void idAnimated::Restore( idRestoreGame *savefile ) {
 	savefile->ReadBool( activated );
 
 // RAVEN BEGIN
-	savefile->ReadObject( reinterpret_cast<idClass *&>( scriptThread ) );
+	savefile->ReadObject( scriptThread );
 	savefile->ReadString( state );
 	savefile->ReadString( idealState );
 	for( i = 0; i < ANIM_NumAnimChannels; i++ ) {
@@ -2238,6 +2246,89 @@ void idAnimated::SetState( const char *statename, int frames ) {
 
 ===============================================================================
 */
+
+// openQ4 BEGIN
+/*
+===============================================================================
+
+	idLiquidVolume
+
+===============================================================================
+*/
+
+CLASS_DECLARATION( idEntity, idLiquidVolume )
+END_CLASS
+
+/*
+================
+idLiquidVolume::idLiquidVolume
+================
+*/
+idLiquidVolume::idLiquidVolume( void ) {
+	liquidContents = CONTENTS_WATER;
+}
+
+/*
+================
+idLiquidVolume::Save
+================
+*/
+void idLiquidVolume::Save( idSaveGame *savefile ) const {
+	savefile->WriteInt( liquidContents );
+}
+
+/*
+================
+idLiquidVolume::Restore
+================
+*/
+void idLiquidVolume::Restore( idRestoreGame *savefile ) {
+	savefile->ReadInt( liquidContents );
+}
+
+/*
+================
+idLiquidVolume::Spawn
+
+idEntity::Spawn has already built a clip model from "mins"/"maxs" or "size" if either was given;
+this only has to name the liquid and hand the volume to the collision world with liquid contents on
+it, which is what makes gameLocal.Contents report it.
+================
+*/
+void idLiquidVolume::Spawn( void ) {
+	const char *liquid = spawnArgs.GetString( "liquid", "water" );
+
+	if ( !idStr::Icmp( liquid, "lava" ) ) {
+		liquidContents = CONTENTS_LAVA;
+	} else if ( !idStr::Icmp( liquid, "slime" ) ) {
+		liquidContents = CONTENTS_SLIME;
+	} else {
+		liquidContents = CONTENTS_WATER;
+		if ( idStr::Icmp( liquid, "water" ) ) {
+			gameLocal.Warning( "idLiquidVolume '%s': unknown liquid '%s', using water", name.c_str(), liquid );
+		}
+	}
+
+	if ( !GetPhysics()->GetClipModel() ) {
+		idVec3 size = spawnArgs.GetVector( "size", "256 256 128" );
+		if ( size.x <= 0.0f || size.y <= 0.0f || size.z <= 0.0f ) {
+			gameLocal.Warning( "idLiquidVolume '%s': invalid size '%s'", name.c_str(), size.ToString() );
+			size.Set( 256.0f, 256.0f, 128.0f );
+		}
+
+		GetPhysics()->SetClipBox( idBounds( idVec3( size.x * -0.5f, size.y * -0.5f, 0.0f ),
+										idVec3( size.x *  0.5f, size.y *  0.5f, size.z ) ), 1.0f );
+	}
+
+	// a liquid is something you move through, so it collides with nothing itself
+	GetPhysics()->SetContents( liquidContents );
+	GetPhysics()->SetClipMask( 0 );
+	GetPhysics()->LinkClip();
+
+	fl.takedamage = false;
+	fl.networkSync = true;
+}
+// openQ4 END
 
 CLASS_DECLARATION( idEntity, idStaticEntity )
 	EVENT( EV_Activate,				idStaticEntity::Event_Activate )

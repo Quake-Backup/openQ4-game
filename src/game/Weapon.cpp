@@ -1329,10 +1329,32 @@ rvWeapon::Save
 */
 void rvWeapon::Save ( idSaveGame *savefile ) const {
 	int i;
+	int packedStateFlags;
+	int packedWeaponFlags;
 
 	// Flags
-	savefile->Write			( &wsfl, sizeof( wsfl ) );
-	savefile->Write			( &wfl, sizeof( wfl ) );
+	packedStateFlags = 0;
+	packedStateFlags |= wsfl.attack ? BIT( 0 ) : 0;
+	packedStateFlags |= wsfl.reload ? BIT( 1 ) : 0;
+	packedStateFlags |= wsfl.netReload ? BIT( 2 ) : 0;
+	packedStateFlags |= wsfl.netEndReload ? BIT( 3 ) : 0;
+	packedStateFlags |= wsfl.raiseWeapon ? BIT( 4 ) : 0;
+	packedStateFlags |= wsfl.lowerWeapon ? BIT( 5 ) : 0;
+	packedStateFlags |= wsfl.flashlight ? BIT( 6 ) : 0;
+	packedStateFlags |= wsfl.zoom ? BIT( 7 ) : 0;
+	savefile->WriteInt( packedStateFlags );
+
+	packedWeaponFlags = 0;
+	packedWeaponFlags |= wfl.attackAltHitscan ? BIT( 0 ) : 0;
+	packedWeaponFlags |= wfl.attackHitscan ? BIT( 1 ) : 0;
+	packedWeaponFlags |= wfl.hide ? BIT( 2 ) : 0;
+	packedWeaponFlags |= wfl.disabled ? BIT( 3 ) : 0;
+	packedWeaponFlags |= wfl.hasBloodSplat ? BIT( 4 ) : 0;
+	packedWeaponFlags |= wfl.silent_fire ? BIT( 5 ) : 0;
+	packedWeaponFlags |= wfl.zoomHideCrosshair ? BIT( 6 ) : 0;
+	packedWeaponFlags |= wfl.flashlightOn ? BIT( 7 ) : 0;
+	packedWeaponFlags |= wfl.hasWindupAnim ? BIT( 8 ) : 0;
+	savefile->WriteInt( packedWeaponFlags );
 
 	// Write all cached joints
 	savefile->WriteJoint	( barrelJointView );
@@ -1460,11 +1482,36 @@ rvWeapon::Restore
 */
 void rvWeapon::Restore ( idRestoreGame *savefile ) {
 	int						i;
+	int						packedStateFlags;
+	int						packedWeaponFlags;
 	const idDeclEntityDef*	def;
 
 	// General
-	savefile->Read			( &wsfl, sizeof( wsfl ) );
-	savefile->Read			( &wfl, sizeof( wfl ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedStateFlags );
+		wsfl.attack = ( packedStateFlags & BIT( 0 ) ) != 0;
+		wsfl.reload = ( packedStateFlags & BIT( 1 ) ) != 0;
+		wsfl.netReload = ( packedStateFlags & BIT( 2 ) ) != 0;
+		wsfl.netEndReload = ( packedStateFlags & BIT( 3 ) ) != 0;
+		wsfl.raiseWeapon = ( packedStateFlags & BIT( 4 ) ) != 0;
+		wsfl.lowerWeapon = ( packedStateFlags & BIT( 5 ) ) != 0;
+		wsfl.flashlight = ( packedStateFlags & BIT( 6 ) ) != 0;
+		wsfl.zoom = ( packedStateFlags & BIT( 7 ) ) != 0;
+
+		savefile->ReadInt( packedWeaponFlags );
+		wfl.attackAltHitscan = ( packedWeaponFlags & BIT( 0 ) ) != 0;
+		wfl.attackHitscan = ( packedWeaponFlags & BIT( 1 ) ) != 0;
+		wfl.hide = ( packedWeaponFlags & BIT( 2 ) ) != 0;
+		wfl.disabled = ( packedWeaponFlags & BIT( 3 ) ) != 0;
+		wfl.hasBloodSplat = ( packedWeaponFlags & BIT( 4 ) ) != 0;
+		wfl.silent_fire = ( packedWeaponFlags & BIT( 5 ) ) != 0;
+		wfl.zoomHideCrosshair = ( packedWeaponFlags & BIT( 6 ) ) != 0;
+		wfl.flashlightOn = ( packedWeaponFlags & BIT( 7 ) ) != 0;
+		wfl.hasWindupAnim = ( packedWeaponFlags & BIT( 8 ) ) != 0;
+	} else {
+		savefile->Read( &wsfl, sizeof( wsfl ) );
+		savefile->Read( &wfl, sizeof( wfl ) );
+	}
 
 	// Read cached joints
 	savefile->ReadJoint		( barrelJointView );
@@ -1606,7 +1653,7 @@ void rvWeapon::Restore ( idRestoreGame *savefile ) {
 	// TORESTORE: idScriptObject*					scriptObject;
 
 	// Entities
-	savefile->ReadObject( reinterpret_cast<idClass *&>( owner ) );
+	savefile->ReadObject( owner );
 	viewModel = owner->GetWeaponViewModel ( );
 	worldModel = owner->GetWeaponWorldModel ( );
 

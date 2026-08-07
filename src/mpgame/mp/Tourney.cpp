@@ -32,6 +32,20 @@ rvTourneyArena::rvTourneyArena() {
 	matchStartTime = 0;
 }
 
+void rvTourneyArena::ShiftMatchTime( int deltaMsec ) {
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+	const int maxInt = 0x7fffffff;
+	int *deadlines[] = { &nextStateTime, &fragLimitTimeout, &matchStartTime };
+	for ( int index = 0; index < 3; ++index ) {
+		int &deadline = *deadlines[ index ];
+		if ( deadline > 0 ) {
+			deadline = deadline > maxInt - deltaMsec ? maxInt : deadline + deltaMsec;
+		}
+	}
+}
+
 /*
 ================
 rvTourneyArena::AddPlayer

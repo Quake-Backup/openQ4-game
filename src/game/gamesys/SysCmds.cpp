@@ -2729,7 +2729,8 @@ idGameEdit::ListAnims
 */
 void idGameEdit::PrintMemInfo( MemInfo *mi ) {
 
-	int		i, count, totalSize;
+	int		i, count;
+	size_t	totalSize;
 	idAAS	*aas;
 
 	totalSize = 0;
@@ -2744,7 +2745,7 @@ void idGameEdit::PrintMemInfo( MemInfo *mi ) {
 		}
 	}
 
-	mi->aasAssetsTotal = totalSize;
+	mi->aasAssetsTotal = idLib::SizeToInt( totalSize, "idGameEdit::PrintMemInfo" );
 	mi->aasAssetsCount = count;
 
 	// jsinger: animationLib changed to a pointer

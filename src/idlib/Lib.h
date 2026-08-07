@@ -1,6 +1,7 @@
 #ifndef __LIB_H__
 #define __LIB_H__
 
+#include <stddef.h>
 
 /*
 ===============================================================================
@@ -33,6 +34,9 @@ public:
 	// wrapper to idCommon functions 
 	static void					Error( const char *fmt, ... );
 	static void					Warning( const char *fmt, ... );
+	// Converts byte/string/container sizes at legacy int API boundaries.
+	// Oversized inputs are rejected instead of being silently truncated.
+	static int					SizeToInt( size_t value, const char *context );
 };
 
 
@@ -117,7 +121,15 @@ class idException {
 public:
 	char error[2048];
 
-	idException( const char *text = "" ) { strcpy( error, text ); }
+	idException( const char *text = "" ) {
+		int i = 0;
+		if ( text != NULL ) {
+			for ( ; i < (int)sizeof( error ) - 1 && text[i] != '\0'; i++ ) {
+				error[i] = text[i];
+			}
+		}
+		error[i] = '\0';
+	}
 };
 
 

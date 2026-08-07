@@ -63,6 +63,41 @@ typedef struct {
 //RAVEN END
 } scannedServer_t;
 
+// Fixed-width, append-only game-module ABI for the server MVD publisher.
+// The query that fills this value is fallible: false means that no recording
+// attempt has produced a result yet.  A pending result names only the staged
+// stream; a committed result names only the published stream; and a failed
+// result may name the recoverable staged stream that was left behind.
+static const int SERVER_MVD_RESULT_QPATH_BYTES = 160;
+
+typedef enum {
+	SERVER_MVD_RESULT_PENDING = 0,
+	SERVER_MVD_RESULT_COMMITTED,
+	SERVER_MVD_RESULT_FAILED,
+	SERVER_MVD_RESULT_STATE_COUNT
+} serverMVDResultState_t;
+
+typedef enum {
+	SERVER_MVD_REASON_NONE = 0,
+	SERVER_MVD_REASON_START_REJECTED,
+	SERVER_MVD_REASON_NAME_UNAVAILABLE,
+	SERVER_MVD_REASON_OPEN_FAILED,
+	SERVER_MVD_REASON_SCHEMA_INVALID,
+	SERVER_MVD_REASON_INITIALIZATION_FAILED,
+	SERVER_MVD_REASON_STREAM_WRITE_FAILED,
+	SERVER_MVD_REASON_FINALIZE_WRITE_FAILED,
+	SERVER_MVD_REASON_SYNC_FAILED,
+	SERVER_MVD_REASON_PROMOTE_FAILED,
+	SERVER_MVD_REASON_COUNT
+} serverMVDResultReason_t;
+
+typedef struct {
+	serverMVDResultState_t	state;
+	serverMVDResultReason_t	reason;
+	char					finalQPath[ SERVER_MVD_RESULT_QPATH_BYTES + 1 ];
+	char					partialQPath[ SERVER_MVD_RESULT_QPATH_BYTES + 1 ];
+} serverMVDRecordingResult_t;
+
 typedef enum {
 	SC_NONE = -1,
 	SC_FAVORITE,
@@ -110,6 +145,10 @@ public:
 	virtual int				ServerGetClientOutgoingRate( int clientNum );
 	virtual int				ServerGetClientIncomingRate( int clientNum );
 	virtual float			ServerGetClientIncomingPacketLoss( int clientNum );
+	// Typed game-side moderation must not synthesize console command text.
+	// Returns false for an inactive server, invalid slot, local listen host or
+	// invalid reason; successful calls synchronously retire the connection.
+	virtual bool			ServerDropClient( int clientNum, const char *reason );
 
 	virtual void			ClientSendReliableMessage( const idBitMsg &msg );
 	virtual int				ClientGetPrediction( void );
@@ -158,6 +197,13 @@ public:
 	virtual int				ServerConnectBot(void) { return 0; }
 
 	virtual int				RepeaterGetClientNum(int clientId) { return 0; }
+
+	// Append-only game-module ABI: server-owned multi-view demo lifecycle.
+	virtual bool			ServerStartMVDRecording( const char *name );
+	virtual bool			ServerStopMVDRecording( const char *reason );
+	virtual bool			ServerIsMVDRecording( void ) const;
+	virtual bool			ServerCopyMVDRecordingQPath( char *buffer, int bufferSize ) const;
+	virtual bool			ServerCopyMVDRecordingResult( serverMVDRecordingResult_t &result ) const;
 };
 
 extern idNetworkSystem *	networkSystem;

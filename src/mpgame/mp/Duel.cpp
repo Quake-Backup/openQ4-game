@@ -182,16 +182,19 @@ void rvDuelGameState::RotateLoser( void ) {
 rvDuelGameState::NewState
 ================
 */
-void rvDuelGameState::NewState( mpGameState_t newState ) {
-	rvDMGameState::NewState( newState );
+bool rvDuelGameState::NewState( mpGameState_t newState ) {
+	if ( !rvDMGameState::NewState( newState ) ) {
+		return false;
+	}
 
 	if ( gameLocal.isClient ) {
-		return;
+		return true;
 	}
 
 	if ( newState == GAMEREVIEW ) {
 		RotateLoser();
 	}
+	return true;
 }
 
 /*

@@ -1526,7 +1526,7 @@ void idAnimManager::PrintMemInfo( MemInfo *mi ) {
 	}
 
 	mi->animsAssetsCount = num;
-	mi->animsAssetsTotal = namesize + size;
+	mi->animsAssetsTotal = idLib::SizeToInt( namesize + size, "idAnimManager::PrintMemInfo" );
 
 	f->Printf( "\nTotal anim bytes allocated: %s (%s items)\n", idStr::FormatNumber( mi->animsAssetsTotal ).c_str(), idStr::FormatNumber( mi->animsAssetsCount ).c_str() );
 	fileSystem->CloseFile( f );

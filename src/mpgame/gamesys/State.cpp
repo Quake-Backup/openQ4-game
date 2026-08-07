@@ -2,6 +2,7 @@
 #pragma hdrstop
 
 #include "../Game_local.h"
+#include "../mp/match/MatchDeadline.h"
 
 const int HISTORY_COUNT = 50;
 
@@ -50,6 +51,9 @@ void stateCall_t::Restore( idRestoreGame *saveFile, const idClass* owner ) {
 
 	saveFile->ReadString( name );
 	state = owner->FindState( name );
+	if ( state == NULL ) {
+		saveFile->Error( "stateCall_t::Restore: unknown state '%s' for owner class '%s'", name.c_str(), owner->GetClassname() );
+	}
 
 	saveFile->ReadInt( flags );
 	saveFile->ReadInt( delay );
@@ -197,6 +201,28 @@ void rvStateThread::Clear ( bool ignoreStateCalls ) {
 	
 	states.Clear ( );
 	interrupted.Clear ( );	
+}
+
+/*
+=====================
+rvStateThread::ShiftMatchTime
+
+Queued state calls store the engine-time origin used by their delay test.
+Both queues must move together or an interrupted weapon/actor state can skip
+its remaining delay as soon as gameplay resumes.
+=====================
+*/
+void rvStateThread::ShiftMatchTime( int deltaMsec ) {
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+
+	for ( stateCall_t *call = states.Next(); call != NULL; call = call->node.Next() ) {
+		mpMatchShiftOptionalDeadline( call->parms.time, deltaMsec );
+	}
+	for ( stateCall_t *call = interrupted.Next(); call != NULL; call = call->node.Next() ) {
+		mpMatchShiftOptionalDeadline( call->parms.time, deltaMsec );
+	}
 }
 
 /*
@@ -363,12 +389,18 @@ rvStateThread::Save
 =====================
 */
 void rvStateThread::Save( idSaveGame *saveFile ) const {
+	int packedFlags;
+
 	saveFile->WriteString( name.c_str() );
 
 	// No need to save owner, its setup in restore
 
 	saveFile->WriteInt( lastResult );
-	saveFile->Write ( &fl, sizeof(fl) );
+	packedFlags = 0;
+	packedFlags |= fl.stateCleared ? BIT( 0 ) : 0;
+	packedFlags |= fl.stateInterrupted ? BIT( 1 ) : 0;
+	packedFlags |= fl.executing ? BIT( 2 ) : 0;
+	saveFile->WriteInt( packedFlags );
 
 	saveFile->WriteInt( states.Num() );
 	for( idLinkList<stateCall_t>* node = states.NextNode(); node; node = node->NextNode() ) {
@@ -391,6 +423,7 @@ rvStateThread::Restore
 */
 void rvStateThread::Restore( idRestoreGame *saveFile, idClass* owner ) {
 	int numStates;
+	int packedFlags;
 	stateCall_t* call = NULL;
 
 	saveFile->ReadString( name );
@@ -400,7 +433,14 @@ void rvStateThread::Restore( idRestoreGame *saveFile, idClass* owner ) {
 	int restoredResult;
 	saveFile->ReadInt( restoredResult );
 	lastResult = static_cast<stateResult_t>( restoredResult );
-	saveFile->Read ( &fl, sizeof(fl) );
+	if ( saveFile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		saveFile->ReadInt( packedFlags );
+		fl.stateCleared = ( packedFlags & BIT( 0 ) ) != 0;
+		fl.stateInterrupted = ( packedFlags & BIT( 1 ) ) != 0;
+		fl.executing = ( packedFlags & BIT( 2 ) ) != 0;
+	} else {
+		saveFile->Read( &fl, sizeof( fl ) );
+	}
 
 	saveFile->ReadInt( numStates );
 	if ( numStates < 0 || numStates > MAX_SAVEGAME_STATE_CALLS ) {

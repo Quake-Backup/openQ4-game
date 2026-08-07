@@ -8,6 +8,7 @@
 
 #include "Game_local.h"
 #include "ai/AI_Manager.h"
+#include "mp/match/MatchDeadline.h"
 #include "Projectile.h"
 #include "spawner.h"
 
@@ -121,10 +122,17 @@ idProjectile::Save
 ================
 */
 void idProjectile::Save( idSaveGame *savefile ) const {
+	int packedFlags;
 	
 	savefile->WriteInt( methodOfDeath );				// cnicholson: Added unsaved var
 	owner.Save( savefile );
-	savefile->Write( &projectileFlags, sizeof( projectileFlags ) );
+	packedFlags = 0;
+	packedFlags |= projectileFlags.detonate_on_world ? BIT( 0 ) : 0;
+	packedFlags |= projectileFlags.detonate_on_actor ? BIT( 1 ) : 0;
+	packedFlags |= projectileFlags.detonate_on_bounce ? BIT( 2 ) : 0;
+	packedFlags |= projectileFlags.randomShaderSpin ? BIT( 3 ) : 0;
+	packedFlags |= projectileFlags.isTracer ? BIT( 4 ) : 0;
+	savefile->WriteInt( packedFlags );
 	savefile->WriteFloat( damagePower );
 
    	savefile->WriteRenderLight( renderLight );
@@ -164,11 +172,21 @@ idProjectile::Restore
 */
 void idProjectile::Restore( idRestoreGame *savefile ) {
 	float	fset;
+	int		packedFlags;
 	idVec3	temp;
 
 	savefile->ReadInt( methodOfDeath );					// cnicholson: Added unrestored var
 	owner.Restore( savefile );
-	savefile->Read( &projectileFlags, sizeof( projectileFlags ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadInt( packedFlags );
+		projectileFlags.detonate_on_world = ( packedFlags & BIT( 0 ) ) != 0;
+		projectileFlags.detonate_on_actor = ( packedFlags & BIT( 1 ) ) != 0;
+		projectileFlags.detonate_on_bounce = ( packedFlags & BIT( 2 ) ) != 0;
+		projectileFlags.randomShaderSpin = ( packedFlags & BIT( 3 ) ) != 0;
+		projectileFlags.isTracer = ( packedFlags & BIT( 4 ) ) != 0;
+	} else {
+		savefile->Read( &projectileFlags, sizeof( projectileFlags ) );
+	}
 	savefile->ReadFloat( damagePower );
 
 	savefile->ReadRenderLight( renderLight );
@@ -452,7 +470,7 @@ void idProjectile::Launch( const idVec3 &start, const idVec3 &dir, const idVec3 
 	physicsObj.SetBouncyness( bounce, !projectileFlags.detonate_on_bounce );
 	physicsObj.SetGravity( gravVec );
 	physicsObj.SetContents( contents );
- 	physicsObj.SetClipMask( clipMask | CONTENTS_WATER );
+ 	physicsObj.SetClipMask( clipMask | MASK_WATER );
 	physicsObj.SetLinearVelocity( dir * speed.GetCurrentValue(gameLocal.time) + pushVelocity );
 	physicsObj.SetOrigin( start );
 	physicsObj.SetAxis( dir.ToMat3() );
@@ -611,6 +629,45 @@ void idProjectile::Think( void ) {
 		} else {
 			lightDefHandle = gameRenderWorld->AddLightDef( &renderLight );
 		}
+	}
+}
+
+/*
+================
+idProjectile::ThinkMatchPaused
+
+Projectile fuses are posted events and are shifted by the central queue pass.
+The trajectory is frame-delta driven, but its acceleration, orientation,
+cheap-prediction origin and light fade retain absolute engine-time origins.
+================
+*/
+void idProjectile::ThinkMatchPaused( int deltaMsec ) {
+	idEntity::ThinkMatchPaused( deltaMsec );
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+
+	float startTime = speed.GetStartTime();
+	mpMatchShiftTimeOrigin( startTime, deltaMsec );
+	speed.SetStartTime( startTime );
+
+	startTime = rotation.GetStartTime();
+	mpMatchShiftTimeOrigin( startTime, deltaMsec );
+	rotation.SetStartTime( startTime );
+
+	if ( state >= LAUNCHED ) {
+		mpMatchShiftTimeOrigin( launchTime, deltaMsec );
+	}
+	if ( lightEndTime > 0 ) {
+		mpMatchShiftTimeOrigin( lightStartTime, deltaMsec );
+		mpMatchShiftOptionalDeadline( lightEndTime, deltaMsec );
+	}
+	if ( lightDefHandle != -1 ) {
+		renderLight.shaderParms[ SHADERPARM_TIMEOFFSET ] -= MS2SEC( deltaMsec );
+		if ( renderLight.shaderParms[ SHADERPARM_TIME_OF_DEATH ] > 0.0f ) {
+			renderLight.shaderParms[ SHADERPARM_TIME_OF_DEATH ] += MS2SEC( deltaMsec );
+		}
+		gameRenderWorld->UpdateLightDef( lightDefHandle, &renderLight );
 	}
 }
 
@@ -818,16 +875,32 @@ bool idProjectile::Collide( const trace_t &collision, const idVec3 &velocity, bo
 		ent->ProcessEvent( &EV_Activate , this );
 	}
 
-	// If the projectile hits water then we need to let the projectile keep going
-	if ( ent->GetPhysics()->GetContents() & CONTENTS_WATER ) {
+// openQ4 BEGIN
+	// A liquid surface never stops a projectile, it splashes and lets it through. This used to test
+	// only the hit entity's contents, so map water - a world brush - never splashed at all, and the
+	// multiplayer tree played no splash whatsoever.
+	const int liquidContents = gameLocal.LiquidContentsAtCollision( ent, collision );
+	if ( liquidContents ) {
 		if ( !physicsObj.IsInWater( ) ) {
 			StopEffect( "fx_fly" );
 			if( flyEffect)	{
 				//flyEffect->Event_Remove();
 			}
+
+			const rvDeclMatType* liquidMaterialType = collision.c.materialType;
+			if ( liquidMaterialType == NULL ) {
+				liquidMaterialType = declManager->FindMaterialType( gameLocal.LiquidTypeName( liquidContents ), false );
+			}
+			const idDecl *impactEffect = gameLocal.GetEffect( spawnArgs, "fx_impact", liquidMaterialType );
+			if ( impactEffect ) {
+				gameLocal.PlayEffect( impactEffect, collision.c.point, collision.c.normal.ToMat3(), false, vec3_origin, true );
+			} else {
+				gameLocal.PlayLiquidImpact( liquidContents, collision.c.point, collision.c.normal, this, &spawnArgs );
+			}
 		}
-		// Pass through water
+		// Pass through the liquid
 		return false;
+// openQ4 END
 	} else if ( canDamage && ent->IsType( idActor::GetClassType() ) ) {
 		if ( !projectileFlags.detonate_on_actor ) {
 			return false;
@@ -1905,6 +1978,21 @@ void idGuidedProjectile::Think( void ) {
 	}
 }
 
+void idGuidedProjectile::ThinkMatchPaused( int deltaMsec ) {
+	idProjectile::ThinkMatchPaused( deltaMsec );
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+
+	if ( state >= LAUNCHED ) {
+		mpMatchShiftTimeOrigin( launchTime, deltaMsec );
+	}
+	mpMatchShiftOptionalDeadline( driftTime, deltaMsec );
+	float startTime = turn_max.GetStartTime();
+	mpMatchShiftTimeOrigin( startTime, deltaMsec );
+	turn_max.SetStartTime( startTime );
+}
+
 /*
 =================
 idGuidedProjectile::Launch
@@ -2085,6 +2173,22 @@ void rvDriftingProjectile::Think( void ) {
 	dir = GetPhysics()->GetOrigin() - oldOrigin;
 	dir.Normalize ( );	
 	GetPhysics ( )->SetAxis ( dir.ToMat3 ( ) );
+}
+
+void rvDriftingProjectile::ThinkMatchPaused( int deltaMsec ) {
+	idProjectile::ThinkMatchPaused( deltaMsec );
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+
+	for ( int index = 0; index < 2; ++index ) {
+		float startTime = driftOffset[ index ].GetStartTime();
+		mpMatchShiftTimeOrigin( startTime, deltaMsec );
+		driftOffset[ index ].SetStartTime( startTime );
+	}
+	float startTime = driftSpeed.GetStartTime();
+	mpMatchShiftTimeOrigin( startTime, deltaMsec );
+	driftSpeed.SetStartTime( startTime );
 }
 
 /*

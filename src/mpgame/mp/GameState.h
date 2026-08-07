@@ -7,6 +7,7 @@
 #ifndef __GAMESTATE_H__
 #define __GAMESTATE_H__
 
+#include "MatchPhase.h"
 #include "../Game_local.h"
 #include "../MultiplayerGame.h"
 #include "Tourney.h"
@@ -41,17 +42,6 @@ typedef enum {
 	GS_DOMINATION
 } gameStateType_t;
 
-typedef enum {
-	INACTIVE = 0,						// not running
-	WARMUP,								// warming up
-	COUNTDOWN,							// post warmup pre-game
-	GAMEON,								// game is on
-	SUDDENDEATH,						// game is on but in sudden death, first frag wins
-	GAMEREVIEW,							// game is over, scoreboard is up. we wait si_gameReviewPause seconds (which has a min value)
-	NEXTGAME,
-	STATE_COUNT
-} mpGameState_t;
-
 class rvGameState {
 public:
 
@@ -73,7 +63,12 @@ public:
 	virtual void	GameStateChanged( void );
 
 	virtual void	Run( void );
-	virtual void	NewState( mpGameState_t newState );
+	// Returns true only after the authoritative match aggregate accepts the
+	// transition and all legacy adapter side effects are applied.
+	virtual bool	NewState( mpGameState_t newState );
+	// Rebase absolute gameplay deadlines exactly once for a frozen engine
+	// frame.  Host/network clocks and operation expiry are owned elsewhere.
+	virtual void	ShiftMatchTime( int deltaMsec );
 
 	virtual void	ClientDisconnect( idPlayer* player );
 	virtual void	Spectate( idPlayer* player );
@@ -337,7 +332,8 @@ public:
 	virtual void	UnpackState( const idBitMsg& inMsg );
 
 	virtual void	GameStateChanged( void );
-	virtual void	NewState( mpGameState_t newState );
+	virtual bool	NewState( mpGameState_t newState );
+	virtual void	ShiftMatchTime( int deltaMsec );
 
 	virtual void	ClientDisconnect( idPlayer* player );
 	virtual void	Spectate( idPlayer* player );
@@ -378,6 +374,7 @@ public:
 	static gameStateType_t GetClassType( void );
 private:
 	void			SetupInitialBrackets( void );
+	bool			CycleSpectatorTarget( idPlayer* player, int direction );
 
 	tourneyState_t			tourneyState;
 

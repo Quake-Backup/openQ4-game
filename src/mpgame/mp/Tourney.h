@@ -51,6 +51,7 @@ public:
 	idPlayer*		GetWinner( void ) { return winner; }
 	void			UpdateState( void );
 	void			NewState( arenaState_t newState );
+	void			ShiftMatchTime( int deltaMsec );
 	
 	idPlayer**		GetPlayers( void );
 

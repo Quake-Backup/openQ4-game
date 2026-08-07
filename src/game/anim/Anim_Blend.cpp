@@ -63,7 +63,8 @@ idAnim::idAnim( const idDeclModelDef *modelDef, const idAnim *anim ) {
 	frameLookup.SetNum( anim->frameLookup.Num() );
 // RAVEN BEGIN
 // JSinger: Changed to call optimized memcpy
-	SIMDProcessor->Memcpy( frameLookup.Ptr(), anim->frameLookup.Ptr(), frameLookup.MemoryUsed() );
+	SIMDProcessor->Memcpy( frameLookup.Ptr(), anim->frameLookup.Ptr(),
+		idLib::SizeToInt( frameLookup.MemoryUsed(), "idAnim::idAnim" ) );
 // RAVEN END
 
 	frameCommands.SetNum( anim->frameCommands.Num() );
@@ -3186,7 +3187,7 @@ int idDeclModelDef::GetAnim( const char *name ) const {
 	int				numAnims;
 	int				len;
 
-	len = strlen( name );
+	len = idLib::SizeToInt( strlen( name ), "idDeclModelDef::GetAnim" );
 	if ( len && idStr::CharIsNumeric( name[ len - 1 ] ) ) {
 		// find a specific animation
 		return GetSpecificAnim( name );
@@ -3539,10 +3540,10 @@ void idAnimator::Save( idSaveGame *savefile ) const {
 	savefile->WriteFloat( AFPoseBlendWeight );
 
 	savefile->WriteInt( AFPoseJoints.Num() );
-	savefile->Write( AFPoseJoints.Ptr(), AFPoseJoints.MemoryUsed() );
+	savefile->Write( AFPoseJoints.Ptr(), idLib::SizeToInt( AFPoseJoints.MemoryUsed(), "idAnimator::Save" ) );
 
 	savefile->WriteInt( AFPoseJointMods.Num() );
-	savefile->Write( AFPoseJointMods.Ptr(), AFPoseJointMods.MemoryUsed() );
+	savefile->Write( AFPoseJointMods.Ptr(), idLib::SizeToInt( AFPoseJointMods.MemoryUsed(), "idAnimator::Save" ) );
 
 	savefile->WriteInt( AFPoseJointFrameSize );
 	savefile->Write( AFPoseJointFrame, AFPoseJointFrameSize * sizeof( AFPoseJointFrame[0] ) );
@@ -3573,7 +3574,7 @@ void idAnimator::Restore( idRestoreGame *savefile ) {
 	const int maxSaveGameAnimatorItems = 4096;
 
 	savefile->ReadModelDef( modelDef );
-	savefile->ReadObject( reinterpret_cast<idClass *&>( entity ) );
+	savefile->ReadObject( entity );
 
 	savefile->ReadInt( num );
 	if ( num < 0 || num > maxSaveGameAnimatorItems ) {
@@ -3612,7 +3613,7 @@ void idAnimator::Restore( idRestoreGame *savefile ) {
 	}
 	AFPoseJoints.SetGranularity( 1 );
 	AFPoseJoints.SetNum( num );
-	savefile->Read( AFPoseJoints.Ptr(), AFPoseJoints.MemoryUsed() );
+	savefile->Read( AFPoseJoints.Ptr(), idLib::SizeToInt( AFPoseJoints.MemoryUsed(), "idAnimator::Restore" ) );
 
 	savefile->ReadInt( num );
 	if ( num < 0 || num > maxSaveGameAnimatorItems ) {
@@ -3620,7 +3621,7 @@ void idAnimator::Restore( idRestoreGame *savefile ) {
 	}
 	AFPoseJointMods.SetGranularity( 1 );
 	AFPoseJointMods.SetNum( num );
-	savefile->Read( AFPoseJointMods.Ptr(), AFPoseJointMods.MemoryUsed() );
+	savefile->Read( AFPoseJointMods.Ptr(), idLib::SizeToInt( AFPoseJointMods.MemoryUsed(), "idAnimator::Restore" ) );
 
 	savefile->ReadInt( AFPoseJointFrameSize );
 	if ( AFPoseJointFrameSize < 0 || AFPoseJointFrameSize > maxSaveGameAnimatorItems ) {

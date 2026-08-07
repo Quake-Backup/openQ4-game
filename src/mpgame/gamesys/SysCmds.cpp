@@ -2250,7 +2250,8 @@ idGameEdit::ListAnims
 */
 void idGameEdit::PrintMemInfo( MemInfo *mi ) {
 
-	int		i, count, totalSize;
+	int		i, count;
+	size_t	totalSize;
 	idAAS	*aas;
 
 	totalSize = 0;
@@ -2265,7 +2266,7 @@ void idGameEdit::PrintMemInfo( MemInfo *mi ) {
 		}
 	}
 
-	mi->aasAssetsTotal = totalSize;
+	mi->aasAssetsTotal = idLib::SizeToInt( totalSize, "idGameEdit::PrintMemInfo" );
 	mi->aasAssetsCount = count;
 
 	// jsinger: animationLib changed to a pointer
@@ -3680,7 +3681,10 @@ void idGameLocal::InitConsoleCommands( void ) {
 	cmdSystem->AddCommand( "notready",				idMultiplayerGame::NotReady_f,	CMD_FL_GAME,	"withdraw your ready state" );
 	cmdSystem->AddCommand( "unready",				idMultiplayerGame::NotReady_f,	CMD_FL_GAME,	"withdraw your ready state" );
 	cmdSystem->AddCommand( "readyup",				idMultiplayerGame::ReadyUp_f,	CMD_FL_GAME,	"toggle your ready state" );
+	cmdSystem->AddCommand( "forceReady",			idMultiplayerGame::ForceReady_f,	CMD_FL_GAME,	"force a managed match through readiness using the typed authority path" );
 	cmdSystem->AddCommand( "allready",				idMultiplayerGame::ForceReady_f,	CMD_FL_GAME,	"force all players ready" );
+	cmdSystem->AddCommand( "matchSeriesBind",		idMultiplayerGame::SeriesBind_f,	CMD_FL_GAME,	"bind a current Duel connection after series recovery: matchSeriesBind <a|b> <client slot>" );
+	cmdSystem->AddCommand( "matchBroadcaster",		idMultiplayerGame::Broadcaster_f,	CMD_FL_GAME,	"grant or revoke broadcaster observation for a current spectator: matchBroadcaster <client slot> <on|off>" );
 
 	// localization help commands
 	cmdSystem->AddCommand( "nextGUI",				Cmd_NextGUI_f,				CMD_FL_GAME|CMD_FL_CHEAT,	"teleport the player to the next func_static with a gui" );

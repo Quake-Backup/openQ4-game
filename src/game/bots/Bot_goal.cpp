@@ -374,9 +374,6 @@ idBotGoalManager::BotFreeInfoEntities
 */
 void idBotGoalManager::BotFreeInfoEntities( void )
 {
-	maplocation_t* ml, * nextml;
-	campspot_t* cs, * nextcs;
-
 //	for (ml = maplocations; ml; ml = nextml)
 //	{
 //		nextml = ml->next;
@@ -404,8 +401,6 @@ void idBotGoalManager::BotInitInfoEntities( void )
 {
 	//char classname[MAX_EPAIRKEY];
 	idStr classname;
-	maplocation_t* ml;
-	campspot_t* cs;
 
 	BotFreeInfoEntities();
 
@@ -456,10 +451,10 @@ idBotGoalManager::InitLevelItems
 */
 void idBotGoalManager::InitLevelItems( void )
 {
-	int i, spawnflags, value;
+	int i, spawnflags;
 	idStr classname;
 	idVec3 origin, end;
-	int ent, goalareanum;
+	int goalareanum;
 	itemconfig_t* ic;
 	levelitem_t* li;
 	//bsp_trace_t trace;

@@ -1034,7 +1034,7 @@ void idVarDef::PrintInfo( idFile *file, int instructionPointer ) const {
 			switch( etype ) {
 			case ev_string :
 				file->Printf( "\"" );
-				len = strlen( value.stringPtr );
+				len = idLib::SizeToInt( strlen( value.stringPtr ), "idVarDef::PrintInfo" );
 				ch = value.stringPtr;
 				for( i = 0; i < len; i++, ch++ ) {
 					if ( idStr::CharIsPrintable( *ch ) ) {
@@ -2042,11 +2042,11 @@ called after all files are compiled to report memory usage.
 ==============
 */
 void idProgram::CompileStats( void ) {
-	int	memused;
-	int	memallocated;
+	size_t	memused;
+	size_t	memallocated;
 	int	numdefs;
-	int	stringspace;
-	int funcMem;
+	size_t	stringspace;
+	size_t	funcMem;
 	int	i;
 
 	gameLocal.Printf( "-------------- Compile stats ----------------\n" );
@@ -2080,13 +2080,13 @@ void idProgram::CompileStats( void ) {
 	memused += sizeof( variables );
 
 	gameLocal.Printf( "\nMemory usage:\n" );
-	gameLocal.Printf( "     Strings: %d, %d bytes\n", fileList.Num(), stringspace );
+	gameLocal.Printf( "     Strings: %d, %zu bytes\n", fileList.Num(), stringspace );
 	gameLocal.Printf( "  Statements: %d, %zu bytes\n", statements.Num(), statements.MemoryUsed() );
-	gameLocal.Printf( "   Functions: %d, %d bytes\n", functions.Num(), funcMem );
+	gameLocal.Printf( "   Functions: %d, %zu bytes\n", functions.Num(), funcMem );
 	gameLocal.Printf( "   Variables: %d bytes\n", numVariables );
-	gameLocal.Printf( "    Mem used: %d bytes\n", memused );
+	gameLocal.Printf( "    Mem used: %zu bytes\n", memused );
 	gameLocal.Printf( " Static data: %zu bytes\n", sizeof( idProgram ) );
-	gameLocal.Printf( "   Allocated: %d bytes\n", memallocated );
+	gameLocal.Printf( "   Allocated: %zu bytes\n", memallocated );
 	gameLocal.Printf( " Thread size: %zu bytes\n\n", sizeof( idThread ) );
 }
 
@@ -2099,7 +2099,7 @@ idProgram::ScriptSummary
 */
 size_t idProgram::ScriptSummary( const idCmdArgs &args ) {
 
-	int		memused;
+	size_t	memused;
 	int		i;
 
 	memused = 0;
@@ -2128,7 +2128,7 @@ size_t idProgram::ScriptSummary( const idCmdArgs &args ) {
 	memused += sizeof( idProgram );
 	memused += sizeof( idThread );
 
-	common->Printf( "Scripts         - %dK\n", memused >> 10 );
+	common->Printf( "Scripts         - %zuK\n", memused >> 10 );
 
 	return( memused >> 10 );
 }

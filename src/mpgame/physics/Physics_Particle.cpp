@@ -10,6 +10,12 @@ END_CLASS
 const float PRT_OVERCLIP	= 1.001f;
 const float PRT_BOUNCESTOP	= 10.0f;
 
+// openQ4: how a submerged body behaves. Buoyancy is the fraction of gravity the liquid cancels, so
+// 0.6 leaves a grenade sinking at 40% of its usual rate; drag is the fraction of speed shed per
+// second, which is what stops a rocket from crossing a pool as if it were air.
+const float PRT_LIQUID_BUOYANCY	= 0.6f;
+const float PRT_LIQUID_DRAG		= 1.5f;
+
 /*
 ================
 rvPhysics_Particle::DropToFloorAndRest
@@ -407,9 +413,22 @@ bool rvPhysics_Particle::Evaluate( int timeStepMSec, int endTimeMSec ) {
 
 	clipModel->Unlink();
 
+// openQ4 BEGIN
+	// inWater used to be a one-way latch, so anything that touched a liquid once behaved as if it
+	// were submerged for the rest of its life. Refresh it from where the body actually is.
+	current.inWater = ( gameLocal.LiquidContentsAtPoint( current.origin, self ) != 0 );
+
+	// Buoyancy and drag: a submerged body falls slowly and loses speed, instead of dropping through
+	// a pool exactly as if it were air.
+	if ( current.inWater ) {
+		current.velocity -= gravityVector * timeStep * PRT_LIQUID_BUOYANCY;
+		current.velocity *= idMath::ClampFloat( 0.0f, 1.0f, 1.0f - PRT_LIQUID_DRAG * timeStep );
+	}
+// openQ4 END
+
 	// Determine if currently on the ground
 	CheckGround ( );
-	
+
 	// Determine the current upward velocity
 	if ( gravityNormal != vec3_zero ) {
 		upspeed = -( current.velocity * gravityNormal );
@@ -866,8 +885,14 @@ bool rvPhysics_Particle::SlideMove( idVec3 &start, idVec3 &velocity, const idVec
 	bool collide, rtnValue = false;
 
 	move = delta;
+// openQ4 BEGIN
+	// A liquid surface crossed during this move must not be hit twice, but the exclusion has to be
+	// local: clearing the member left the projectile permanently blind to liquid, so it could only
+	// ever detect one surface in its whole lifetime.
+	int moveClipMask = clipMask;
+// openQ4 END
 	for( i = 0; i < 3; i++ ) { // be sure if you change this upper value in the for() to update the exit condition below!!!!!
-		gameLocal.Translation( self, tr, start, start + move, clipModel, clipModel->GetAxis(), clipMask, self, extraPassEntity );
+		gameLocal.Translation( self, tr, start, start + move, clipModel, clipModel->GetAxis(), moveClipMask, self, extraPassEntity );
 
 		start = tr.endpos;
 
@@ -887,13 +912,19 @@ bool rvPhysics_Particle::SlideMove( idVec3 &start, idVec3 &velocity, const idVec
 		ent = gameLocal.entities[tr.c.entityNum];
 		assert ( ent );
 		
-		// If we hit water just clip the move for now and keep on going
-		if ( ent->GetPhysics()->GetContents() & CONTENTS_WATER ) {
-			// Make sure we dont collide with water again
-			clipMask &= ~CONTENTS_WATER;
-			
+		// If we hit a liquid just clip the move for now and keep on going
+// openQ4 BEGIN
+		const int liquidContents = gameLocal.LiquidContentsAtCollision( ent, tr );
+		if ( liquidContents ) {
+			// Make sure we dont collide with the same surface again during this move
+			moveClipMask &= ~MASK_WATER;
+
+			if ( !current.inWater ) {
+				gameLocal.PlayLiquidImpact( liquidContents, tr.c.point, tr.c.normal, self, self ? &self->spawnArgs : NULL );
+			}
 			current.inWater = true;
-			
+// openQ4 END
+
 			// Allow the loop to go one more round to push us through the water
 			i--;
 						

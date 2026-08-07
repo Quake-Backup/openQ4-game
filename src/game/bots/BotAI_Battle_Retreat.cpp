@@ -16,7 +16,7 @@ stateResult_t rvmBot::state_Retreat(const stateParms_t& parms)
 	idPlayer* entinfo;
 	rvmBot* owner;
 	idVec3 target, dir;
-	float attack_skill, range;
+	float range;
 
 	// respawn if dead.
 	if( BotIsDead( &bs ) )

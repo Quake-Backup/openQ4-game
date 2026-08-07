@@ -101,6 +101,19 @@ if is_msvc
     '/wd4740',
     '/wd4750',
   ]
+
+  # Keep the warning classes cleaned up in the supported Windows x64 build as
+  # hard errors without imposing a blanket /WX policy on legacy SDK sources.
+  if host_cpu_family == 'x86_64'
+    cleaned_windows_x64_warning_errors = [
+      '/we4101',
+      '/we4189',
+      '/we4267',
+      '/we4324',
+      '/we4505',
+    ]
+    common_cpp_args += cleaned_windows_x64_warning_errors
+  endif
 else
   if not cpp.has_argument('-std=c++17')
     if is_darwin
@@ -207,15 +220,24 @@ endforeach
 game_dll_define_arg = define_arg_prefix + 'GAME_DLL'
 game_mpapi_define_arg = define_arg_prefix + 'GAME_MPAPI'
 
-# Keep this list identical to the engine repo's game_idlib_discovery, which
-# excludes Simd_AltiVec.cpp and nothing else. The per-architecture SIMD sources
-# guard their own bodies (Simd_SSE2.h only defines ID_SIMD_SSE2_AVAILABLE on
-# x86/x86-64), and idSIMD::InitProcessor constructs idSIMD_SSE2 unconditionally
-# on x86-64 -- so excluding Simd_SSE2.cpp there left the archive without the
-# definition the module needs.
+# This repository retains the SDK's MSVC x86 inline-assembly SIMD sources. The
+# engine has newer portable/intrinsic implementations, so its source list is
+# intentionally different. Simd.cpp selects the generic implementation on
+# every non-x86 target supported here; do not ask x64/ARM64 compilers to parse
+# the legacy sources.
 idlib_excludes = [
   'idlib/math/Simd_AltiVec.cpp',
 ]
+
+if host_cpu_family != 'x86'
+  idlib_excludes += [
+    'idlib/math/Simd_3DNow.cpp',
+    'idlib/math/Simd_MMX.cpp',
+    'idlib/math/Simd_SSE.cpp',
+    'idlib/math/Simd_SSE2.cpp',
+    'idlib/math/Simd_SSE3.cpp',
+  ]
+endif
 
 idlib_source_output = run_command(
   py,

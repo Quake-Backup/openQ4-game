@@ -254,6 +254,16 @@ extern idCVar	pm_thirdPersonDeath;
 extern idCVar	pm_modelView;
 extern idCVar	pm_airTics;
 
+// openQ4 BEGIN
+extern idCVar	pm_waterAirTics;
+extern idCVar	g_liquidDamageInterval;
+extern idCVar	g_drownDamageMax;
+extern idCVar	g_liquidScreenTint;
+extern idCVar	g_debugLiquid;
+extern idCVar	g_liquidTestVolume;
+extern idCVar	g_liquidTestVolumeSize;
+// openQ4 END
+
 // RAVEN BEGIN
 // asalmon: parameters for aim assistance on Xenon
 #ifdef _XBOX

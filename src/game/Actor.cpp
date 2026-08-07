@@ -84,10 +84,10 @@ void idAnimState::Restore( idRestoreGame *savefile ) {
 	savefile->ReadInt( animBlendFrames );
 	savefile->ReadInt( lastAnimBlendFrames );
 
-	savefile->ReadObject( reinterpret_cast<idClass *&>( self ) );
+	savefile->ReadObject( self );
 
 	idEntity *animowner;
-	savefile->ReadObject( reinterpret_cast<idClass *&>( animowner ) );
+	savefile->ReadObject( animowner );
 	if ( animowner ) {
 		animator = animowner->GetAnimator();
 	}
@@ -918,7 +918,7 @@ void idActor::Restore( idRestoreGame *savefile ) {
 		savefile->Error( "idActor::Restore: invalid enemy count %d", num );
 	}
 	for ( i = 0; i < num; i++ ) {
-		savefile->ReadObject( reinterpret_cast<idClass *&>( ent ) );
+		savefile->ReadObject( ent );
 		assert( ent );
 		if ( ent ) {
 			ent->enemyNode.AddToEnd( enemyList );
@@ -2963,6 +2963,28 @@ void idActor::FootStep ( void ) {
 	if ( !GetPhysics()->HasGroundContacts() ) {
 		return;
 	}
+
+// openQ4 BEGIN
+	// Wading. Retail player.def has carried snd_water_wade since 2005 and nothing has ever read it.
+	// Quake 3 swaps the footstep for a splash whenever the feet are in liquid, whatever the floor
+	// underneath happens to be made of.
+	if ( GetPhysics()->IsInWater() ) {
+		const char *wadeSound = spawnArgs.GetString( "snd_water_wade" );
+		if ( !wadeSound || !*wadeSound ) {
+			const idDict *liquidDict = gameLocal.FindEntityDefDict( "liquid_openq4", false );
+			if ( liquidDict ) {
+				wadeSound = liquidDict->GetString( "snd_wade" );
+			}
+		}
+		if ( wadeSound && *wadeSound ) {
+			const idSoundShader *wadeShader = declManager->FindSound( wadeSound, false );
+			if ( wadeShader ) {
+				StartSoundShader( wadeShader, SND_CHANNEL_BODY, 0, false, NULL );
+				return;
+			}
+		}
+	}
+// openQ4 END
 
 	// start footstep sound based on material type
 	materialType = GetPhysics()->GetContact( 0 ).materialType;

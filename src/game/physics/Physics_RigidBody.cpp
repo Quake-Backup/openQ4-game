@@ -15,9 +15,13 @@ const float RB_COLLISION_MIN_TIMESTEP = 0.0001f;
 const float RB_COLLISION_FRACTION_EPSILON = 0.0001f;
 const float RB_CONTACT_MERGE_EPSILON = 2.0f;
 const float RB_WATER_FRICTION_SCALE = 20.0f;
+// openQ4: fraction of a submerged body's weight the liquid holds up. Below 1 everything still
+// sinks, just slowly, which is what Quake's crates and gibs do.
+const float RB_LIQUID_BUOYANCY = 0.8f;
 
 static ID_INLINE int RigidBodyClipMask( int clipMask ) {
-	return clipMask & ~CONTENTS_WATER;
+	// openQ4: liquids are passed through, not collided with - all three of them, not just water
+	return clipMask & ~MASK_WATER;
 }
 
 static ID_INLINE idMat3 RigidBodyWorldInertiaTensor( const idMat3 &orientation, const idMat3 &inertiaTensor ) {
@@ -528,7 +532,7 @@ void idPhysics_RigidBody_SavePState( idSaveGame *savefile, const rigidBodyPState
 	savefile->WriteFloat( state.lastTimeStep );
 	savefile->WriteVec3( state.localOrigin );
 	savefile->WriteMat3( state.localAxis );
-	savefile->Write( &state.pushVelocity, sizeof( state.pushVelocity ) );
+	savefile->WriteVec6( state.pushVelocity );
 	savefile->WriteVec3( state.externalForce );
 	savefile->WriteVec3( state.externalTorque );
 
@@ -548,7 +552,11 @@ void idPhysics_RigidBody_RestorePState( idRestoreGame *savefile, rigidBodyPState
 	savefile->ReadFloat( state.lastTimeStep );
 	savefile->ReadVec3( state.localOrigin );
 	savefile->ReadMat3( state.localAxis );
-	savefile->Read( &state.pushVelocity, sizeof( state.pushVelocity ) );
+	if ( savefile->GetOpenQ4SaveGameCompatibilityVersion() == OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		savefile->ReadVec6( state.pushVelocity );
+	} else {
+		savefile->Read( &state.pushVelocity, sizeof( state.pushVelocity ) );
+	}
 	savefile->ReadVec3( state.externalForce );
 	savefile->ReadVec3( state.externalTorque );
 
@@ -980,10 +988,17 @@ bool idPhysics_RigidBody::Evaluate( int timeStepMSec, int endTimeMSec ) {
 	while ( remainingTime > RB_COLLISION_MIN_TIMESTEP ) {
 		next = current;
 
-		// Treat water as a damping medium instead of a one-time blocking collision hack.
+		// Treat liquid as a damping medium instead of a one-time blocking collision hack.
 		if ( IsInWater() ) {
 			current.externalForce -= ( RB_WATER_FRICTION_SCALE - 1.0f ) * linearFriction * current.i.linearMomentum;
 			current.externalTorque -= ( RB_WATER_FRICTION_SCALE - 1.0f ) * angularFriction * current.i.angularMomentum;
+
+// openQ4 BEGIN
+			// Buoyancy. Without this a crate dropped in a pool falls to the bottom at full gravity
+			// and only looks slow because of the drag above. Cancelling most of the weight lets
+			// debris settle the way it does in the older Quake games.
+			current.externalForce -= RB_LIQUID_BUOYANCY * mass * gravityVector;
+// openQ4 END
 		}
 
 		// calculate next position and orientation
@@ -1239,7 +1254,7 @@ bool idPhysics_RigidBody::IsInWater( void ) const {
 	if ( clipModel == NULL ) {
 		return false;
 	}
-	return ( gameLocal.Contents( self, current.i.position, clipModel, current.i.orientation, CONTENTS_WATER, self ) & CONTENTS_WATER ) != 0;
+	return ( gameLocal.Contents( self, current.i.position, clipModel, current.i.orientation, MASK_WATER, self ) & MASK_WATER ) != 0;
 }
 
 /*
