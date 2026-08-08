@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -10,8 +11,36 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _resolve_engine_root() -> Path:
+    """Locate a sibling openQ4 checkout, if the caller has one."""
+
+    override = os.environ.get("OPENQ4_ENGINE_REPO", "").strip()
+    if override:
+        return Path(override)
+    for name in ("openQ4", "OpenQ4"):
+        candidate = ROOT.parent / name
+        if candidate.is_dir():
+            return candidate
+    return ROOT.parent / "openQ4"
+
+
+ENGINE_ROOT = _resolve_engine_root()
+
+
 def read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def read_engine(relative_path: str) -> str | None:
+    """Read a file this repository does not own, when the engine is present.
+
+    src/sys/win32/ is entirely untracked here - .gitignore's "Win32/" rule
+    matches it case-insensitively - so these paths only exist for developers
+    with both checkouts, never in this repository's CI.
+    """
+
+    path = ENGINE_ROOT / relative_path
+    return path.read_text(encoding="utf-8", errors="surrogateescape") if path.is_file() else None
 
 
 def require(haystack: str, needle: str, context: str) -> None:
@@ -28,7 +57,7 @@ def main() -> None:
     src_meson = read("src/meson.build")
     options = read("meson_options.txt")
     sys_public = read("src/sys/sys_public.h")
-    win_main_cpp = read("src/sys/win32/win_main.cpp")
+    win_main_cpp = read_engine("src/sys/win32/win_main.cpp")
     lib_cpp = read("src/idlib/Lib.cpp")
     lib_h = read("src/idlib/Lib.h")
     base64_cpp = read("src/idlib/Base64.cpp")
@@ -230,8 +259,14 @@ def main() -> None:
     require(sys_public, "idSocketHandle_t\tfd;", "TCP socket handle")
     require(sys_public, "uint32_t\t\tthreadId;", "fixed-width thread identifier")
     reject(sys_public, "unsigned long\tthreadId;", "LP64-wide thread identifier")
-    require(win_main_cpp, "DWORD threadId = 0;", "native CreateThread identifier output")
-    require(win_main_cpp, "info.threadId = static_cast<uint32_t>( threadId );", "fixed-width stored thread identifier")
+    if win_main_cpp is None:
+        print(
+            "linux_portability_contract: skipped win_main.cpp checks "
+            f"(no engine checkout at {ENGINE_ROOT})"
+        )
+    else:
+        require(win_main_cpp, "DWORD threadId = 0;", "native CreateThread identifier output")
+        require(win_main_cpp, "info.threadId = static_cast<uint32_t>( threadId );", "fixed-width stored thread identifier")
 
     require(lib_cpp, "#if defined( MACOS_X ) || defined( __linux__ )", "POSIX signal header")
     require(lib_cpp, "raise( SIGTRAP );", "portable Linux assertion trap")
