@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import os
 from pathlib import Path
 
 
@@ -15,7 +16,25 @@ HEADER = MATCH_DIR / "MatchSeriesReportFileSystem.h"
 SOURCE = MATCH_DIR / "MatchSeriesReportFileSystem.cpp"
 STORAGE_HEADER = MATCH_DIR / "MatchSeriesReportStorage.h"
 STORAGE_SOURCE = MATCH_DIR / "MatchSeriesReportStorage.cpp"
-ENGINE_ROOT = ROOT.parent / "OpenQ4"
+def _resolve_engine_root() -> Path:
+    """Locate a sibling openQ4 checkout, if the caller has one.
+
+    The directory is named "openQ4"; hardcoding "OpenQ4" only ever resolved on
+    case-insensitive filesystems, so on Linux the engine-side assertions were
+    skipped even when the engine was checked out beside this repository.
+    """
+
+    override = os.environ.get("OPENQ4_ENGINE_REPO", "").strip()
+    if override:
+        return Path(override)
+    for name in ("openQ4", "OpenQ4"):
+        candidate = ROOT.parent / name
+        if candidate.is_dir():
+            return candidate
+    return ROOT.parent / "openQ4"
+
+
+ENGINE_ROOT = _resolve_engine_root()
 
 
 def read(path: Path) -> str:

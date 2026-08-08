@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import os
 from pathlib import Path
 
 
@@ -17,7 +18,25 @@ SOURCE = MATCH_DIR / "MatchEvidenceStorage.cpp"
 EVIDENCE_SOURCE = MATCH_DIR / "MatchEvidence.cpp"
 FILESYSTEM_HEADER = MATCH_DIR / "MatchEvidenceFileSystem.h"
 FILESYSTEM_SOURCE = MATCH_DIR / "MatchEvidenceFileSystem.cpp"
-ENGINE_ROOT = ROOT.parent / "OpenQ4"
+def _resolve_engine_root() -> Path:
+    """Locate a sibling openQ4 checkout, if the caller has one.
+
+    The directory is named "openQ4"; hardcoding "OpenQ4" only ever resolved on
+    case-insensitive filesystems, so on Linux the engine-side assertions were
+    skipped even when the engine was checked out beside this repository.
+    """
+
+    override = os.environ.get("OPENQ4_ENGINE_REPO", "").strip()
+    if override:
+        return Path(override)
+    for name in ("openQ4", "OpenQ4"):
+        candidate = ROOT.parent / name
+        if candidate.is_dir():
+            return candidate
+    return ROOT.parent / "openQ4"
+
+
+ENGINE_ROOT = _resolve_engine_root()
 ENGINE_FILESYSTEM_HEADER = ENGINE_ROOT / "src/framework/FileSystem.h"
 ENGINE_FILESYSTEM_SOURCE = ENGINE_ROOT / "src/framework/FileSystem.cpp"
 

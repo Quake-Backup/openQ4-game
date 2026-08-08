@@ -4,11 +4,30 @@
 from __future__ import annotations
 
 import re
+import os
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ENGINE_ROOT = ROOT.parent / "OpenQ4"
+def _resolve_engine_root() -> Path:
+    """Locate a sibling openQ4 checkout, if the caller has one.
+
+    The directory is named "openQ4"; hardcoding "OpenQ4" only ever resolved on
+    case-insensitive filesystems, so on Linux the engine-side assertions were
+    skipped even when the engine was checked out beside this repository.
+    """
+
+    override = os.environ.get("OPENQ4_ENGINE_REPO", "").strip()
+    if override:
+        return Path(override)
+    for name in ("openQ4", "OpenQ4"):
+        candidate = ROOT.parent / name
+        if candidate.is_dir():
+            return candidate
+    return ROOT.parent / "openQ4"
+
+
+ENGINE_ROOT = _resolve_engine_root()
 
 
 def read(relative_path: str) -> str:
@@ -66,8 +85,14 @@ def main() -> None:
     multiplayer_h = read("src/mpgame/MultiplayerGame.h")
     network = read("src/mpgame/Game_network.cpp")
     cvars = read("src/mpgame/gamesys/SysCvar.cpp")
-    mpmain = (ENGINE_ROOT / "content/baseoq4/pak0/guis/mpmain.gui").read_text(
-        encoding="utf-8", errors="replace"
+    # The GUI lives in the engine repository, which this repository's CI does
+    # not check out. Skip only the engine-side assertions when it is absent,
+    # the way the other cross-repository contracts here do.
+    mpmain_path = ENGINE_ROOT / "content/baseoq4/pak0/guis/mpmain.gui"
+    mpmain = (
+        mpmain_path.read_text(encoding="utf-8", errors="replace")
+        if mpmain_path.is_file()
+        else None
     )
 
     ready = body(multiplayer, "bool idMultiplayerGame::AllPlayersReady")
@@ -456,18 +481,24 @@ def main() -> None:
         "cast-vote validation before mutation",
     )
 
-    require(
-        mpmain,
-        'if( "gui::si_allowVoting" == 1 && "gui::si_managedMatch" == 0)',
-        "managed in-game vote menu hiding",
-    )
-    require(mpmain, "windowDef vote_managed_notice", "managed vote local rejection")
-    require(mpmain, 'text\t"#str_41773"', "localized managed vote rejection")
-    require(
-        mpmain,
-        'if ( "gui::si_managedMatch" == 1 )',
-        "managed vote panel fail-closed guard",
-    )
+    if mpmain is None:
+        print(
+            "mp_vote_security_contract: skipped mpmain.gui checks "
+            f"(no engine checkout at {ENGINE_ROOT})"
+        )
+    else:
+        require(
+            mpmain,
+            'if( "gui::si_allowVoting" == 1 && "gui::si_managedMatch" == 0)',
+            "managed in-game vote menu hiding",
+        )
+        require(mpmain, "windowDef vote_managed_notice", "managed vote local rejection")
+        require(mpmain, 'text\t"#str_41773"', "localized managed vote rejection")
+        require(
+            mpmain,
+            'if ( "gui::si_managedMatch" == 1 )',
+            "managed vote panel fail-closed guard",
+        )
 
     require(
         multiplayer,
