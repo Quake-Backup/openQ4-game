@@ -117,6 +117,10 @@ public:
 	// Shut down the entire game.
 	virtual void				Shutdown( void ) = 0;
 
+	// Release module-owned support state after the engine has destroyed every
+	// declaration whose implementation and allocator live in this module.
+	virtual void				ShutdownAfterDecls( void ) = 0;
+
 	// Set the local client number. Distinguishes listen ( == 0 ) / dedicated ( == -1 )
 	virtual void				SetLocalClient( int clientNum ) = 0;
 
@@ -682,7 +686,9 @@ extern rvGameLog *				gameLog;
 // 40: versioned MVD schema, routed instance messages, and fallible snapshot decoding
 // 41: operating-system secure-random service for game-module authentication
 // 42: durable server MVD publication results for competitive match evidence
-const int GAME_API_VERSION		= 42;
+// 43: two-phase game shutdown keeps module decl/animation/idLib state alive
+//     until the engine declaration manager has released module-owned decls
+const int GAME_API_VERSION		= 43;
 
 struct gameImport_t {
 

@@ -306,7 +306,13 @@ idGameLocal::idGameLocal
 ============
 */
 idGameLocal::idGameLocal() :
-	mapMediaPrecacheSeen( 4096 ) {
+	mapMediaPrecacheSeen( 4096 ),
+	moduleIdLibInitialized( false ),
+	moduleShutdownStarted( false ),
+	moduleShutdownFinalized( false ),
+	moduleEventInitStarted( false ),
+	moduleClassInitStarted( false ),
+	moduleProgramInitStarted( false ) {
 	Clear();
 }
 
@@ -502,6 +508,16 @@ void idGameLocal::Init( void ) {
 	const idDict *dict;
 	idAAS *aas;
 
+	// A loaded game object gets one early service-aware shutdown and one late
+	// module-lifetime finalization.  Reset the one-shot guards before any part
+	// of initialization can report an error.
+	moduleShutdownStarted = false;
+	moduleShutdownFinalized = false;
+	moduleEventInitStarted = false;
+	moduleClassInitStarted = false;
+	moduleProgramInitStarted = false;
+	assert( !moduleIdLibInitialized );
+
 #ifndef GAME_DLL
 
 	TestGameAPI();
@@ -519,6 +535,7 @@ void idGameLocal::Init( void ) {
 // RAVEN END
 	// initialize idLib
 	idLib::Init();
+	moduleIdLibInitialized = true;
 
 	// register static cvars declared in the game
 	idCVar::RegisterStaticVars();
@@ -601,15 +618,18 @@ void idGameLocal::Init( void ) {
 
 	Clear();
 
+	moduleEventInitStarted = true;
 	idEvent::Init();
 // RAVEN BEGIN
 // jnewquist: Register subclasses explicitly so they aren't dead-stripped
 	idClass::RegisterClasses();
 // RAVEN END
+	moduleClassInitStarted = true;
 	idClass::Init();
 
 	InitConsoleCommands();
 	// load default scripts
+	moduleProgramInitStarted = true;
 	program.Startup( SCRIPT_DEFAULT );
 	
 	// set up the aas
@@ -698,8 +718,33 @@ idGameLocal::Shutdown
 void idGameLocal::Shutdown( void ) {
 
 	int		i;
+	if ( moduleShutdownStarted ) {
+		return;
+	}
+	moduleShutdownStarted = true;
 
 	if ( !common ) {
+		return;
+	}
+
+	// Fatal startup failures can arrive before the runtime is complete.  Release
+	// only subsystems whose initialization began; the late phase still removes
+	// callbacks and releases animation/idLib after declarations are gone.
+	if ( gamestate == GAMESTATE_UNINITIALIZED ) {
+		aasList.DeleteContents( true );
+		aasNames.Clear();
+		if ( moduleEventInitStarted ) {
+			idEvent::Shutdown();
+			moduleEventInitStarted = false;
+		}
+		if ( moduleProgramInitStarted ) {
+			program.Shutdown();
+			moduleProgramInitStarted = false;
+		}
+		if ( moduleClassInitStarted ) {
+			idClass::Shutdown();
+			moduleClassInitStarted = false;
+		}
 		return;
 	}
 
@@ -730,11 +775,20 @@ void idGameLocal::Shutdown( void ) {
 	// shutdown the model exporter
 	idModelExport::Shutdown();
 
-	idEvent::Shutdown();
+	if ( moduleEventInitStarted ) {
+		idEvent::Shutdown();
+		moduleEventInitStarted = false;
+	}
 
-	program.Shutdown();
+	if ( moduleProgramInitStarted ) {
+		program.Shutdown();
+		moduleProgramInitStarted = false;
+	}
 
-	idClass::Shutdown();
+	if ( moduleClassInitStarted ) {
+		idClass::Shutdown();
+		moduleClassInitStarted = false;
+	}
 
 	// clear list with forces
 	idForce::ClearForceList();
@@ -771,16 +825,11 @@ void idGameLocal::Shutdown( void ) {
 	aiManager.Clear();
 // RAVEN END
 
-	ShutdownConsoleCommands();
-
 	// free memory allocated by class objects
 	Clear();
 
-	// shut down the animation manager
-// RAVEN BEGIN
-// jsinger: animationLib changed to a pointer
-	animationLib->Shutdown();
-// RAVEN END
+	// animationLib remains live until ShutdownAfterDecls() because model decl
+	// idAnim destructors still decrement idMD5Anim references.
 
 // RAVEN BEGIN
 // rjohnson: entity usage stats
@@ -790,18 +839,50 @@ void idGameLocal::Shutdown( void ) {
 	Printf( "---------------------------------------------\n" );
 
 	instances.DeleteContents( true );
+}
+
+/*
+===========
+idGameLocal::ShutdownAfterDecls
+
+  release module-owned support state after engine decl destruction
+============
+*/
+void idGameLocal::ShutdownAfterDecls( void ) {
+	if ( moduleShutdownFinalized ) {
+		return;
+	}
+	moduleShutdownFinalized = true;
+
+	// Remove every engine callback into this binary immediately before unload.
+	// Keeping this in the late phase also covers a partially completed Init().
+	if ( cmdSystem != NULL ) {
+		ShutdownConsoleCommands();
+	}
+	if ( cvarSystem != NULL ) {
+		cvarSystem->RemoveFlaggedAutoCompletion( CVAR_GAME );
+	}
+
+	if ( animationLib != NULL ) {
+		animationLib->Shutdown();
+		delete animationLib;
+		animationLib = NULL;
+	}
+
+	delete visemeTable100;
+	visemeTable100 = NULL;
+	delete visemeTable66;
+	visemeTable66 = NULL;
+	delete visemeTable33;
+	visemeTable33 = NULL;
 
 #ifdef GAME_DLL
-
-	// remove auto-completion function pointers pointing into this DLL
-	cvarSystem->RemoveFlaggedAutoCompletion( CVAR_GAME );
-
-	// enable leak test
-	Mem_EnableLeakTest( "game" );
-
-	// shutdown idLib
-	idLib::ShutDown();
-
+	if ( moduleIdLibInitialized ) {
+		// All module-owned decl objects and animation references are gone now.
+		Mem_EnableLeakTest( "game" );
+		idLib::ShutDown();
+		moduleIdLibInitialized = false;
+	}
 #endif
 }
 

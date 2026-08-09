@@ -533,7 +533,7 @@ typedef struct {
 
 class idPort {
 public:
-				idPort();				// this just zeros netSocket and port
+				idPort();				// initializes the platform socket state and port
 	virtual		~idPort();
 
 	// if the InitForPort fails, the idPort.port field will remain 0
@@ -556,6 +556,7 @@ private:
 	netadr_t	bound_to;		// interface and port
 	idSocketHandle_t	netSocket;		// OS specific socket
 	idSocketHandle_t	netSocket6;		// OS specific IPv6 socket
+	void *		platformData;		// OS specific per-socket state
 };
 
 class idTCP {
@@ -564,7 +565,7 @@ public:
 	virtual		~idTCP();
 
 	// if host is host:port, the value of port is ignored
-	bool		Init( const char *host, short port );
+	bool		Init( const char *host, int port );
 	void		Close();
 
 	// returns -1 on failure (and closes socket)

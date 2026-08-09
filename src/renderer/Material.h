@@ -505,6 +505,21 @@ public:
 	// get a specific stage
 	const shaderStage_t* GetStage(const int index) const { assert(index >= 0 && index < numStages); return &stages[index]; }
 
+	// Retarget a parsed stage without rewriting authored declaration text.
+	// Runtime-generated images (for example the scalable console font atlas)
+	// must not change the declaration checksum used by multiplayer handshakes.
+	bool				OverrideStageImageForRuntime(const int index, idImage* image) {
+		if (index < 0 || index >= numStages || image == NULL) {
+			return false;
+		}
+		shaderStage_t& stage = stages[index];
+		if (stage.newStage != NULL || stage.texture.cinematic != NULL || stage.texture.dynamic != DI_STATIC) {
+			return false;
+		}
+		stage.texture.image = image;
+		return true;
+	}
+
 	// get the first bump map stage, or NULL if not present.
 	// used for bumpy-specular
 	const shaderStage_t* GetBumpStage(void) const;

@@ -565,6 +565,7 @@ public:
 #endif
 // RAVEN END
 	virtual void			Shutdown( void );
+	virtual void			ShutdownAfterDecls( void );
 	virtual void			SetLocalClient( int clientNum );
 	virtual void			ThrottleUserInfo( void );
 	virtual const idDict *	SetUserInfo( int clientNum, const idDict &userInfo, bool isClient );
@@ -1170,6 +1171,12 @@ private:
 	idHashTable<int>		mapMediaPrecacheSeen;
 	int						mapMediaPrecacheRequests;
 	int						mapMediaPrecacheSkips;
+	bool					moduleIdLibInitialized;
+	bool					moduleShutdownStarted;
+	bool					moduleShutdownFinalized;
+	bool					moduleEventInitStarted;
+	bool					moduleClassInitStarted;
+	bool					moduleProgramInitStarted;
 
 // jmarshall
 	rvmGameRender_t			gameRender;
