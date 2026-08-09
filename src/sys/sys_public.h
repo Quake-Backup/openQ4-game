@@ -517,8 +517,13 @@ typedef enum {
 	NA_IP,
 	NA_IP6,
 // jmarshall
-	NA_BOT
+	NA_BOT,
 // jmarshall end
+	// IPv6 has no broadcast address. NA_MULTICAST6 stands in for it during LAN
+	// discovery and resolves to the net_mcast6addr group in the platform layer.
+	// It is appended so the values above keep the numbering the game module was
+	// built against.
+	NA_MULTICAST6
 } netadrtype_t;
 
 typedef struct {
