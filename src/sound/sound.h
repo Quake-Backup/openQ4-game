@@ -439,40 +439,82 @@ public:
 	// get a new emitter that can play sounds in this world
 	virtual idSoundWorld* GetSoundWorldFromId(int worldId) = 0;
 
+	// The sound worlds these helpers reach through belong to the session, which
+	// allocates them in idSessionLocal::Init and drops them in Shutdown. Engine
+	// teardown runs outside that window: idCommonLocal::FatalError shuts the
+	// session down from anywhere in startup, so a renderer that fails to bring
+	// up its device tears down before any world exists. A missing world is
+	// therefore ordinary state, not a programming error, and matches the NULL
+	// check idSoundSystemLocal::FreeSoundEmitter already makes on the same
+	// accessor (issue #96).
 	idSoundEmitter* EmitterForIndex(int worldId, int index) {
-		return GetSoundWorldFromId(worldId)->EmitterForIndex(index);
+		idSoundWorld* soundWorld = GetSoundWorldFromId(worldId);
+		if (soundWorld == NULL) {
+			return NULL;
+		}
+		return soundWorld->EmitterForIndex(index);
 	}
 
 	void			FadeSoundClasses(int worldId, const int soundClass, const float to, const float over) {
-		GetSoundWorldFromId(worldId)->FadeSoundClasses(soundClass, to, over);
+		idSoundWorld* soundWorld = GetSoundWorldFromId(worldId);
+		if (soundWorld == NULL) {
+			return;
+		}
+		soundWorld->FadeSoundClasses(soundClass, to, over);
 	}
 
 	void			PlayShaderDirectly(int worldId, const char* name, int channel = -1) {
-		GetSoundWorldFromId(worldId)->PlayShaderDirectly(name, channel);
+		idSoundWorld* soundWorld = GetSoundWorldFromId(worldId);
+		if (soundWorld == NULL) {
+			return;
+		}
+		soundWorld->PlayShaderDirectly(name, channel);
 	}
 
 	virtual int				AllocSoundEmitter(int worldId) {
-		return GetSoundWorldFromId(worldId)->AllocSoundEmitter()->Index();
+		idSoundWorld* soundWorld = GetSoundWorldFromId(worldId);
+		if (soundWorld == NULL) {
+			// index 0 is the reserved "no emitter" handle; EmitterForIndex and
+			// FreeSoundEmitter both already treat it as invalid
+			return 0;
+		}
+		return soundWorld->AllocSoundEmitter()->Index();
 	}
 	virtual void			FreeSoundEmitter(int worldId, int handle, bool immediate) {
 
 	}
 
 	virtual void StopAllSounds(int worldId) {
-		GetSoundWorldFromId(worldId)->StopAllSounds();
+		idSoundWorld* soundWorld = GetSoundWorldFromId(worldId);
+		if (soundWorld == NULL) {
+			return;
+		}
+		soundWorld->StopAllSounds();
 	}
 
 	virtual void SetActiveSoundWorld(bool val) {  }
 
 	virtual void			WriteToSaveGame(int worldId, idFile* savefile) {
-		GetSoundWorldFromId(worldId)->WriteToSaveGame(savefile);
+		idSoundWorld* soundWorld = GetSoundWorldFromId(worldId);
+		if (soundWorld == NULL) {
+			return;
+		}
+		soundWorld->WriteToSaveGame(savefile);
 	}
 	virtual void			ReadFromSaveGame(int worldId, idFile* savefile) {
-		GetSoundWorldFromId(worldId)->ReadFromSaveGame(savefile);
+		idSoundWorld* soundWorld = GetSoundWorldFromId(worldId);
+		if (soundWorld == NULL) {
+			return;
+		}
+		soundWorld->ReadFromSaveGame(savefile);
 	}
 
 	void			PlaceListener(const idVec3& origin, const idMat3& axis, const int listenerId, const int gameTime, const idStr& areaName) {
-		GetSoundWorldFromId(SOUNDWORLD_GAME)->PlaceListener(origin, axis, listenerId);
+		idSoundWorld* soundWorld = GetSoundWorldFromId(SOUNDWORLD_GAME);
+		if (soundWorld == NULL) {
+			return;
+		}
+		soundWorld->PlaceListener(origin, axis, listenerId);
 	}
 
 	virtual	float			CurrentShakeAmplitudeForPosition(int worldId, const int time, const idVec3& listenerPosition) {
