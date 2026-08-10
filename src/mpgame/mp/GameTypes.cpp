@@ -44,17 +44,20 @@ static const mpGameTypeInfo_t mpGameTypeInfoTable[] = {
 	{	GAME_TDM,				"Team DM",				"tdm",		"#str_107677",	"Team DM",			"Team DM",
 		GTF_TEAM | GTF_FRAGLIMIT | GTF_BUYING, MP_GAMESTATE_TEAMDM, true },
 
+	// The flag modes carry GTF_BUYING because retail Quake 4 allowed the buy
+	// menu everywhere except Tourney; the flag now drives that rule rather than
+	// a hard-coded exclusion, so it has to say what shipped.
 	{	GAME_CTF,				"CTF",					"ctf",		"#str_107678",	"CTF",				"CTF",
-		GTF_TEAM | GTF_FLAG | GTF_CAPTURELIMIT, MP_GAMESTATE_CTF, true },
+		GTF_TEAM | GTF_FLAG | GTF_CAPTURELIMIT | GTF_BUYING, MP_GAMESTATE_CTF, true },
 
 	{	GAME_1F_CTF,			"One Flag CTF",			"1fctf",	"#str_107680",	"CTF",				"CTF",
-		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_CAPTURELIMIT, MP_GAMESTATE_CTF, true },
+		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_CAPTURELIMIT | GTF_BUYING, MP_GAMESTATE_CTF, true },
 
 	{	GAME_ARENA_CTF,			"Arena CTF",			"actf",		"#str_107681",	"Arena CTF",		"Arena CTF",
-		GTF_TEAM | GTF_FLAG | GTF_ARENA | GTF_CAPTURELIMIT, MP_GAMESTATE_CTF, true },
+		GTF_TEAM | GTF_FLAG | GTF_ARENA | GTF_CAPTURELIMIT | GTF_BUYING, MP_GAMESTATE_CTF, true },
 
 	{	GAME_ARENA_1F_CTF,		"Arena One Flag CTF",	"a1fctf",	"#str_107682",	"Arena CTF",		"Arena CTF",
-		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_ARENA | GTF_CAPTURELIMIT, MP_GAMESTATE_CTF, true },
+		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_ARENA | GTF_CAPTURELIMIT | GTF_BUYING, MP_GAMESTATE_CTF, true },
 
 	{	GAME_DEADZONE,			"DeadZone",				"dz",		"#str_122001",	"DeadZone",			"DeadZone",
 		GTF_TEAM | GTF_DEADZONE | GTF_BUYING, MP_GAMESTATE_DEADZONE, true },
@@ -64,7 +67,8 @@ static const mpGameTypeInfo_t mpGameTypeInfoTable[] = {
 		GTF_DUEL | GTF_FRAGLIMIT, MP_GAMESTATE_DUEL, true },
 
 	{	GAME_CA,				"Clan Arena",			"ca",		"#str_41301",	"Team DM",			"Team DM",
-		GTF_TEAM | GTF_ROUND | GTF_ELIMINATION | GTF_ROUNDLIMIT | GTF_DAMAGESCORE, MP_GAMESTATE_CA, true },
+		GTF_TEAM | GTF_ROUND | GTF_ELIMINATION | GTF_ROUNDLIMIT | GTF_DAMAGESCORE | GTF_FULLARSENAL,
+		MP_GAMESTATE_CA, true },
 
 	{	GAME_FREEZETAG,			"Freeze Tag",			"ft",		"#str_41302",	"Team DM",			"Team DM",
 		GTF_TEAM | GTF_ROUND | GTF_ELIMINATION | GTF_FREEZE | GTF_ROUNDLIMIT, MP_GAMESTATE_FREEZETAG, true },
@@ -82,7 +86,7 @@ static const mpGameTypeInfo_t mpGameTypeInfoTable[] = {
 		GTF_TEAM | GTF_CONTROLPOINT | GTF_SCORELIMIT, MP_GAMESTATE_NONE, false },
 
 	{	GAME_ATTACK_DEFEND,		"Attack Defend",		"ad",		"#str_41307",	"CTF",				"CTF",
-		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_ROUND | GTF_ELIMINATION | GTF_TURNS | GTF_SCORELIMIT | GTF_DAMAGESCORE,
+		GTF_TEAM | GTF_FLAG | GTF_ONEFLAG | GTF_ROUND | GTF_ELIMINATION | GTF_TURNS | GTF_SCORELIMIT | GTF_DAMAGESCORE | GTF_FULLARSENAL,
 		MP_GAMESTATE_NONE, false },
 };
 

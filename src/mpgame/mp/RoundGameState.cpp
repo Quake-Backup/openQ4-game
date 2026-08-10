@@ -292,6 +292,11 @@ rvRoundGameState::RoundBegin
 ================
 */
 void rvRoundGameState::RoundBegin( void ) {
+	// Last chance for anybody who died during the countdown.  Every subclass
+	// chains to this first, so the revive is ordered ahead of a mode's own
+	// round-start loadout - Clan Arena would otherwise write full health onto a
+	// body that is still a ragdoll.
+	ReviveForRound();
 }
 
 /*
@@ -462,10 +467,15 @@ bool rvRoundGameState::ScheduleNextRound( void ) {
 		return false;
 	}
 
+	// Every round is prepared, including the first.  Red Rover's reshuffle lives
+	// here, and skipping it for round one left the opening round on whatever
+	// split the players happened to pick - which in a mode that is decided by
+	// absorbing the other side is the whole starting position.
+	PrepareNextRound();
+
 	// NewState( GAMEON ) has just restarted the map for the first round, so
 	// resetting again here would respawn everyone twice in two frames
 	if ( roundNumber > 0 ) {
-		PrepareNextRound();
 		ResetRound();
 	} else {
 		int i;
@@ -481,6 +491,86 @@ bool rvRoundGameState::ScheduleNextRound( void ) {
 	roundStateTime = gameLocal.time + Max( 0, warmupDelay ) * 1000;
 	roundStartTime = roundStateTime;
 	return true;
+}
+
+/*
+================
+rvRoundGameState::ReviveForRound
+
+Puts anybody who is dead but still in the round back on their feet.  Only the
+respawn is forced here; CheckRespawns still decides whether it is allowed, so an
+eliminated player is not let back in by this.
+================
+*/
+void rvRoundGameState::ReviveForRound( void ) {
+	int i;
+
+	if ( gameLocal.isClient ) {
+		return;
+	}
+
+	for ( i = 0; i < gameLocal.numClients; i++ ) {
+		idEntity *ent = gameLocal.entities[ i ];
+
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+
+		idPlayer *p = static_cast< idPlayer * >( ent );
+		if ( p->wantSpectate || p->health > 0 || IsEliminated( i ) ) {
+			continue;
+		}
+		if ( gameLocal.IsTeamGame() && ( p->team < 0 || p->team >= TEAM_MAX ) ) {
+			continue;
+		}
+
+		p->forceRespawn = true;
+	}
+}
+
+/*
+================
+rvRoundGameState::SealRound
+
+Quake Live sends anyone who arrives after a Clan Arena round has started into
+follow-spectate until the next one.  openQ4 gets the same result out of the
+elimination flag it already has, by treating "not in the round" and "out of the
+round" as the same thing.
+
+Every slot that is not a live participant right now is marked, INCLUDING the
+empty ones - a client that connects into an empty slot mid-round inherits the
+mark and so waits for the next round rather than walking into a fight that is
+already half decided.  ResetRound clears the whole array, so nothing here
+outlives the round it belongs to.
+================
+*/
+void rvRoundGameState::SealRound( void ) {
+	int i;
+
+	if ( gameLocal.isClient || !IsEliminationMode() ) {
+		return;
+	}
+
+	for ( i = 0; i < MAX_CLIENTS; i++ ) {
+		idEntity *ent = ( i < gameLocal.numClients ) ? gameLocal.entities[ i ] : NULL;
+
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			SetEliminated( i, true );
+			continue;
+		}
+
+		idPlayer *p = static_cast< idPlayer * >( ent );
+		// Deliberately not a health test.  CheckRespawns runs before the game
+		// state each frame, so a player who died in the last moments of the
+		// countdown can still be a corpse here even though ReviveForRound has
+		// already asked for them back; they belong to this round.  What marks
+		// somebody as arriving rather than playing is that they never left
+		// spectator - a mid-round join has not spawned yet.
+		const bool participating = !p->wantSpectate && !p->spectating &&
+			( !gameLocal.IsTeamGame() || ( p->team >= 0 && p->team < TEAM_MAX ) );
+
+		SetEliminated( i, !participating );
+	}
 }
 
 /*
@@ -539,10 +629,19 @@ void rvRoundGameState::Run( void ) {
 		}
 
 		case RS_COUNTDOWN: {
+			// A death during the countdown is not an elimination, so the victim
+			// is entitled to be back on their feet before "FIGHT".  Left alone
+			// they would wait out idPlayer's ordinary respawn delay - up to
+			// thirteen seconds, longer than the countdown itself - and the round
+			// would open with a corpse on the field that still counts as a
+			// living body for the round-end test.
+			ReviveForRound();
+
 			if ( gameLocal.time >= roundStateTime ) {
 				if ( SetRoundState( RS_ACTIVE ) ) {
 					roundStartTime = gameLocal.time;
 					roundStateTime = 0;
+					SealRound();
 					RoundBegin();
 				}
 			}
@@ -665,29 +764,26 @@ void rvRoundGameState::PlayerDeath( idPlayer* dead, idPlayer* killer ) {
 
 	SetEliminated( dead->entityNumber, true );
 
-	// tell the last player on a side that it is down to them
-	if ( dead->team >= 0 && dead->team < TEAM_MAX ) {
-		int i;
+	// Tell the last player on the side that just lost someone that it is down to
+	// them.  Only that side can have crossed the threshold on this death, and
+	// announcing for both would re-tell an already lone survivor on the other
+	// team every time their opponents trade a kill.
+	if ( dead->team >= 0 && dead->team < TEAM_MAX && CountLiveTeamPlayers( dead->team ) == 1 ) {
+		int j;
 
-		for ( i = 0; i < TEAM_MAX; i++ ) {
-			if ( CountLiveTeamPlayers( i ) != 1 ) {
+		for ( j = 0; j < gameLocal.numClients; j++ ) {
+			idEntity *ent = gameLocal.entities[ j ];
+
+			if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
 				continue;
 			}
 
-			int j;
-			for ( j = 0; j < gameLocal.numClients; j++ ) {
-				idEntity *ent = gameLocal.entities[ j ];
-
-				if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
-					continue;
-				}
-
-				idPlayer *p = static_cast< idPlayer * >( ent );
-				if ( p->team == i && PlayerIsAlive( p ) ) {
-					gameLocal.mpGame.CenterPrint( j, "#str_41336" );
-					gameLocal.mpGame.ScheduleAnnouncerSound( AS_MATCH_LAST_STANDING, gameLocal.time, -1, true );
-					break;
-				}
+			idPlayer *p = static_cast< idPlayer * >( ent );
+			if ( p->team == dead->team && PlayerIsAlive( p ) ) {
+				gameLocal.mpGame.CenterPrint( j, "#str_41336" );
+				// the announcer queue is client local, so this has to be sent
+				gameLocal.mpGame.AnnounceTo( j, AS_MATCH_LAST_STANDING );
+				break;
 			}
 		}
 	}
@@ -721,9 +817,41 @@ rvRoundGameState::ClientDisconnect
 void rvRoundGameState::ClientDisconnect( idPlayer* player ) {
 	rvGameState::ClientDisconnect( player );
 
-	if ( player != NULL ) {
-		SetEliminated( player->entityNumber, false );
+	if ( player == NULL ) {
+		return;
 	}
+
+	// A freed slot stays sealed for the rest of a live round.  Clearing it would
+	// hand the next client to connect into that slot a way into a round it was
+	// never part of - which is the same hole SealRound closes for fresh slots.
+	SetEliminated( player->entityNumber,
+		( currentState == GAMEON && roundState != RS_INACTIVE && IsEliminationMode() ) );
+}
+
+/*
+================
+rvRoundGameState::PlayerWithdrew
+
+A team change kills the player with nodamage, which never reaches
+idPlayer::Killed and so never reaches PlayerDeath.  Without this, changing sides
+while cornered was a way to leave a round you were about to lose and come back
+alive on the other team a frame later.
+
+Only elimination modes care: in Red Rover a change of side IS the rule, and
+marking the converted player would take them out of the very count that decides
+the round.
+================
+*/
+void rvRoundGameState::PlayerWithdrew( idPlayer* player ) {
+	if ( player == NULL || gameLocal.isClient ) {
+		return;
+	}
+
+	if ( currentState != GAMEON || roundState == RS_INACTIVE || !IsEliminationMode() ) {
+		return;
+	}
+
+	SetEliminated( player->entityNumber, true );
 }
 
 /*
@@ -741,7 +869,13 @@ void rvRoundGameState::Spectate( idPlayer* player ) {
 		return;
 	}
 
-	if ( currentState == GAMEON && roundState == RS_ACTIVE && player->wantSpectate ) {
+	// Only elimination modes. In a non-elimination round mode nobody is ever
+	// "out", so marking a spectate toggle as eliminated removes a player who is
+	// alive and fighting from every live-count for the rest of the round - and
+	// the round then ends as soon as their team mates die. Every other
+	// elimination write in this class is gated the same way.
+	if ( currentState == GAMEON && roundState == RS_ACTIVE && player->wantSpectate &&
+		 IsEliminationMode() ) {
 		SetEliminated( player->entityNumber, true );
 	}
 }

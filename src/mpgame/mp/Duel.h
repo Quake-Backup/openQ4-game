@@ -25,12 +25,22 @@ public:
 
 	virtual void	ClientDisconnect( idPlayer* player );
 
+	// Only the two people holding the arena may be in it.  Without this the
+	// ordinary respawn path spawns every waiting player into the map and the
+	// force-spectate loop below takes them straight back out, once per respawn
+	// cycle - a full spawn each time, telefragging whatever is on the pad.
+	virtual bool	AllowRespawn( idPlayer* player );
+
 	virtual	bool	IsType( gameStateType_t type ) const;
 	static gameStateType_t GetClassType( void );
 
 	// player numbers of everyone waiting for a turn, in arrival order
 	int				GetQueuePosition( int clientNum ) const;
 	int				GetQueueLength( void ) const { return queue.Num(); }
+	bool			IsContender( int clientNum ) const {
+						return ( clientNum >= 0 &&
+							( clientNum == contenders[ 0 ] || clientNum == contenders[ 1 ] ) );
+					}
 
 private:
 	void			UpdateQueue( void );

@@ -444,7 +444,16 @@ public:
 	void			CenterPrint( int to, const char *strId, centerPrintParm_t type1, int parm1, bool persist = false );
 	void			CenterPrint( int to, const char *strId, centerPrintParm_t type1, int parm1, centerPrintParm_t type2, int parm2, bool persist = false );
 	void			CenterPrintTeam( int team, const char *strId, centerPrintParm_t type1 = CPARM_NONE, int parm1 = 0, bool persist = false );
+	void			CenterPrintTeam( int team, const char *strId, centerPrintParm_t type1, int parm1, centerPrintParm_t type2, int parm2, bool persist = false );
 	void			ReceiveCenterPrint( const idBitMsg &msg );
+
+	// Server driven announcer cue.  ScheduleAnnouncerSound only ever reaches the
+	// machine it runs on, so a cue decided by server-only game logic - who was
+	// left standing, whose round it was - never reached the player it was about.
+	// to == -1 broadcasts.
+	void			AnnounceTo( int to, announcerSound_t sound );
+	void			AnnounceToTeam( int team, announcerSound_t sound );
+	void			ReceiveAnnouncer( const idBitMsg &msg );
 
 	// authoritative ready state, set from the client's reliable ready message
 	void			ServerSetPlayerReady( int clientNum, bool ready );
@@ -746,6 +755,19 @@ public:
 	// so ordinary multiplayer retains the stock ready, spectate and camera flow.
 	bool			IsArenaCampaignMatch( void ) const;
 	bool			ArenaCampaignLocksPlayers( void ) const;
+	bool			ArenaCampaignAllowsFreeLook( void ) const;
+	void			AdvanceArenaCampaignCeremony( void );
+	void			SetupArenaCampaignStatSummary( void );
+	int				GetMapWeaponMask( void );
+	bool			ArenaCampaignFreezesWorld( void ) const;
+	bool			BuildArenaCampaignSpawnInView( idPlayer *viewer, renderView_t *view );
+	bool			BuildArenaCampaignIntroView( idPlayer *viewer, renderView_t *view );
+	idPlayer *		ArenaCampaignIntroSubject( void );
+	int				ArenaCampaignIntroCount( void );
+	void			ShowArenaCampaignIntroCard( idPlayer *subject );
+	bool			ArenaCampaignIntroBlocksCountdown( void );
+	float			ArenaCampaignCeremonyFade( void ) const;
+	void			DrawArenaCampaignCeremonyFade( void );
 	bool			BuildArenaCampaignPresentationView( idPlayer *viewer, renderView_t *view );
 	void			BeginArenaCampaignEntrancePresentation( void );
 	void			ShowArenaCampaignVictoryPresentation( void );
@@ -1051,6 +1073,25 @@ private:
 	void			BeginArenaCampaignResult( void );
 	void			UpdateArenaCampaignResult( void );
 
+	// Ordered end-of-match ceremony. An Arena match is always one human on a
+	// listen server with no remote clients, so these phases are host-local and
+	// need no wire state - deliberately NOT mpGameState_t values, which are
+	// replicated bytes every gametype branches on.
+	enum arenaCeremonyPhase_t {
+		ARENA_CEREMONY_NONE = 0,
+		ARENA_CEREMONY_INTRO,		// warmup: present each authored opponent in turn
+		ARENA_CEREMONY_SPAWN_IN,	// match start: orbit own body, land in first person
+		ARENA_CEREMONY_TABLEAU,		// frozen world, player-steered orbit of the victor
+		ARENA_CEREMONY_SCOREBOARD,
+		ARENA_CEREMONY_STATS,
+		ARENA_CEREMONY_DONE			// ceremony over; the result may be reported
+	};
+	int				arenaCeremonyPhase;
+	int				arenaCeremonyPhaseStartTime;
+	int				arenaCeremonyPhaseEndTime;
+	int				arenaTableauStartTime;
+	bool			arenaCeremonyFadeStarted;
+
 	bool			arenaResultPending;
 	bool			arenaResultReported;
 	int				arenaResultToken;
@@ -1062,12 +1103,33 @@ private:
 	int				arenaPresentationFocus;
 	bool			arenaPresentationBlurEnabled;
 	bool			arenaEntranceCameraResolved;
+	// Which presentation the latched camera belongs to.  The entrance and the
+	// final tableau both latch a collision-safe anchor, but they resolve it
+	// around different points in the map, so the latch has to be re-resolved
+	// when the phase changes instead of carrying the spawn shot into review.
+	bool			arenaEntranceCameraIsEntrance;
 	bool			arenaEntranceCameraFallback;
 	bool			arenaEntranceCameraValid;
 	idVec3			arenaEntranceCameraForward;
 	idVec3			arenaEntranceCameraLeft;
 	idVec3			arenaEntranceCameraRadial;
 	float			arenaEntranceCameraHeightLimit;
+	// Reference yaw for the final tableau's player-steered orbit, latched on its
+	// first frame so the shot opens at the authored angle wherever the player
+	// happened to be looking when the match ended.
+	bool			arenaVictorLookLatched;
+	float			arenaVictorLookYaw;
+	// Match-start orbit basis, latched once so the shot cannot swim.
+	// Weapon slots present as pickups on the loaded map, for the warmup
+	// arsenal. Invalidated by ClearMap.
+	int				mapWeaponMask;
+	bool			mapWeaponMaskValid;
+	bool			arenaSpawnInLatched;
+	int				arenaIntroIndex;
+	int				arenaIntroSubjectStartTime;
+	int				arenaIntroArmDeadline;
+	idVec3			arenaSpawnInForward;
+	idVec3			arenaSpawnInLeft;
 
 	void			SelectArenaCampaignPresentationFocus( idPlayer *host );
 	idPlayer *		GetArenaCampaignPresentationFocus( void ) const;
@@ -1232,6 +1294,9 @@ private:
 	// called during normal gameplay for death -> respawn cycles
 	// and for a spectator who want back in the game (see param)
 	void			CheckRespawns( idPlayer *spectator = NULL );
+	// puts a spectating player's camera on a living team mate, if they have not
+	// already picked one themselves
+	void			FollowTeamMate( idPlayer *p );
 
 	void			FreeLight ( int lightID );
 	void			UpdateLight ( int lightID, idPlayer *player );

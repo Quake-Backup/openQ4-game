@@ -4169,6 +4169,7 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds, int activeEdito
 	idPlayer	*player;
 	const renderView_t *view;
 	bool		competitiveGameplayFrozen = false;
+	bool		arenaCeremonyFrozen = false;
 
 	editors = activeEditors;
 	isLastPredictFrame = lastCatchupFrame;
@@ -4206,7 +4207,13 @@ gameReturn_t idGameLocal::RunFrame( const usercmd_t *clientCmds, int activeEdito
 		realClientTime = time;
 		if ( isMultiplayer ) {
 			mpGame.BeginCompetitiveFrame();
-			competitiveGameplayFrozen = mpGame.IsGameplayFrozen();
+			// The Arena final tableau freezes the whole world, not just the
+			// combatants: projectiles hang, movers stop, effects hold. It reuses
+			// the competitive pause's per-entity ThinkMatchPaused path rather than
+			// adding a pause kind to mpMatchSession, whose phase invariants exist
+			// to serve remote clients an Arena match never has.
+			arenaCeremonyFrozen = mpGame.ArenaCampaignFreezesWorld();
+			competitiveGameplayFrozen = mpGame.IsGameplayFrozen() || arenaCeremonyFrozen;
 		}
 		{
 TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
@@ -4294,6 +4301,14 @@ TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 			// complete spawned set exactly once rather than only active thinkers.
 			for ( ent = spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next() ) {
 				currentThinkingEntity = ent;
+				// Everyone, including the viewer. idPlayer::ThinkMatchPaused
+				// already consumes the usercmd, zeroes movement and impulses, and
+				// calls UpdateViewAngles() - which is where the Arena tableau's
+				// free-look orbit is honoured. An earlier version exempted the
+				// local player here on the belief that it only shifted deadlines;
+				// that was wrong, and it left the viewer's own body animating,
+				// their powerups expiring and their corpse dissolving inside a
+				// world that had visibly stopped.
 				ent->ThinkMatchPaused( msec );
 				currentThinkingEntity = NULL;
 				num++;
@@ -5865,6 +5880,36 @@ bool idGameLocal::InhibitEntitySpawn( idDict &spawnArgs ) {
 		}
 	}
 // RITUAL END
+
+// openQ4 BEGIN
+	// A mode where everybody spawns with the whole arsenal, full ammo and full
+	// armour is not played over the item layout, and Quake Live's Clan Arena
+	// factory clears the weapon, ammo, holdable, health, armour and powerup
+	// spawns for exactly that reason.  Leaving them in turns Clan Arena back
+	// into Team DM with a free loadout: the fight goes to whoever reaches the
+	// mega health, and a player who wins an exchange tops straight back up.
+	//
+	// This runs at map populate on the server and on every client alike -
+	// SetGameType always precedes MapPopulate - so entity numbering stays in
+	// step, and ResetRound's map restart re-applies it every round.
+	if ( isMultiplayer && MPGameTypeHasAny( gameType, GTF_FULLARSENAL ) ) {
+		const char *classname = spawnArgs.GetString( "classname" );
+
+		// An objective is not a pickup.  Attack & Defend also carries
+		// GTF_FULLARSENAL and plays with a flag, so the flag class is named
+		// rather than guessed at from the classname prefix.
+		const bool objective = spawnArgs.GetBool( "inv_objective" ) ||
+			idStr::Icmp( spawnArgs.GetString( "spawnclass" ), "rvItemCTFFlag" ) == 0;
+
+		if ( !objective &&
+			 ( idStr::FindText( classname, "weapon_" ) == 0 ||
+			   idStr::FindText( classname, "ammo_" ) == 0 ||
+			   idStr::FindText( classname, "item_" ) == 0 ||
+			   idStr::FindText( classname, "powerup_" ) == 0 ) ) {
+			return true;
+		}
+	}
+// openQ4 END
 
 	// suppress deadzone triggers if we're not running DZ
 	if ( idStr::Icmp( serverInfo.GetString( "si_gameType" ), "DeadZone" ) != 0 ) {

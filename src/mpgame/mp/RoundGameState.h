@@ -45,6 +45,7 @@ public:
 
 	virtual bool	AllowRespawn( idPlayer* player );
 	virtual void	PlayerDeath( idPlayer* dead, idPlayer* killer );
+	virtual void	PlayerWithdrew( idPlayer* player );
 	virtual bool	WeaponsLocked( void ) const;
 
 	// Clan Arena style modes put an eliminated player into follow-spectator;
@@ -99,6 +100,13 @@ protected:
 	void			AwardRound( int winningTeam );
 
 	bool			SetRoundState( roundState_t newState );
+	// forces a respawn for anyone dead but not eliminated, so a round never
+	// opens with a corpse that the round-end test still counts as alive
+	void			ReviveForRound( void );
+	// closes the round's roster: every slot that is not a live participant at
+	// the moment the round goes live is out of it, including the empty ones, so
+	// a player who connects or joins mid-round waits for the next one
+	void			SealRound( void );
 	// wipes the arena and puts everyone back on their feet
 	void			ResetRound( void );
 	bool			ScheduleNextRound( void );

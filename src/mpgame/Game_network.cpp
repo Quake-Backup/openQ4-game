@@ -2412,7 +2412,8 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			}
 
 			// openQ4: a notice aimed at one player is not for the viewers
-			case GAME_RELIABLE_MESSAGE_CENTERPRINT: {
+			case GAME_RELIABLE_MESSAGE_CENTERPRINT:
+			case GAME_RELIABLE_MESSAGE_ANNOUNCER: {
 				if ( toClient != -1 ) {
 					inhibitRepeater = true;
 				}
@@ -2749,6 +2750,10 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 		// openQ4 BEGIN
 		case GAME_RELIABLE_MESSAGE_CENTERPRINT: {
 			mpGame.ReceiveCenterPrint( msg );
+			break;
+		}
+		case GAME_RELIABLE_MESSAGE_ANNOUNCER: {
+			mpGame.ReceiveAnnouncer( msg );
 			break;
 		}
 		case GAME_RELIABLE_MESSAGE_MATCH_RESULT:

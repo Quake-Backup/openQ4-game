@@ -20,6 +20,12 @@
 idCVar g_spectatorChat( "g_spectatorChat", "0", CVAR_GAME | CVAR_ARCHIVE | CVAR_BOOL, "let spectators talk to everyone during game" );
 
 static const int ARENA_RESULT_REVIEW_MSEC = 6000;
+// The ordered ceremony that follows the exit condition: a frozen tableau the
+// player steers, then the scoreboard, then the match stats, and only then the
+// handoff to the framework. Each hand-over fades the arena down first.
+static const int ARENA_SCOREBOARD_MSEC = 5000;
+static const int ARENA_STATS_MSEC = 6000;
+static const int ARENA_CEREMONY_FADE_MSEC = 700;
 static const int ARENA_ENTRANCE_MIN_MSEC = 3000;
 static const int ARENA_SCORE_UNAVAILABLE = -9999;
 static const int ARENA_MATCH_TITLE_FIRST_STRING = 42100;
@@ -28,6 +34,23 @@ static const float ARENA_CAMERA_MIN_ESTABLISHING_FRACTION = 0.55f;
 static const float ARENA_CAMERA_MIN_HORIZONTAL_CLEARANCE = 72.0f;
 static const float ARENA_CAMERA_MIN_USABLE_DISTANCE = 32.0f;
 static const float ARENA_CAMERA_FALLBACK_SWEEP_DEGREES = 12.0f;
+// Final tableau free-look framing. The orbit opens at the authored angle and
+// the player steers from there; pitch is clamped well inside the view limits so
+// the camera cannot end up inside the floor or straight overhead.
+static const float ARENA_VICTOR_ORBIT_START = 25.0f;
+static const float ARENA_VICTOR_ORBIT_HEIGHT = 48.0f;
+static const float ARENA_VICTOR_ORBIT_PITCH_RANGE = 60.0f;
+static const float ARENA_VICTOR_ORBIT_HEIGHT_PER_DEGREE = 1.1f;
+// Match-start spawn-in: a rising orbit that ends behind the head and converges
+// on the first-person view over its last quarter.
+static const int ARENA_SPAWN_IN_MSEC = 2600;
+static const float ARENA_SPAWN_IN_START_DEGREES = 35.0f;
+static const float ARENA_SPAWN_IN_START_RANGE = 132.0f;
+static const float ARENA_SPAWN_IN_START_HEIGHT = 62.0f;
+static const float ARENA_SPAWN_IN_BLEND_START = 0.72f;
+// Warmup introduction: one beat per authored opponent before the countdown.
+static const int ARENA_INTRO_SUBJECT_MSEC = 1800;
+static const int ARENA_INTRO_ARM_TIMEOUT_MSEC = 4000;
 static const float ARENA_DOF_EFFECT_RANGE = 4.0f;
 static const float ARENA_DOF_DISTANCE_SCALE = 512.0f;
 
@@ -82,11 +105,46 @@ static float CompetitiveItemRespawnSeconds( const idItem *item ) {
 	return respawn > 0.0f ? respawn : 0.0f;
 }
 
+// These values travel to the framework verbatim in the arenaComplete session
+// command and are parsed there by number, so they must stay pinned to the
+// engine's ARENA_OUTCOME_* values.  Spelling every one out keeps a reorder or
+// an inserted member from silently turning a draw into a win.
 typedef enum {
 	ARENA_RESULT_LOSS = 0,
-	ARENA_RESULT_WIN,
-	ARENA_RESULT_DRAW
+	ARENA_RESULT_WIN = 1,
+	ARENA_RESULT_DRAW = 2
 } arenaCampaignResult_t;
+
+/*
+================
+ArenaCampaignAwardMask
+
+Packs the local player's end-game awards into one bounded integer for the
+arenaComplete handoff, one bit per endGameAward_t id. rvStatManager::EndGame
+computes these on the GAMEREVIEW enter edge, which is before the result is
+actually emitted at the end of the tableau, so this must be read at emission
+time rather than when the result is first queued.
+================
+*/
+static int ArenaCampaignAwardMask( int clientNum ) {
+	if ( statManager == NULL || clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return 0;
+	}
+
+	const rvPlayerStat *stats = statManager->GetPlayerStat( clientNum );
+	if ( stats == NULL ) {
+		return 0;
+	}
+
+	int mask = 0;
+	for ( int i = 0; i < stats->endGameAwards.Num(); i++ ) {
+		const int award = (int)stats->endGameAwards[i];
+		if ( award > EGA_INVALID && award < EGA_NUM_AWARDS ) {
+			mask |= 1 << award;
+		}
+	}
+	return mask;
+}
 
 static const char *ArenaCampaignResultName( int outcome ) {
 	switch ( outcome ) {
@@ -1080,6 +1138,21 @@ idMultiplayerGame::idMultiplayerGame() {
 	stroggScoreBarPulseAmount = 0.0f;
 	arenaPresentationBlurEnabled = false;
 	arenaEntranceCameraResolved = false;
+	arenaEntranceCameraIsEntrance = false;
+	arenaVictorLookLatched = false;
+	arenaVictorLookYaw = 0.0f;
+	arenaSpawnInLatched = false;
+	arenaSpawnInForward.Zero();
+	arenaSpawnInLeft.Zero();
+	mapWeaponMask = 0;
+	mapWeaponMaskValid = false;
+	arenaIntroIndex = 0;
+	arenaIntroSubjectStartTime = 0;
+	arenaIntroArmDeadline = 0;
+	arenaCeremonyPhase = ARENA_CEREMONY_NONE;
+	arenaCeremonyPhaseEndTime = 0;
+	arenaCeremonyPhaseStartTime = 0;
+	arenaTableauStartTime = 0;
 	arenaEntranceCameraFallback = false;
 	arenaEntranceCameraValid = false;
 	arenaEntranceCameraForward.Zero();
@@ -6652,8 +6725,11 @@ void idMultiplayerGame::MirrorCompetitiveRulesToLegacy( void ) {
 	// Userinfo is interpreted on both peers.  Publish the managed-session bit
 	// explicitly so clients bypass stock spectator coercion without depending on
 	// server-only session aggregates.
+	// The Arena campaign is never a managed match, whatever profile the player
+	// last used for multiplayer. Publish that here too so nothing downstream
+	// reads the serverinfo bit and reaches a different answer to IsManagedMatch.
 	gameLocal.serverInfo.SetBool( "si_managedMatch",
-		rules.GetBool( MP_RULE_MANAGED_MATCH ) );
+		!IsArenaCampaignMatch() && rules.GetBool( MP_RULE_MANAGED_MATCH ) );
 
 	const bool warmupEnabled = rules.GetBool( MP_RULE_WARMUP_ENABLED );
 	cvarSystem->SetCVarBool( "si_warmup", warmupEnabled );
@@ -6771,6 +6847,16 @@ bool idMultiplayerGame::ConfigureMatchSessionForRules( mpMatchSession &session,
 		policy.minimumActivePerRequiredSide = 0;
 		policy.readyThresholdBasisPoints = 0;
 		policy.requiredSideMask = 0;
+		// A declared-seat roster has nobody to declare it in single player, so
+		// leaving these set holds the one human out of their own match as an
+		// undeclared participant. There are no sides to cap and no team with
+		// standing to call a timeout either.
+		policy.maximumActivePerSide = 0;
+		policy.requireDeclaredRosterSeats = false;
+		rosterSize = 0;
+		timeoutCount = 0;
+		timeoutDurationMsec = 0;
+		timeoutDuringCountdown = false;
 	}
 
 	if ( session.ConfigureReadiness( policy,
@@ -8076,6 +8162,16 @@ bool idMultiplayerGame::BeginMatchSession( void ) {
 }
 
 bool idMultiplayerGame::IsManagedMatch( void ) const {
+	// The Arena campaign is single player. The managed match layer exists to
+	// arbitrate rosters, readiness, timeouts and referee authority between real
+	// teams, and none of that has an owner here - but its join evaluator does
+	// take over participation. idPlayer::UserInfoChanged's managed arm only sets
+	// forceRespawn when the requested intent CHANGES, and the campaign already
+	// launches with ui_spectate "Play", so the change never happens and the
+	// player sits in spectator for the whole match while the bots fight.
+	if ( IsArenaCampaignMatch() ) {
+		return false;
+	}
 	if ( gameLocal.isServer ) {
 		return matchSession.GetSessionId() != 0 &&
 			matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH );
@@ -8294,8 +8390,12 @@ void idMultiplayerGame::SynchronizeMatchParticipant( int clientNum ) {
 	}
 
 	// spectating is a physical gameplay state also used for death/elimination.
-	// Managed participation follows durable player intent instead.
-	const bool active = playerState[ clientNum ].ingame && !player->wantSpectate;
+	// Managed participation follows durable player intent instead.  Duel is the
+	// exception: everybody past the two contenders is held in spectator by the
+	// game state, not by their own choice, so counting them as active makes the
+	// warmup ready threshold a vote of people who cannot play and cannot ready.
+	const bool active = playerState[ clientNum ].ingame && !player->wantSpectate &&
+		!( gameLocal.gameType == GAME_DUEL && player->spectating );
 	const int side = gameLocal.IsTeamGame() && player->team >= 0 && player->team < TEAM_MAX ?
 		player->team : MP_MATCH_SIDE_NONE;
 
@@ -8939,6 +9039,21 @@ void idMultiplayerGame::Clear() {
 	arenaPresentationFocus = -1;
 	arenaPresentationBlurEnabled = false;
 	arenaEntranceCameraResolved = false;
+	arenaEntranceCameraIsEntrance = false;
+	arenaVictorLookLatched = false;
+	arenaVictorLookYaw = 0.0f;
+	arenaSpawnInLatched = false;
+	arenaSpawnInForward.Zero();
+	arenaSpawnInLeft.Zero();
+	mapWeaponMask = 0;
+	mapWeaponMaskValid = false;
+	arenaIntroIndex = 0;
+	arenaIntroSubjectStartTime = 0;
+	arenaIntroArmDeadline = 0;
+	arenaCeremonyPhase = ARENA_CEREMONY_NONE;
+	arenaCeremonyPhaseEndTime = 0;
+	arenaCeremonyPhaseStartTime = 0;
+	arenaTableauStartTime = 0;
 	arenaEntranceCameraFallback = false;
 	arenaEntranceCameraValid = false;
 	arenaEntranceCameraForward.Zero();
@@ -9026,6 +9141,21 @@ void idMultiplayerGame::ClearMap( void ) {
 	arenaPresentationVictor = -1;
 	arenaPresentationFocus = -1;
 	arenaEntranceCameraResolved = false;
+	arenaEntranceCameraIsEntrance = false;
+	arenaVictorLookLatched = false;
+	arenaVictorLookYaw = 0.0f;
+	arenaSpawnInLatched = false;
+	arenaSpawnInForward.Zero();
+	arenaSpawnInLeft.Zero();
+	mapWeaponMask = 0;
+	mapWeaponMaskValid = false;
+	arenaIntroIndex = 0;
+	arenaIntroSubjectStartTime = 0;
+	arenaIntroArmDeadline = 0;
+	arenaCeremonyPhase = ARENA_CEREMONY_NONE;
+	arenaCeremonyPhaseEndTime = 0;
+	arenaCeremonyPhaseStartTime = 0;
+	arenaTableauStartTime = 0;
 	arenaEntranceCameraFallback = false;
 	arenaEntranceCameraValid = false;
 	arenaEntranceCameraForward.Zero();
@@ -9706,8 +9836,11 @@ void idMultiplayerGame::UpdateTeamScoreboard( idUserInterface *scoreBoard ) {
 	bool useReady = ( gameLocal.serverInfo.GetBool( "si_useReady" ) &&
 		!IsArenaCampaignMatch() && gameLocal.mpGame.GetGameState()->GetMPGameState() == WARMUP );
 	const bool roundMode = MPGameTypeHasAny( gameLocal.gameType, GTF_ROUND );
-	const char *scoreColumn = ( gameLocal.gameType == GAME_CA ) ? "#str_41406" :
-		( roundMode ? "#str_41409" : "#str_200198" );
+	// The round modes accumulate a personal score out of more than one thing -
+	// Clan Arena pays per hundred damage dealt AND per frag, Freeze Tag pays per
+	// frag AND per thaw - so the column is points, not any one of its sources.
+	// It used to claim "Damage" in Clan Arena, which the number has never been.
+	const char *scoreColumn = roundMode ? "#str_41409" : "#str_200198";
 	scoreBoard->SetStateString( "scoreColumn", common->GetLocalizedString( scoreColumn ) );
 
 	for ( int i = 0; i < SCOREBOARD_MAX_CLIENTS; i++ ) {
@@ -10239,11 +10372,40 @@ idMultiplayerGame::EnoughClientsToPlay
 bool idMultiplayerGame::EnoughClientsToPlay() {
 	int team[ 2 ];
 	int clients = NumActualClients( false, &team[ 0 ] );
-	if ( gameLocal.IsTeamGame() ) {
+	// openQ4: in a mode where a kill moves the victim onto the killer's team,
+	// an empty side is the round result rather than a population failure.  Held
+	// to the ordinary team rule, Red Rover aborts itself the instant its own win
+	// condition is met, and no match ever reaches a second round.
+	if ( gameLocal.IsTeamGame() && !MPGameTypeHasAny( gameLocal.gameType, GTF_TEAMSWAP ) ) {
 		return clients >= 2 && team[ 0 ] && team[ 1 ];
-	} else {
-		return clients >= 2;
 	}
+
+	// openQ4: a Duel is two people, and everyone else is a queue.  Counting the
+	// queue as population means a contender can walk out and the abandoned match
+	// keeps running 1v0 - the queue is standing right there, but nothing promotes
+	// anyone into a live duel.  Quake Live forfeits instead; counting only the
+	// contenders lets CheckAbortGame do exactly that, after which the ordinary
+	// winner-stays rotation seats the next challenger.
+	if ( gameLocal.gameType == GAME_DUEL ) {
+		int contenders = 0;
+
+		for ( int i = 0; i < gameLocal.numClients; i++ ) {
+			idEntity *ent = gameLocal.entities[ i ];
+
+			if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+				continue;
+			}
+
+			idPlayer *p = static_cast< idPlayer * >( ent );
+			if ( CanPlay( p ) && !p->spectating ) {
+				contenders++;
+			}
+		}
+
+		return contenders >= 2;
+	}
+
+	return clients >= 2;
 }
 
 /*
@@ -10338,6 +10500,14 @@ bool idMultiplayerGame::AllPlayersReady( idStr* reason ) {
 		}
 
 		p = static_cast< idPlayer * >( ent );
+
+		// openQ4: a Duel waiting-queue player is held in spectator by the game
+		// state rather than by choice, cannot ready up, and is not one of the two
+		// people the match is waiting on.  Counting them made the ready gate
+		// unsatisfiable the moment a third player connected.
+		if ( gameLocal.gameType == GAME_DUEL && p->spectating ) {
+			continue;
+		}
 
 		if ( CanPlay( p ) ) {
 			eligibleCount++;
@@ -10553,6 +10723,12 @@ int idMultiplayerGame::ForfeitTeam( void ) {
 			matchRules.Committed().GetBool( MP_RULE_FORFEIT_ON_EMPTY_TEAM ) ) :
 		gameLocal.serverInfo.GetBool( "si_forfeit" );
 	if ( !gameLocal.IsTeamGame() || !forfeitEnabled ) {
+		return -1;
+	}
+
+	// See EnoughClientsToPlay: sides are transient in a team-swap mode, so one
+	// side being empty is how a round ends, not somebody walking out.
+	if ( MPGameTypeHasAny( gameLocal.gameType, GTF_TEAMSWAP ) ) {
 		return -1;
 	}
 
@@ -12559,6 +12735,16 @@ idMultiplayerGame::IsArenaCampaignMatch
 ================
 */
 bool idMultiplayerGame::IsArenaCampaignMatch( void ) const {
+	// si_arenaCampaign is CVAR_SERVERINFO, so it replicates to every connected
+	// client.  The Arena campaign is always the framework's own offline listen
+	// server with no remote humans, so require the listen-server host here.
+	// Without that, a normal multiplayer server config carrying the token would
+	// hand every client the single-player ceremony: ready-up bypassed, players
+	// frozen through the countdown, and a result card built from state that is
+	// only ever computed on the server.
+	if ( !gameLocal.isListenServer || gameLocal.isClient || !gameLocal.isServer ) {
+		return false;
+	}
 	return gameLocal.serverInfo.GetInt( "si_arenaCampaign" ) > 0;
 }
 
@@ -12575,9 +12761,42 @@ bool idMultiplayerGame::ArenaCampaignLocksPlayers( void ) const {
 		return false;
 	}
 
+	if ( arenaCeremonyPhase == ARENA_CEREMONY_SPAWN_IN ||
+		 arenaCeremonyPhase == ARENA_CEREMONY_INTRO ) {
+		// Match start and the warmup introduction both own the screen. The
+		// introduction especially: si_warmupWeapons arms everyone, so without
+		// this the bots would fight through their own introduction.
+		return true;
+	}
 	const mpGameState_t state = gameState->GetMPGameState();
+	if ( state == WARMUP && arenaIntroIndex == 0 ) {
+		// The introductions cannot arm until the bots are out of spectator, which
+		// takes a few frames. Hold the whole of warmup rather than only the part
+		// after arming, or the roster gets a free head start on each other.
+		return true;
+	}
 	return state == COUNTDOWN ||
 		( state == GAMEREVIEW && ( arenaResultPending || arenaResultReported ) );
+}
+
+/*
+================
+idMultiplayerGame::ArenaCampaignAllowsFreeLook
+
+The final tableau is the one locked phase the player still steers: the world is
+frozen where the match ended and the camera orbits the victor under look input.
+The entrance is the opposite - a fixed authored shot that a stray mouse movement
+must not be able to drag off its subject.
+================
+*/
+bool idMultiplayerGame::ArenaCampaignAllowsFreeLook( void ) const {
+	if ( !ArenaCampaignLocksPlayers() || gameState == NULL ) {
+		return false;
+	}
+	// Only the tableau. Once the scoreboard has the screen there is nothing to
+	// steer, and a stray mouse movement should not be swinging a camera behind it.
+	return gameState->GetMPGameState() == GAMEREVIEW &&
+		arenaCeremonyPhase == ARENA_CEREMONY_TABLEAU;
 }
 
 /*
@@ -12741,6 +12960,21 @@ void idMultiplayerGame::BeginArenaCampaignEntrancePresentation( void ) {
 	}
 
 	arenaEntranceCameraResolved = false;
+	arenaEntranceCameraIsEntrance = false;
+	arenaVictorLookLatched = false;
+	arenaVictorLookYaw = 0.0f;
+	arenaSpawnInLatched = false;
+	arenaSpawnInForward.Zero();
+	arenaSpawnInLeft.Zero();
+	mapWeaponMask = 0;
+	mapWeaponMaskValid = false;
+	arenaIntroIndex = 0;
+	arenaIntroSubjectStartTime = 0;
+	arenaIntroArmDeadline = 0;
+	arenaCeremonyPhase = ARENA_CEREMONY_NONE;
+	arenaCeremonyPhaseEndTime = 0;
+	arenaCeremonyPhaseStartTime = 0;
+	arenaTableauStartTime = 0;
 	arenaEntranceCameraFallback = false;
 	arenaEntranceCameraValid = false;
 	arenaEntranceCameraForward.Zero();
@@ -12761,6 +12995,7 @@ void idMultiplayerGame::BeginArenaCampaignEntrancePresentation( void ) {
 	localPlayer->mphud->SetStateString( "arena_presentSubtitle",
 		GetLongGametypeName( gameLocal.serverInfo.GetString( "si_gameType" ) ) );
 	localPlayer->mphud->SetStateString( "arena_presentVictor", "" );
+	localPlayer->mphud->SetStateBool( "arena_presentHasVictor", false );
 	localPlayer->mphud->SetStateInt( "arena_presentOutcome", -1 );
 	localPlayer->mphud->SetStateString( "arena_presentScore", "" );
 	localPlayer->mphud->HandleNamedEvent( "arenaCampaignEntrance" );
@@ -12799,6 +13034,10 @@ void idMultiplayerGame::ShowArenaCampaignVictoryPresentation( void ) {
 	localPlayer->mphud->SetStateString( "arena_presentTitle", title );
 	localPlayer->mphud->SetStateString( "arena_presentSubtitle", "" );
 	localPlayer->mphud->SetStateString( "arena_presentVictor", victorName );
+	// A tie for the lead has no unique victor even though the outcome is not a
+	// draw.  The champion card must follow the name, not the outcome, or it
+	// renders its title over an empty line.
+	localPlayer->mphud->SetStateBool( "arena_presentHasVictor", victorName[0] != '\0' );
 	localPlayer->mphud->SetStateInt( "arena_presentOutcome", arenaResultOutcome );
 	localPlayer->mphud->SetStateString( "arena_presentScore", score.c_str() );
 	localPlayer->mphud->HandleNamedEvent( "arenaCampaignVictory" );
@@ -12814,6 +13053,21 @@ void idMultiplayerGame::ClearArenaCampaignPresentation( void ) {
 	arenaPresentationVictor = -1;
 	arenaPresentationFocus = -1;
 	arenaEntranceCameraResolved = false;
+	arenaEntranceCameraIsEntrance = false;
+	arenaVictorLookLatched = false;
+	arenaVictorLookYaw = 0.0f;
+	arenaSpawnInLatched = false;
+	arenaSpawnInForward.Zero();
+	arenaSpawnInLeft.Zero();
+	mapWeaponMask = 0;
+	mapWeaponMaskValid = false;
+	arenaIntroIndex = 0;
+	arenaIntroSubjectStartTime = 0;
+	arenaIntroArmDeadline = 0;
+	arenaCeremonyPhase = ARENA_CEREMONY_NONE;
+	arenaCeremonyPhaseEndTime = 0;
+	arenaCeremonyPhaseStartTime = 0;
+	arenaTableauStartTime = 0;
 	arenaEntranceCameraFallback = false;
 	arenaEntranceCameraValid = false;
 	arenaEntranceCameraForward.Zero();
@@ -12830,6 +13084,7 @@ void idMultiplayerGame::ClearArenaCampaignPresentation( void ) {
 	localPlayer->mphud->SetStateString( "arena_presentTitle", "" );
 	localPlayer->mphud->SetStateString( "arena_presentSubtitle", "" );
 	localPlayer->mphud->SetStateString( "arena_presentVictor", "" );
+	localPlayer->mphud->SetStateBool( "arena_presentHasVictor", false );
 	localPlayer->mphud->SetStateInt( "arena_presentOutcome", -1 );
 	localPlayer->mphud->SetStateString( "arena_presentScore", "" );
 	localPlayer->mphud->HandleNamedEvent( "arenaCampaignPresentationClear" );
@@ -12844,6 +13099,313 @@ slow orbit around the victor during review.  Returning false leaves the normal
 player/camera path completely untouched.
 ================
 */
+/*
+================
+idMultiplayerGame::ArenaCampaignIntroBlocksCountdown
+
+Arms the warmup introduction on its first call and reports whether it still owns
+the screen. Arena warmup otherwise has no dwell at all: AllPlayersReady returns
+true the moment the roster is complete, and PopulateBots completes it before the
+first game frame, so without this the countdown starts immediately.
+================
+*/
+bool idMultiplayerGame::ArenaCampaignIntroBlocksCountdown( void ) {
+	if ( !IsArenaCampaignMatch() ) {
+		return false;
+	}
+	if ( arenaCeremonyPhase == ARENA_CEREMONY_INTRO ) {
+		return true;
+	}
+	// Only ever run once per match. arenaIntroIndex is reset with the rest of the
+	// ceremony state, so a replay gets its introduction and a mid-match return to
+	// warmup does not.
+	if ( arenaIntroIndex != 0 ) {
+		return false;
+	}
+
+	// The roster is added before the first game frame, but the bots are not
+	// CanPlay() until CheckRespawns has taken them out of spectator, which is a
+	// few frames later. Arming on frame one would count zero opponents and skip
+	// the introductions entirely, so hold warmup until the authored roster is
+	// actually standing - or until a deadline, so a bot that never arrives
+	// cannot wedge the match in warmup forever.
+	if ( arenaIntroArmDeadline == 0 ) {
+		arenaIntroArmDeadline = gameLocal.time + ARENA_INTRO_ARM_TIMEOUT_MSEC;
+	}
+	const int expected = Max( 0, gameLocal.serverInfo.GetInt( "si_maxPlayers" ) - 1 );
+	const int present = ArenaCampaignIntroCount();
+	if ( present < expected && gameLocal.time < arenaIntroArmDeadline ) {
+		return true;
+	}
+	if ( present <= 0 ) {
+		return false;
+	}
+
+	idPlayer *first = ArenaCampaignIntroSubject();
+	if ( first == NULL ) {
+		return false;
+	}
+
+	arenaCeremonyPhase = ARENA_CEREMONY_INTRO;
+	arenaIntroSubjectStartTime = gameLocal.time;
+	arenaCeremonyPhaseStartTime = gameLocal.time;
+	arenaCeremonyPhaseEndTime = gameLocal.time + ARENA_INTRO_SUBJECT_MSEC;
+	ShowArenaCampaignIntroCard( first );
+	gameLocal.Printf( "arena campaign: introducing %d opponents\n", ArenaCampaignIntroCount() );
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::ArenaCampaignIntroSubject
+
+The opponent currently being introduced, or NULL. The roster is already complete
+on the first warmup frame - PopulateBots runs addbot before any game frame - so
+the introduction is a presentation of who is already here, taken in slot order so
+it matches the roster the campaign authored.
+================
+*/
+idPlayer *idMultiplayerGame::ArenaCampaignIntroSubject( void ) {
+	idPlayer *host = gameLocal.GetLocalPlayer();
+	int seen = 0;
+	for ( int i = 0; i < gameLocal.numClients; i++ ) {
+		idEntity *ent = gameLocal.entities[i];
+		if ( ent == NULL || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+		idPlayer *candidate = static_cast<idPlayer *>( ent );
+		if ( candidate == host || !CanPlay( candidate ) ) {
+			continue;
+		}
+		if ( seen == arenaIntroIndex ) {
+			return candidate;
+		}
+		seen++;
+	}
+	return NULL;
+}
+
+/*
+================
+idMultiplayerGame::ArenaCampaignIntroCount
+================
+*/
+int idMultiplayerGame::ArenaCampaignIntroCount( void ) {
+	idPlayer *host = gameLocal.GetLocalPlayer();
+	int count = 0;
+	for ( int i = 0; i < gameLocal.numClients; i++ ) {
+		idEntity *ent = gameLocal.entities[i];
+		if ( ent == NULL || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+		idPlayer *candidate = static_cast<idPlayer *>( ent );
+		if ( candidate != host && CanPlay( candidate ) ) {
+			count++;
+		}
+	}
+	return count;
+}
+
+/*
+================
+idMultiplayerGame::ShowArenaCampaignIntroCard
+
+Reuses the entrance card rather than adding a presentation mode: it is already a
+large name over a subtitle framed in the letterbox, which is exactly what an
+introduction needs, and mphud.gui gates its whole ceremony on a two-valued
+arena_presentMode whose named events each stopTransitions the other two.
+================
+*/
+void idMultiplayerGame::ShowArenaCampaignIntroCard( idPlayer *subject ) {
+	idPlayer *localPlayer = gameLocal.GetLocalPlayer();
+	if ( localPlayer == NULL || localPlayer->mphud == NULL || subject == NULL ) {
+		return;
+	}
+
+	localPlayer->mphud->SetStateInt( "arena_presentPhase", 1 );
+	localPlayer->mphud->SetStateString( "arena_presentTitle",
+		subject->GetUserInfo()->GetString( "ui_name" ) );
+	localPlayer->mphud->SetStateString( "arena_presentSubtitle",
+		common->GetLocalizedString( "#str_42155" ) );
+	localPlayer->mphud->SetStateString( "arena_presentVictor", "" );
+	localPlayer->mphud->SetStateBool( "arena_presentHasVictor", false );
+	localPlayer->mphud->SetStateInt( "arena_presentOutcome", -1 );
+	localPlayer->mphud->SetStateString( "arena_presentScore", "" );
+	localPlayer->mphud->HandleNamedEvent( "arenaCampaignEntrance" );
+}
+
+/*
+================
+idMultiplayerGame::BuildArenaCampaignIntroView
+
+A slow orbit of the opponent being introduced, using the same collision-aware
+trace as the other arena shots so a bot standing against a wall still reads.
+================
+*/
+bool idMultiplayerGame::BuildArenaCampaignIntroView( idPlayer *viewer, renderView_t *view ) {
+	idPlayer *subject = ArenaCampaignIntroSubject();
+	if ( subject == NULL ) {
+		return false;
+	}
+
+	idVec3 up = -subject->GetPhysics()->GetGravityNormal();
+	if ( up.Normalize() == 0.0f ) {
+		up.Set( 0.0f, 0.0f, 1.0f );
+	}
+
+	idVec3 viewOrigin;
+	idMat3 facingAxis;
+	subject->GetViewPos( viewOrigin, facingAxis );
+	idVec3 forward = facingAxis[0];
+	forward -= up * ( forward * up );
+	if ( forward.Normalize() == 0.0f ) {
+		forward.Set( 1.0f, 0.0f, 0.0f );
+	}
+	idVec3 left = up.Cross( forward );
+	left.Normalize();
+
+	const int elapsed = Max( 0, gameLocal.time - arenaIntroSubjectStartTime );
+	const float fraction = idMath::ClampFloat( 0.0f, 1.0f,
+		(float)elapsed / (float)Max( 1, ARENA_INTRO_SUBJECT_MSEC ) );
+
+	// Come around the front so the opponent is introduced face-on, drifting in.
+	const float orbitDegrees = idMath::Lerp( 42.0f, -18.0f, fraction );
+	float orbitSin, orbitCos;
+	idMath::SinCos( DEG2RAD( orbitDegrees ), orbitSin, orbitCos );
+	const idVec3 radial = forward * orbitCos + left * orbitSin;
+
+	const idBounds cameraBounds(
+		idVec3( -ARENA_CAMERA_CLIP_RADIUS, -ARENA_CAMERA_CLIP_RADIUS, -ARENA_CAMERA_CLIP_RADIUS ),
+		idVec3( ARENA_CAMERA_CLIP_RADIUS, ARENA_CAMERA_CLIP_RADIUS, ARENA_CAMERA_CLIP_RADIUS ) );
+	const idVec3 focusPoint = subject->GetPhysics()->GetOrigin() + up * 46.0f;
+	trace_t trace;
+	const float clearance = TraceArenaCampaignCamera( subject, trace, focusPoint, radial, up,
+		idMath::Lerp( 138.0f, 104.0f, fraction ), idMath::Lerp( 26.0f, 14.0f, fraction ),
+		cameraBounds );
+
+	if ( clearance < ARENA_CAMERA_MIN_USABLE_DISTANCE ||
+		 !ArenaCampaignCameraHasLineOfSight( subject, trace.endpos, focusPoint ) ) {
+		return false;
+	}
+
+	idVec3 look = focusPoint - trace.endpos;
+	if ( look.Normalize() == 0.0f ) {
+		return false;
+	}
+	idMat3 cameraAxis;
+	cameraAxis[0] = look;
+	cameraAxis[1] = up.Cross( look );
+	if ( cameraAxis[1].Normalize() == 0.0f ) {
+		cameraAxis[1] = left;
+	}
+	cameraAxis[2] = look.Cross( cameraAxis[1] );
+	cameraAxis[2].Normalize();
+
+	view->vieworg = trace.endpos;
+	view->viewaxis = cameraAxis;
+	view->viewID = 0;
+	gameLocal.CalcFov( 72.0f, view->fov_x, view->fov_y );
+	SetArenaCampaignDepthOfField( false );
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::BuildArenaCampaignSpawnInView
+
+The match-start shot: a rising orbit around the player's own body that swings in
+behind the head and then converges on the real first-person view.
+
+The convergence is the point. firstPersonViewOrigin/Axis are recomputed by
+idPlayer::CalculateFirstPersonView immediately before CalculateRenderView every
+frame, so blending onto them over the tail of the move means the last presented
+frame and the first gameplay frame are the same view - no cut, no snap.
+================
+*/
+bool idMultiplayerGame::BuildArenaCampaignSpawnInView( idPlayer *viewer, renderView_t *view ) {
+	const int duration = Max( 1, ARENA_SPAWN_IN_MSEC );
+	const int elapsed = Max( 0, gameLocal.time - arenaCeremonyPhaseStartTime );
+	const float fraction = idMath::ClampFloat( 0.0f, 1.0f, (float)elapsed / (float)duration );
+	const float eased = fraction * fraction * ( 3.0f - 2.0f * fraction );
+
+	idVec3 up = -viewer->GetPhysics()->GetGravityNormal();
+	if ( up.Normalize() == 0.0f ) {
+		up.Set( 0.0f, 0.0f, 1.0f );
+	}
+
+	// The body is frozen for the whole shot, so the basis is taken once and the
+	// orbit is expressed relative to it.
+	if ( !arenaSpawnInLatched ) {
+		idVec3 viewOrigin;
+		idMat3 facingAxis;
+		viewer->GetViewPos( viewOrigin, facingAxis );
+		idVec3 forward = facingAxis[0];
+		forward -= up * ( forward * up );
+		if ( forward.Normalize() == 0.0f ) {
+			forward.Set( 1.0f, 0.0f, 0.0f );
+		}
+		arenaSpawnInForward = forward;
+		arenaSpawnInLeft = up.Cross( forward );
+		arenaSpawnInLeft.Normalize();
+		arenaSpawnInLatched = true;
+	}
+
+	const idVec3 focusPoint = viewer->GetPhysics()->GetOrigin() + up * 40.0f;
+
+	// Sweep around to directly behind the head (180 degrees from facing), pulling
+	// in and rising as it goes.
+	const float orbitDegrees = idMath::Lerp( ARENA_SPAWN_IN_START_DEGREES, 180.0f, eased );
+	float orbitSin, orbitCos;
+	idMath::SinCos( DEG2RAD( orbitDegrees ), orbitSin, orbitCos );
+	const idVec3 radial = arenaSpawnInForward * orbitCos + arenaSpawnInLeft * orbitSin;
+
+	const float range = idMath::Lerp( ARENA_SPAWN_IN_START_RANGE, 44.0f, eased );
+	const float height = idMath::Lerp( ARENA_SPAWN_IN_START_HEIGHT, 12.0f, eased );
+
+	const idBounds cameraBounds(
+		idVec3( -ARENA_CAMERA_CLIP_RADIUS, -ARENA_CAMERA_CLIP_RADIUS, -ARENA_CAMERA_CLIP_RADIUS ),
+		idVec3( ARENA_CAMERA_CLIP_RADIUS, ARENA_CAMERA_CLIP_RADIUS, ARENA_CAMERA_CLIP_RADIUS ) );
+	trace_t trace;
+	TraceArenaCampaignCamera( viewer, trace, focusPoint, radial, up, range, height, cameraBounds );
+
+	idVec3 origin = trace.endpos;
+	idVec3 look = focusPoint - origin;
+	idMat3 cameraAxis;
+	if ( look.Normalize() == 0.0f ) {
+		cameraAxis = viewer->firstPersonViewAxis;
+	} else {
+		cameraAxis[0] = look;
+		cameraAxis[1] = up.Cross( look );
+		if ( cameraAxis[1].Normalize() == 0.0f ) {
+			cameraAxis[1] = arenaSpawnInLeft;
+		}
+		cameraAxis[2] = look.Cross( cameraAxis[1] );
+		cameraAxis[2].Normalize();
+	}
+
+	// Land on the real first-person view over the tail of the move.
+	if ( fraction > ARENA_SPAWN_IN_BLEND_START ) {
+		const float blend = idMath::ClampFloat( 0.0f, 1.0f,
+			( fraction - ARENA_SPAWN_IN_BLEND_START ) / ( 1.0f - ARENA_SPAWN_IN_BLEND_START ) );
+		origin = origin * ( 1.0f - blend ) + viewer->firstPersonViewOrigin * blend;
+		const idQuat blended =
+			cameraAxis.ToQuat().Slerp( cameraAxis.ToQuat(), viewer->firstPersonViewAxis.ToQuat(), blend );
+		cameraAxis = blended.ToMat3();
+	}
+
+	view->vieworg = origin;
+	view->viewaxis = cameraAxis;
+	view->viewID = 0;
+	gameLocal.CalcFov( viewer->CalcFov( true ), view->fov_x, view->fov_y );
+	SetArenaCampaignDepthOfField( false );
+	return true;
+}
+
+/*
+================
+idMultiplayerGame::BuildArenaCampaignPresentationView
+================
+*/
 bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, renderView_t *view ) {
 	if ( viewer == NULL || view == NULL || !viewer->IsLocalClient() ||
 		 !IsArenaCampaignMatch() || gameState == NULL ) {
@@ -12851,6 +13413,20 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 	}
 
 	const mpGameState_t state = gameState->GetMPGameState();
+
+	// Spawn-in is its own shot and does not share the establishing machinery: it
+	// orbits the viewer's own body, swings in behind the head and then converges
+	// exactly on the first-person view so the hand-off to normal control has no
+	// seam. Handled before the entrance/tableau selection because its subject,
+	// its framing and its ending are all different.
+	if ( arenaCeremonyPhase == ARENA_CEREMONY_SPAWN_IN ) {
+		return BuildArenaCampaignSpawnInView( viewer, view );
+	}
+
+	if ( arenaCeremonyPhase == ARENA_CEREMONY_INTRO ) {
+		return BuildArenaCampaignIntroView( viewer, view );
+	}
+
 	const bool entrance = state == COUNTDOWN;
 	const bool victory = state == GAMEREVIEW &&
 		( arenaResultPending || arenaResultReported );
@@ -12870,7 +13446,9 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 	}
 	idVec3 forward;
 	idVec3 left;
-	if ( entrance && arenaEntranceCameraResolved ) {
+	const bool cameraLatched =
+		arenaEntranceCameraResolved && arenaEntranceCameraIsEntrance == entrance;
+	if ( cameraLatched ) {
 		forward = arenaEntranceCameraForward;
 		left = arenaEntranceCameraLeft;
 	} else {
@@ -12888,10 +13466,8 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 		}
 		left = up.Cross( forward );
 		left.Normalize();
-		if ( entrance ) {
-			arenaEntranceCameraForward = forward;
-			arenaEntranceCameraLeft = left;
-		}
+		arenaEntranceCameraForward = forward;
+		arenaEntranceCameraLeft = left;
 	}
 
 	float orbitDegrees;
@@ -12914,15 +13490,33 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 		cameraFov = idMath::Lerp( 84.0f, 72.0f, eased );
 		SetArenaCampaignDepthOfField( false );
 	} else {
-		const int startTime = arenaResultReportTime - ARENA_RESULT_REVIEW_MSEC;
+		const int startTime = arenaTableauStartTime;
 		const int elapsed = Max( 0, gameLocal.time - startTime );
 		presentationFraction = idMath::ClampFloat( 0.0f, 1.0f,
 			(float)elapsed / (float)ARENA_RESULT_REVIEW_MSEC );
 		const float settle = idMath::ClampFloat( 0.0f, 1.0f, (float)elapsed / 1400.0f );
 		const float eased = settle * settle * ( 3.0f - 2.0f * settle );
-		orbitDegrees = 25.0f + (float)elapsed * 0.018f;
+
+		// Free rotation around the victor. The player steers the orbit with look
+		// input while the bodies stay frozen; only the framing settles on its own.
+		// The reference yaw is latched on the first tableau frame so the shot
+		// opens at the authored angle no matter where the player was looking when
+		// the match ended, and so it cannot jump if the victor is re-resolved.
+		if ( !arenaVictorLookLatched ) {
+			arenaVictorLookYaw = viewer->viewAngles.yaw;
+			arenaVictorLookLatched = true;
+		}
+		const float lookYaw = idMath::AngleNormalize180( viewer->viewAngles.yaw - arenaVictorLookYaw );
+		const float lookPitch = idMath::ClampFloat(
+			-ARENA_VICTOR_ORBIT_PITCH_RANGE, ARENA_VICTOR_ORBIT_PITCH_RANGE,
+			viewer->viewAngles.pitch );
+
+		orbitDegrees = ARENA_VICTOR_ORBIT_START + lookYaw;
 		cameraRange = idMath::Lerp( 178.0f, 132.0f, eased );
-		cameraHeight = 48.0f + idMath::Sin( presentationFraction * idMath::TWO_PI ) * 8.0f;
+		// Looking down raises the camera and looking up drops it, so the stick or
+		// mouse moves the eye the way it would in a normal third-person orbit.
+		cameraHeight = ARENA_VICTOR_ORBIT_HEIGHT +
+			lookPitch * ( ARENA_VICTOR_ORBIT_HEIGHT_PER_DEGREE * eased );
 		cameraFov = idMath::Lerp( 78.0f, 70.0f, eased );
 	}
 
@@ -12932,12 +13526,16 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 		idVec3( -ARENA_CAMERA_CLIP_RADIUS, -ARENA_CAMERA_CLIP_RADIUS, -ARENA_CAMERA_CLIP_RADIUS ),
 		idVec3( ARENA_CAMERA_CLIP_RADIUS, ARENA_CAMERA_CLIP_RADIUS, ARENA_CAMERA_CLIP_RADIUS ) );
 
-	// A spawn can face directly into a wall or sit beneath a low overhang.  The
-	// authored sweep is ideal in open space, but clipping it down to a few units
-	// produces an unreadable close-up.  Resolve the whole entrance once against
-	// fixed probes, then latch both the facing basis and any fallback anchor so
-	// player input or close candidate scores cannot switch the shot mid-countdown.
-	if ( entrance && !arenaEntranceCameraResolved ) {
+	// A spawn can face directly into a wall or sit beneath a low overhang, and a
+	// victor almost always ends the match against cover because that is where the
+	// last fight happened.  The authored sweep is ideal in open space, but clipping
+	// it down to a few units produces an unreadable close-up.  Resolve the whole
+	// presentation once against fixed probes, then latch both the facing basis and
+	// any fallback anchor so player input or close candidate scores cannot switch
+	// the shot mid-presentation.  The final tableau needs this as much as the
+	// entrance: without it a blocked orbit angle fails the clearance gate below,
+	// hard-cutting to first person and popping the depth of field off mid-orbit.
+	if ( !cameraLatched ) {
 		static const float entranceProbeAngles[] = {
 			205.0f, 231.25f, 257.5f, 283.75f, 310.0f
 		};
@@ -12947,14 +13545,28 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 		static const float entranceProbeHeights[] = {
 			82.0f, 70.0f, 58.0f, 46.0f, 34.0f
 		};
+		// Mirrors the review orbit below: orbitDegrees sweeps 25 -> 133 while the
+		// range eases 178 -> 132 and the height oscillates about 48.
+		static const float reviewProbeAngles[] = {
+			25.0f, 52.0f, 79.0f, 106.0f, 133.0f
+		};
+		static const float reviewProbeRanges[] = {
+			178.0f, 166.5f, 155.0f, 143.5f, 132.0f
+		};
+		static const float reviewProbeHeights[] = {
+			48.0f, 56.0f, 48.0f, 40.0f, 48.0f
+		};
+		const float *probeAngles = entrance ? entranceProbeAngles : reviewProbeAngles;
+		const float *probeRanges = entrance ? entranceProbeRanges : reviewProbeRanges;
+		const float *probeHeights = entrance ? entranceProbeHeights : reviewProbeHeights;
 		bool authoredSweepClear = true;
 		for ( int i = 0; i < 5; i++ ) {
 			float probeSin, probeCos;
-			idMath::SinCos( DEG2RAD( entranceProbeAngles[i] ), probeSin, probeCos );
+			idMath::SinCos( DEG2RAD( probeAngles[i] ), probeSin, probeCos );
 			const idVec3 probeRadial = forward * probeCos + left * probeSin;
 			trace_t probeTrace;
 			TraceArenaCampaignCamera( focusPlayer, probeTrace, focusPoint, probeRadial,
-				up, entranceProbeRanges[i], entranceProbeHeights[i], cameraBounds );
+				up, probeRanges[i], probeHeights[i], cameraBounds );
 			idVec3 probeSeparation = probeTrace.endpos - focusPoint;
 			probeSeparation -= up * ( probeSeparation * up );
 			if ( probeTrace.fraction < ARENA_CAMERA_MIN_ESTABLISHING_FRACTION ||
@@ -12998,9 +13610,10 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 			}
 		}
 		arenaEntranceCameraResolved = true;
+		arenaEntranceCameraIsEntrance = entrance;
 	}
 
-	if ( entrance && !arenaEntranceCameraValid ) {
+	if ( !arenaEntranceCameraValid ) {
 		// No third-person point is safe and readable.  Let CalculateRenderView
 		// continue into its normal valid first-person path instead of normalizing
 		// a zero-length camera vector or filling the screen with the local model.
@@ -13009,7 +13622,7 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 
 	float orbitSin, orbitCos;
 	idVec3 radial;
-	if ( entrance && arenaEntranceCameraFallback ) {
+	if ( arenaEntranceCameraFallback ) {
 		const float entranceEase = presentationFraction * presentationFraction *
 			( 3.0f - 2.0f * presentationFraction );
 		const float sweepDegrees = idMath::Lerp( -ARENA_CAMERA_FALLBACK_SWEEP_DEGREES,
@@ -13028,7 +13641,7 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 	float cameraClearance = TraceArenaCampaignCamera( focusPlayer, trace, focusPoint,
 		radial, up, cameraRange, cameraHeight, cameraBounds );
 
-	if ( entrance && arenaEntranceCameraFallback ) {
+	if ( arenaEntranceCameraFallback ) {
 		idVec3 separation = trace.endpos - focusPoint;
 		separation -= up * ( separation * up );
 		if ( separation.Length() < ARENA_CAMERA_MIN_HORIZONTAL_CLEARANCE ||
@@ -13041,8 +13654,30 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 		}
 	}
 
+	// The tableau is steered by the player, so it will be swung into walls, and a
+	// bail there would hard-cut to first person mid-ceremony.  Pull the eye in
+	// toward the victor until the shot clears instead; the trace already clips
+	// the position, so this only has to shorten the requested range.
+	if ( !entrance ) {
+		static const float pullInFractions[] = { 0.78f, 0.58f, 0.42f, 0.30f };
+		for ( int attempt = 0;
+			  attempt < 4 &&
+				  ( cameraClearance < ARENA_CAMERA_MIN_USABLE_DISTANCE ||
+					!ArenaCampaignCameraHasLineOfSight( focusPlayer, trace.endpos, focusPoint ) );
+			  attempt++ ) {
+			cameraClearance = TraceArenaCampaignCamera( focusPlayer, trace, focusPoint,
+				radial, up, cameraRange * pullInFractions[attempt],
+				cameraHeight * pullInFractions[attempt], cameraBounds );
+		}
+	}
+
 	idVec3 horizontalSeparation = trace.endpos - focusPoint;
 	horizontalSeparation -= up * ( horizontalSeparation * up );
+	// The horizontal-clearance floor stays an entrance rule.  The entrance is a
+	// fixed establishing shot where a tight pass reads as an unreadable close-up,
+	// but the tableau is a moving orbit where a brief tight pass is far better
+	// than cutting to first person.  Occlusion is what the tableau had to fix,
+	// and the latched fallback anchor above now covers it.
 	if ( cameraClearance < ARENA_CAMERA_MIN_USABLE_DISTANCE ||
 		 ( entrance && horizontalSeparation.Length() < ARENA_CAMERA_MIN_HORIZONTAL_CLEARANCE ) ||
 		 !ArenaCampaignCameraHasLineOfSight( focusPlayer, trace.endpos, focusPoint ) ) {
@@ -13067,8 +13702,7 @@ bool idMultiplayerGame::BuildArenaCampaignPresentationView( idPlayer *viewer, re
 	gameLocal.CalcFov( cameraFov, view->fov_x, view->fov_y );
 
 	if ( victory ) {
-		const int elapsed = Max( 0, gameLocal.time -
-			( arenaResultReportTime - ARENA_RESULT_REVIEW_MSEC ) );
+		const int elapsed = Max( 0, gameLocal.time - arenaTableauStartTime );
 		const float strength = idMath::ClampFloat( 0.0f, 0.38f,
 			(float)elapsed / 1800.0f * 0.38f );
 		SetArenaCampaignDepthOfField( true, focusDistance, strength );
@@ -13096,6 +13730,16 @@ void idMultiplayerGame::OnMatchStarted( void ) {
 	arenaResultOpponentScore = ARENA_SCORE_UNAVAILABLE;
 	arenaResultReportTime = 0;
 
+	// Hold control for the match-start shot. ClearArenaCampaignPresentation above
+	// has already reset the ceremony, so this is the one place that arms it.
+	if ( IsArenaCampaignMatch() ) {
+		arenaCeremonyPhase = ARENA_CEREMONY_SPAWN_IN;
+		arenaCeremonyPhaseStartTime = gameLocal.time;
+		arenaCeremonyPhaseEndTime = gameLocal.time + ARENA_SPAWN_IN_MSEC;
+		arenaSpawnInLatched = false;
+		gameLocal.Printf( "arena campaign: spawn-in presentation (%d ms)\n", ARENA_SPAWN_IN_MSEC );
+	}
+
 	botManager.OnMatchStart();
 }
 
@@ -13117,8 +13761,16 @@ idMultiplayerGame::BeginArenaCampaignResult
 ================
 */
 void idMultiplayerGame::BeginArenaCampaignResult( void ) {
+	// Arm on the same predicate the freeze, the lock and the cameras use, not on
+	// the raw serverinfo token. si_arenaCampaign is replicated and archivable, so
+	// a server that merely carries it would otherwise run the whole single-player
+	// ceremony: an 18-second hold on NEXTGAME stalling the map rotation, and a
+	// stray arenaComplete written into the one session-command slot per frame.
+	if ( !IsArenaCampaignMatch() || arenaResultPending || arenaResultReported ) {
+		return;
+	}
 	const int token = gameLocal.serverInfo.GetInt( "si_arenaCampaign" );
-	if ( token <= 0 || arenaResultPending || arenaResultReported ) {
+	if ( token <= 0 ) {
 		return;
 	}
 
@@ -13190,12 +13842,306 @@ void idMultiplayerGame::BeginArenaCampaignResult( void ) {
 
 	SelectArenaCampaignPresentationFocus( host );
 	arenaResultPending = true;
-	arenaResultReportTime = gameLocal.time + ARENA_RESULT_REVIEW_MSEC;
+	// The tableau is only the first beat. arenaResultReportTime is the end of the
+	// whole ceremony, because it is what holds NEXTGAME off and what gates the
+	// handoff; the tableau keeps its own start so the camera timings do not have
+	// to be derived backwards from a moving total.
+	arenaCeremonyPhase = ARENA_CEREMONY_TABLEAU;
+	arenaTableauStartTime = gameLocal.time;
+	arenaCeremonyPhaseStartTime = gameLocal.time;
+	arenaCeremonyPhaseEndTime = gameLocal.time + ARENA_RESULT_REVIEW_MSEC;
+	arenaResultReportTime = arenaCeremonyPhaseEndTime +
+		ARENA_SCOREBOARD_MSEC + ARENA_STATS_MSEC;
 	gameLocal.Printf( "arena campaign: queued result token %d (%s, %d-%d)\n",
 		arenaResultToken,
 		ArenaCampaignResultName( arenaResultOutcome ),
 		arenaResultPlayerScore,
 		arenaResultOpponentScore );
+}
+
+/*
+================
+idMultiplayerGame::GetMapWeaponMask
+
+The set of weapon slots that actually exist as pickups on the loaded map.
+
+Warmup is practice for the map you are about to play, so handing out weapons the
+map does not contain teaches the wrong fight and lets a player warm up with a
+gun they can never find once the match starts. Derived from the spawned item
+entities rather than from a table, so it follows whatever the mapper placed.
+
+Cached per map; ClearMap invalidates it.
+================
+*/
+int idMultiplayerGame::GetMapWeaponMask( void ) {
+	if ( mapWeaponMaskValid ) {
+		return mapWeaponMask;
+	}
+
+	// Slot numbering lives in the player def, so a player is needed to resolve
+	// names. Before anyone has spawned there is nothing to warm up with anyway.
+	idPlayer *resolver = NULL;
+	for ( int i = 0; i < gameLocal.numClients && resolver == NULL; i++ ) {
+		idEntity *ent = gameLocal.entities[i];
+		if ( ent != NULL && ent->IsType( idPlayer::GetClassType() ) ) {
+			resolver = static_cast<idPlayer *>( ent );
+		}
+	}
+	if ( resolver == NULL ) {
+		// Fail open rather than handing out nothing.
+		return BIT( MAX_WEAPONS ) - 1;
+	}
+
+	int mask = 0;
+	for ( idEntity *ent = gameLocal.spawnedEntities.Next(); ent != NULL;
+		  ent = ent->spawnNode.Next() ) {
+		if ( !ent->IsType( idItem::GetClassType() ) ) {
+			continue;
+		}
+		const char *weaponName = ent->spawnArgs.GetString( "inv_weapon", "" );
+		if ( weaponName[0] == '\0' ) {
+			continue;
+		}
+		const int slot = resolver->SlotForWeapon( weaponName );
+		if ( slot >= 0 && slot < MAX_WEAPONS ) {
+			mask |= 1 << slot;
+		}
+	}
+
+	// Always keep whatever the player spawns holding, so warmup can never leave
+	// someone with no weapon at all on a map with no pickups.
+	mask |= resolver->inventory.weapons;
+
+	mapWeaponMask = mask;
+	mapWeaponMaskValid = true;
+	gameLocal.Printf( "warmup arsenal: %d weapon slots present on this map\n",
+		idMath::BitCount( mask ) );
+	return mapWeaponMask;
+}
+
+/*
+================
+idMultiplayerGame::ArenaCampaignFreezesWorld
+
+True for the whole end-of-match ceremony. "Freeze every combatant where the
+match ended" is only half of it - a rocket still in flight, a moving platform or
+a running effect would all keep going behind the tableau and make the frozen
+score read as a paused fight rather than a finished one.
+================
+*/
+bool idMultiplayerGame::ArenaCampaignFreezesWorld( void ) const {
+	// Not the spawn-in shot: that only holds control, and freezing entity
+	// thinking there would also stop the match clock the shot runs under.
+	return IsArenaCampaignMatch() &&
+		( arenaCeremonyPhase == ARENA_CEREMONY_TABLEAU ||
+		  arenaCeremonyPhase == ARENA_CEREMONY_SCOREBOARD ||
+		  arenaCeremonyPhase == ARENA_CEREMONY_STATS ||
+		  arenaCeremonyPhase == ARENA_CEREMONY_DONE );
+}
+
+/*
+================
+idMultiplayerGame::ArenaCampaignCeremonyFade
+
+How black the screen should be for the ceremony hand-overs, 0 to 1.
+
+idPlayerView::ScreenFade cannot be used for these: it draws inside
+RenderPlayerView, which runs before the scoreboard and the stat summary, so it
+can darken the arena but never the board that replaces it. This value is drawn
+over everything at the end of Draw instead, which is what lets each beat fade
+out and the next one fade in.
+================
+*/
+float idMultiplayerGame::ArenaCampaignCeremonyFade( void ) const {
+	if ( arenaCeremonyPhase == ARENA_CEREMONY_NONE ) {
+		return 0.0f;
+	}
+	if ( arenaCeremonyPhase == ARENA_CEREMONY_DONE ) {
+		// Hold black until the framework's own wipe takes the screen, so the
+		// frozen arena cannot flash between the stats and the match report.
+		return 1.0f;
+	}
+
+	// The match-start shot hands over to gameplay, not to another screen: it must
+	// never darken, at either end.
+	if ( arenaCeremonyPhase == ARENA_CEREMONY_SPAWN_IN ) {
+		return 0.0f;
+	}
+
+	const int remaining = arenaCeremonyPhaseEndTime - gameLocal.time;
+	if ( remaining < ARENA_CEREMONY_FADE_MSEC ) {
+		return idMath::ClampFloat( 0.0f, 1.0f,
+			(float)( ARENA_CEREMONY_FADE_MSEC - remaining ) / (float)ARENA_CEREMONY_FADE_MSEC );
+	}
+
+	// The tableau opens straight from gameplay and must not fade in.
+	if ( arenaCeremonyPhase == ARENA_CEREMONY_TABLEAU ) {
+		return 0.0f;
+	}
+
+	const int elapsed = gameLocal.time - arenaCeremonyPhaseStartTime;
+	if ( elapsed < ARENA_CEREMONY_FADE_MSEC ) {
+		return idMath::ClampFloat( 0.0f, 1.0f,
+			1.0f - (float)elapsed / (float)ARENA_CEREMONY_FADE_MSEC );
+	}
+	return 0.0f;
+}
+
+/*
+================
+idMultiplayerGame::DrawArenaCampaignCeremonyFade
+================
+*/
+void idMultiplayerGame::DrawArenaCampaignCeremonyFade( void ) {
+	const float fade = ArenaCampaignCeremonyFade();
+	if ( fade <= 0.0f ) {
+		return;
+	}
+
+	const idMaterial *black = declManager->FindMaterial( "_white", false );
+	if ( black == NULL ) {
+		return;
+	}
+
+	renderSystem->SetColor4( 0.0f, 0.0f, 0.0f, fade );
+	renderSystem->DrawStretchPic( 0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT,
+		0.0f, 0.0f, 1.0f, 1.0f, black );
+	renderSystem->SetColor4( 1.0f, 1.0f, 1.0f, 1.0f );
+}
+
+/*
+================
+idMultiplayerGame::SetupArenaCampaignStatSummary
+
+Populates the stock stat summary exactly as idMultiplayerGame::StartMenu does for
+currentMenu 3, but without going through the menu session command. The Arena
+handoff owns the single sessionCommand slot for the whole review, so the ceremony
+cannot afford to spend it opening a menu.
+================
+*/
+void idMultiplayerGame::SetupArenaCampaignStatSummary( void ) {
+	if ( statSummary == NULL ) {
+		return;
+	}
+
+	statSummary->Activate( true, gameLocal.time );
+	statManager->SetupStatWindow( statSummary );
+	UpdateScoreboard( statSummary );
+	UpdateSummaryBoard( statSummary );
+	statSummary->SetStateFloat( "ready", 0 );
+	statSummary->StateChanged( gameLocal.time );
+
+	// The stock win/lose call lives in the menu path the Arena suppresses, so
+	// the campaign has never had it. Announce it here, once, with the stats.
+	idPlayer *host = gameLocal.GetLocalPlayer();
+	if ( host != NULL && gameLocal.time - lastVOAnnounce > 1000 ) {
+		ScheduleAnnouncerSound(
+			arenaResultOutcome == ARENA_RESULT_WIN ? AS_GENERAL_YOU_WIN : AS_GENERAL_YOU_LOSE,
+			gameLocal.time );
+		lastVOAnnounce = gameLocal.time;
+	}
+}
+
+/*
+================
+idMultiplayerGame::AdvanceArenaCampaignCeremony
+
+Drives the ordered end-of-match beats. Each hand-over fades the arena to black
+first: idPlayerView::ScreenFade draws inside RenderPlayerView, which runs before
+the scoreboard and the stat summary, so the fade can only ever darken what is
+behind them - which is exactly what is wanted here. The world goes down and the
+board is revealed over it.
+================
+*/
+void idMultiplayerGame::AdvanceArenaCampaignCeremony( void ) {
+	if ( arenaCeremonyPhase == ARENA_CEREMONY_NONE ||
+		 arenaCeremonyPhase == ARENA_CEREMONY_DONE ) {
+		return;
+	}
+
+	idPlayer *host = gameLocal.GetLocalPlayer();
+
+	if ( gameLocal.time < arenaCeremonyPhaseEndTime ) {
+		return;
+	}
+
+	switch ( arenaCeremonyPhase ) {
+		case ARENA_CEREMONY_INTRO: {
+			arenaIntroIndex++;
+			idPlayer *next = ArenaCampaignIntroSubject();
+			if ( next != NULL ) {
+				arenaIntroSubjectStartTime = gameLocal.time;
+				arenaCeremonyPhaseStartTime = gameLocal.time;
+				arenaCeremonyPhaseEndTime = gameLocal.time + ARENA_INTRO_SUBJECT_MSEC;
+				ShowArenaCampaignIntroCard( next );
+				break;
+			}
+			// Roster exhausted: release warmup so the countdown can start.
+			arenaCeremonyPhase = ARENA_CEREMONY_NONE;
+			arenaCeremonyPhaseStartTime = gameLocal.time;
+			arenaCeremonyPhaseEndTime = gameLocal.time;
+			gameLocal.Printf( "arena campaign: introductions complete\n" );
+			break;
+		}
+		case ARENA_CEREMONY_SPAWN_IN: {
+			// The shot has already converged on the first-person view, so simply
+			// releasing the phase hands control back on the same view it ended on.
+			arenaCeremonyPhase = ARENA_CEREMONY_NONE;
+			arenaCeremonyPhaseStartTime = gameLocal.time;
+			arenaCeremonyPhaseEndTime = gameLocal.time;
+			arenaSpawnInLatched = false;
+			// The GAMEON edge suppresses this for the campaign so it lands with
+			// control rather than over the camera move. Round modes are excluded
+			// for the same reason they are excluded there: Clan Arena and Red
+			// Rover are not fighting yet at GAMEON, and their own "Fight" comes
+			// from the round going active a few seconds later.
+			if ( gameLocal.gameType != GAME_TOURNEY && !gameLocal.IsRoundGameType() ) {
+				ScheduleAnnouncerSound( AS_GENERAL_FIGHT, gameLocal.time );
+			}
+			ClearArenaCampaignPresentation();
+			gameLocal.Printf( "arena campaign: spawn-in complete, control returned\n" );
+			break;
+		}
+		case ARENA_CEREMONY_TABLEAU: {
+			// Retire the in-world victor card and its letterbox before the board
+			// takes the screen; DrawScoreBoard sets disableHud, which would freeze
+			// them mid-transition instead of playing them out.
+			ClearArenaCampaignPresentation();
+			if ( host != NULL ) {
+				host->ForceScoreboard( true, 0 );
+			}
+			arenaCeremonyPhase = ARENA_CEREMONY_SCOREBOARD;
+			arenaCeremonyPhaseStartTime = gameLocal.time;
+			arenaCeremonyPhaseEndTime = gameLocal.time + ARENA_SCOREBOARD_MSEC;
+			gameLocal.Printf( "arena campaign: ceremony scoreboard for token %d\n", arenaResultToken );
+			break;
+		}
+		case ARENA_CEREMONY_SCOREBOARD: {
+			if ( host != NULL ) {
+				host->ForceScoreboard( false, 0 );
+				host->disableHud = true;
+			}
+			SetupArenaCampaignStatSummary();
+			currentMenu = 3;
+			arenaCeremonyPhase = ARENA_CEREMONY_STATS;
+			arenaCeremonyPhaseStartTime = gameLocal.time;
+			arenaCeremonyPhaseEndTime = gameLocal.time + ARENA_STATS_MSEC;
+			gameLocal.Printf( "arena campaign: ceremony stats for token %d\n", arenaResultToken );
+			break;
+		}
+		case ARENA_CEREMONY_STATS: {
+			// Leave the summary up. The framework's own fade takes the screen on
+			// the next handoff frame, so tearing it down here would flash the
+			// frozen arena between the stats and the match report.
+			arenaCeremonyPhase = ARENA_CEREMONY_DONE;
+			arenaCeremonyPhaseStartTime = gameLocal.time;
+			arenaCeremonyPhaseEndTime = gameLocal.time;
+			break;
+		}
+		default: {
+			break;
+		}
+	}
 }
 
 /*
@@ -13218,13 +14164,17 @@ void idMultiplayerGame::UpdateArenaCampaignResult( void ) {
 		return;
 	}
 
-	// A player may configure a review pause shorter than the campaign result
-	// presentation.  Keep NEXTGAME beyond the handoff so the in-world victory
-	// showcase remains visible for its full duration.
+	// A player may configure a review pause shorter than the campaign ceremony.
+	// Keep NEXTGAME beyond the handoff so the tableau, the scoreboard and the
+	// stats all play out. This is re-armed every frame rather than once, because
+	// the ceremony is long enough that a later scheduler could otherwise slip a
+	// map restart in underneath it.
 	if ( gameState->GetNextMPGameState() == NEXTGAME &&
 		 gameState->GetNextMPGameStateTime() <= arenaResultReportTime ) {
 		gameState->SetNextMPGameStateTime( arenaResultReportTime + 1000 );
 	}
+
+	AdvanceArenaCampaignCeremony();
 
 	if ( gameLocal.time < arenaResultReportTime ) {
 		return;
@@ -13265,11 +14215,13 @@ void idMultiplayerGame::UpdateArenaCampaignResult( void ) {
 	// Keep the tableau, camera and depth-of-field live through the framework's
 	// immediate wipe capture.  ClearMap/Clear owns teardown if the command is
 	// accepted; a new match clears it explicitly in OnMatchStarted.
-	gameLocal.sessionCommand = va( "arenaComplete %d %d %d %d",
+	idPlayer *resultHost = gameLocal.GetLocalPlayer();
+	gameLocal.sessionCommand = va( "arenaComplete %d %d %d %d %d",
 		arenaResultToken,
 		arenaResultOutcome,
 		arenaResultPlayerScore,
-		arenaResultOpponentScore );
+		arenaResultOpponentScore,
+		ArenaCampaignAwardMask( resultHost != NULL ? resultHost->entityNumber : -1 ) );
 }
 
 /*
@@ -13288,6 +14240,20 @@ void idMultiplayerGame::Run( void ) {
 	}
 
 	CheckVote();
+
+	// The Arena ceremony deliberately freezes the world around its final tableau,
+	// so the result handoff has to run ahead of the frozen-frame return.  Left
+	// below it, a frozen tableau would never report and the campaign would hang
+	// in a live server with no UI and no diagnostic.  This is safe to run twice
+	// in a frame: it no-ops unless arenaResultPending is set, and it only reads
+	// already-frozen score state.
+	// The match-start shot runs while the match is live, so the ceremony driver
+	// cannot live inside the result path -- that only runs once a result is
+	// pending. UpdateArenaCampaignResult re-enters it for the review beats, which
+	// is harmless: it is idempotent within a frame.
+	AdvanceArenaCampaignCeremony();
+
+	UpdateArenaCampaignResult();
 
 	if ( IsGameplayFrozen() ) {
 		// The network/UI/operation side of CommonRun and inherited vote expiry
@@ -13313,8 +14279,6 @@ void idMultiplayerGame::Run( void ) {
 	UpdateTeamPowerups();
 //RITUAL END
 	gameState->Run();
-
-	UpdateArenaCampaignResult();
 
 	gameState->SendState( serverReliableSender.To( -1 ) );
 
@@ -13396,12 +14360,20 @@ void idMultiplayerGame::UpdateMainGui( void ) {
 	const int maxPlayers = gameLocal.serverInfo.GetInt( "si_maxPlayers" );
 	const char *limitLabel = common->GetLocalizedString( "#str_107660" );
 	int limitValue = gameLocal.serverInfo.GetInt( "si_fragLimit" );
+	// openQ4: driven off the gametype flags rather than a hard-coded list, so a
+	// round or objective mode no longer advertises an irrelevant frag limit.
 	if ( gameLocal.IsFlagGameType() ) {
 		limitLabel = common->GetLocalizedString( "#str_107661" );
 		limitValue = gameLocal.serverInfo.GetInt( "si_captureLimit" );
 	} else if ( gameLocal.gameType == GAME_DEADZONE ) {
 		limitLabel = common->GetLocalizedString( "#str_122008" );
 		limitValue = gameLocal.serverInfo.GetInt( "si_controlTime" );
+	} else if ( MPGameTypeHasAny( gameLocal.gameType, GTF_ROUNDLIMIT ) ) {
+		limitLabel = common->GetLocalizedString( "#str_41404" );
+		limitValue = gameLocal.serverInfo.GetInt( "si_roundLimit" );
+	} else if ( MPGameTypeHasAny( gameLocal.gameType, GTF_SCORELIMIT ) ) {
+		limitLabel = common->GetLocalizedString( "#str_41403" );
+		limitValue = gameLocal.serverInfo.GetInt( "si_scoreLimit" );
 	}
 	mainGui->SetStateString( "join_server_line_0", va( "%s:\t%s", common->GetLocalizedString( "#str_107725" ), gameLocal.serverInfo.GetString( "si_name" ) ) );
 	mainGui->SetStateString( "join_server_line_1", va( "%s:\t%s", common->GetLocalizedString( "#str_107726" ), serverAddress.c_str() ) );
@@ -14975,6 +15947,9 @@ bool idMultiplayerGame::Draw( int clientNum ) {
 		DrawScoreBoard( player );
 	}
 
+	// Last, so it covers the scoreboard and the stat summary as well as the world.
+	DrawArenaCampaignCeremonyFade();
+
 // RAVEN BEGIN
 // bdube: debugging HUD
 	gameDebug.DrawHud();
@@ -15337,7 +16312,15 @@ void idMultiplayerGame::UpdateHud( idUserInterface* _mphud ) {
 		gameLocal.mpGame.tourneyGUI.UpdateScores();
 	}
 
-	ProjectClientManagedMatchContext( _mphud );
+	// The managed-match status panel reports readiness, rule freezing, timeout
+	// budgets and referee authority. None of that exists in the Arena campaign,
+	// where it is a large block of noise over the match.
+	if ( IsArenaCampaignMatch() ) {
+		MPMatchControlClearManagedContext( *_mphud );
+		clientMatchHudProjectedViewRevision = 0;
+	} else {
+		ProjectClientManagedMatchContext( _mphud );
+	}
 	_mphud->StateChanged( gameLocal.time );
 
 	statManager->UpdateInGameHud( _mphud, ( localPlayer->usercmd.buttons & BUTTON_INGAMESTATS ) != 0 );
@@ -15784,6 +16767,10 @@ that team see it too, which is what Quake Live does.
 ================
 */
 void idMultiplayerGame::CenterPrintTeam( int team, const char *strId, centerPrintParm_t type1, int parm1, bool persist ) {
+	CenterPrintTeam( team, strId, type1, parm1, CPARM_NONE, 0, persist );
+}
+
+void idMultiplayerGame::CenterPrintTeam( int team, const char *strId, centerPrintParm_t type1, int parm1, centerPrintParm_t type2, int parm2, bool persist ) {
 	int i;
 
 	if ( gameLocal.isClient ) {
@@ -15800,8 +16787,79 @@ void idMultiplayerGame::CenterPrintTeam( int team, const char *strId, centerPrin
 			continue;
 		}
 
-		CenterPrint( i, strId, type1, parm1, persist );
+		CenterPrint( i, strId, type1, parm1, type2, parm2, persist );
 	}
+}
+
+/*
+================
+idMultiplayerGame::AnnounceTo
+
+The announcer queue lives on whichever machine calls ScheduleAnnouncerSound, so
+a cue that only the server can decide has to be sent.  A listen server never
+receives its own reliable messages, so the host is queued directly.
+================
+*/
+void idMultiplayerGame::AnnounceTo( int to, announcerSound_t sound ) {
+	idBitMsg	outMsg;
+	byte		msgBuf[ MAX_GAME_MESSAGE_SIZE ];
+
+	if ( gameLocal.isClient || sound < 0 || sound >= AS_NUM_SOUNDS ) {
+		return;
+	}
+
+	outMsg.Init( msgBuf, sizeof( msgBuf ) );
+	outMsg.WriteByte( GAME_RELIABLE_MESSAGE_ANNOUNCER );
+	outMsg.WriteByte( sound );
+	networkSystem->ServerSendReliableMessage( to, outMsg );
+
+	idPlayer *local = gameLocal.GetLocalPlayer();
+	if ( local != NULL && ( to == -1 || to == local->entityNumber ) ) {
+		RemoveAnnouncerSound( sound );
+		ScheduleAnnouncerSound( sound, gameLocal.time, -1, true );
+	}
+}
+
+/*
+================
+idMultiplayerGame::AnnounceToTeam
+================
+*/
+void idMultiplayerGame::AnnounceToTeam( int team, announcerSound_t sound ) {
+	int i;
+
+	if ( gameLocal.isClient ) {
+		return;
+	}
+
+	for ( i = 0; i < gameLocal.numClients; i++ ) {
+		idEntity *ent = gameLocal.entities[ i ];
+
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+		if ( static_cast< idPlayer * >( ent )->team != team ) {
+			continue;
+		}
+
+		AnnounceTo( i, sound );
+	}
+}
+
+/*
+================
+idMultiplayerGame::ReceiveAnnouncer
+================
+*/
+void idMultiplayerGame::ReceiveAnnouncer( const idBitMsg &msg ) {
+	int sound = msg.ReadByte();
+
+	if ( sound < 0 || sound >= AS_NUM_SOUNDS ) {
+		return;
+	}
+
+	RemoveAnnouncerSound( sound );
+	ScheduleAnnouncerSound( (announcerSound_t)sound, gameLocal.time, -1, true );
 }
 
 /*
@@ -15942,6 +17000,52 @@ void idMultiplayerGame::PrintMessage( int to, const char* msg ) {
 
 /*
 ================
+idMultiplayerGame::FollowTeamMate
+
+Points a spectating player's camera at a living team mate.  Only moves a camera
+that is still on the player themselves, so a deliberate choice of POV is never
+overridden, and only ever selects a target the spectator is allowed to follow.
+================
+*/
+void idMultiplayerGame::FollowTeamMate( idPlayer *p ) {
+	int i;
+
+	if ( gameLocal.isClient || p == NULL || !p->spectating ) {
+		return;
+	}
+
+	// already watching somebody else
+	if ( p->spectator != p->entityNumber ) {
+		return;
+	}
+
+	if ( !gameLocal.IsTeamGame() || p->team < 0 || p->team >= TEAM_MAX ) {
+		return;
+	}
+
+	for ( i = 0; i < gameLocal.numClients; i++ ) {
+		idEntity *ent = gameLocal.entities[ i ];
+
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+
+		idPlayer *mate = static_cast< idPlayer * >( ent );
+		if ( mate->team != p->team || mate->health <= 0 ) {
+			continue;
+		}
+		if ( !CanSpectatorFollow( p->entityNumber, i ) ) {
+			continue;
+		}
+
+		p->spectator = i;
+		mate->UpdateHudWeapon( mate->GetCurrentWeapon() );
+		return;
+	}
+}
+
+/*
+================
 idMultiplayerGame::CheckSpawns
 ================
 */
@@ -15955,6 +17059,19 @@ void idMultiplayerGame::CheckRespawns( idPlayer *spectator ) {
 
 		idPlayer *p = static_cast<idPlayer *>(ent);
 
+		// The Arena campaign has exactly one human and they are a combatant for
+		// the whole match. Several independent policy layers can put them in
+		// spectator - the managed match session's join evaluator, the duel
+		// queue, sudden death - and each of them fails silently, leaving the
+		// player watching bots with no way back. Rather than trusting every one
+		// of those to be guarded, put them back here. AllowRespawn still has the
+		// final say, so a round mode that has legitimately eliminated them for
+		// the rest of the round is respected.
+		if ( IsArenaCampaignMatch() && p->spectating && !p->wantSpectate &&
+			 p == gameLocal.GetLocalPlayer() && gameState->AllowRespawn( p ) ) {
+			p->forceRespawn = true;
+		}
+
 		// once we hit sudden death, nobody respawns till game has ended
 		// no respawns in tourney mode, the tourney manager manually handles spawns
 		if ( (WantRespawn( p ) || p == spectator) ) {
@@ -15962,8 +17079,12 @@ void idMultiplayerGame::CheckRespawns( idPlayer *spectator ) {
 				// respawn rules while sudden death are different
 				// sudden death may trigger while a player is dead, so there are still cases where we need to respawn
 				// don't do any respawns while we are in end game delay though
-				if ( gameLocal.IsTeamGame() || p->IsLeader() ) {
+				if ( gameLocal.IsTeamGame() || p->IsLeader() || IsArenaCampaignMatch() ) {
 					//everyone respawns in team games, only fragleaders respawn in DM
+					// The Arena campaign is single player: benching the trailing
+					// combatant would hand the match to a bot and leave the human
+					// watching. Everyone keeps fighting; a tie is a draw, which the
+					// campaign already reports.
 					p->ServerSpectate( false );
 				} else {//if ( !p->IsLeader() ) {
 					// sudden death is rolling, this player is not a leader, have him spectate
@@ -15978,6 +17099,11 @@ void idMultiplayerGame::CheckRespawns( idPlayer *spectator ) {
 						if ( !gameState->AllowRespawn( p ) ) {
 							if ( gameState->EliminatedBecomesSpectator() ) {
 								p->ServerSpectate( true );
+								// Quake Live puts an eliminated Clan Arena player
+								// on a team mate rather than dropping them into
+								// free-fly over their own corpse; the rest of the
+								// round is their team's fight to watch.
+								FollowTeamMate( p );
 							}
 							continue;
 						}
@@ -17638,11 +18764,15 @@ void idMultiplayerGame::SwitchToTeam( int clientNum, int oldteam, int newteam ) 
 	assert( oldteam != newteam );
 	assert( !gameLocal.isClient );
 
-	if ( !gameLocal.isClient && newteam >= 0 ) {
+	// openQ4: in a mode where every kill moves the victim onto the killer's
+	// team, announcing each switch to the whole server turns the chat into a
+	// second obituary feed.  The victim already gets told directly.
+	if ( !gameLocal.isClient && newteam >= 0 &&
+		 !MPGameTypeHasAny( gameLocal.gameType, GTF_TEAMSWAP ) ) {
 		// clients might not have userinfo of joining client at this point, so
 		// send down the player's name
 		idPlayer *p = static_cast<idPlayer *>( gameLocal.entities[ clientNum ] );
-		if ( !p->wantSpectate ) {		
+		if ( !p->wantSpectate ) {
 			PrintMessage( -1, va( common->GetLocalizedString( "#str_104280" ), gameLocal.userInfo[ clientNum ].GetString( "ui_name" ), newteam ? common->GetLocalizedString( "#str_108025" ) : common->GetLocalizedString( "#str_108026" ) ) );
 		}
 	}
@@ -17664,6 +18794,13 @@ void idMultiplayerGame::SwitchToTeam( int clientNum, int oldteam, int newteam ) 
 			p->SetReady( false );
 			p->forcedReady = false;
 		}
+		// openQ4: Kill( nodamage ) never reaches idPlayer::Killed, so nothing
+		// below tells the game state this player has left play.  Say so first -
+		// an elimination mode has to see a mid-round side change as leaving the
+		// round, not as a free respawn on the other team.
+		if ( gameState ) {
+			gameState->PlayerWithdrew( p );
+		}
 		p->Kill( true, true );
 		CheckAbortGame();
 	}
@@ -17675,6 +18812,14 @@ idMultiplayerGame::JoinTeam
 ================
 */
 void idMultiplayerGame::JoinTeam( const char* team ) {
+	// The Arena campaign is single-player: the roster, the sides and the seat
+	// count are all authored, and a mid-match side switch or a jump to
+	// spectator would leave the ceremony without its subject.  Refuse the
+	// request outright rather than letting it half-apply.
+	if ( IsArenaCampaignMatch() ) {
+		return;
+	}
+
 	cvarSystem->SetCVarBool( "ui_joined", true );
 
 	if( !idStr::Icmp( team, "auto" ) ) {
@@ -17928,6 +19073,14 @@ idMultiplayerGame::ToggleSpectate
 ================
 */
 void idMultiplayerGame::ToggleSpectate( void ) {
+	// The Arena campaign is single-player: the roster, the sides and the seat
+	// count are all authored, and a mid-match side switch or a jump to
+	// spectator would leave the ceremony without its subject.  Refuse the
+	// request outright rather than letting it half-apply.
+	if ( IsArenaCampaignMatch() ) {
+		return;
+	}
+
  	bool spectating;
 	assert( gameLocal.isClient || gameLocal.localClientNum == 0 );
 
@@ -17979,6 +19132,14 @@ idMultiplayerGame::ToggleTeam
 ================
 */
 void idMultiplayerGame::ToggleTeam( void ) {
+	// The Arena campaign is single-player: the roster, the sides and the seat
+	// count are all authored, and a mid-match side switch or a jump to
+	// spectator would leave the ceremony without its subject.  Refuse the
+	// request outright rather than letting it half-apply.
+	if ( IsArenaCampaignMatch() ) {
+		return;
+	}
+
 	bool team;
 	assert( gameLocal.isClient || gameLocal.localClientNum == 0 );
 	
@@ -19784,6 +20945,16 @@ int idMultiplayerGame::VerifyTeamSwitch( int wantTeam, idPlayer *player ) {
 		return wantTeam;
 	}
 
+	// openQ4: a mode whose rule is "a kill moves the victim onto the killer's
+	// team" is lopsided by design, and the round only ends once one side has
+	// absorbed everybody.  Balancing here would send the victim to the smaller
+	// side instead - the exact opposite of the rule - and the round could never
+	// resolve.  The between-round reshuffle in rvRedRoverGameState does the
+	// balancing this mode actually wants.
+	if ( MPGameTypeHasAny( gameLocal.gameType, GTF_TEAMSWAP ) ) {
+		return wantTeam;
+	}
+
 	teamCount[ TEAM_MARINE ] = teamCount[ TEAM_STROGG ] = 0;
 
 	for( int i = 0; i < gameLocal.numClients; i++ ) {
@@ -19942,11 +21113,17 @@ bool idMultiplayerGame::IsBuyingAllowedInTheCurrentGameMode( void ) {
 		return false;
 	}
 
-	if ( gameLocal.gameType != GAME_TOURNEY ) {
-		return gameLocal.serverInfo.GetBool( "si_isBuyingEnabled" );
+	// openQ4: the buy menu is now a gametype property rather than "anything that
+	// is not Tourney".  That old test let the buy menu into every mode added
+	// since, which is wrong for all of them: Duel and Clan Arena are fought on a
+	// fixed loadout, and buying your way back after a Red Rover conversion or a
+	// Freeze Tag thaw defeats the point of both.  Every mode that allowed buying
+	// in retail Quake 4 carries GTF_BUYING, so this is not a change for them.
+	if ( !MPGameTypeHasAny( gameLocal.gameType, GTF_BUYING ) ) {
+		return false;
 	}
 
-	return false;
+	return gameLocal.serverInfo.GetBool( "si_isBuyingEnabled" );
 }
 
 

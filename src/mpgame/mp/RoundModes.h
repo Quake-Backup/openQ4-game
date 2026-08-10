@@ -32,7 +32,7 @@ public:
 					rvClanArenaGameState( bool allocPrevious = true );
 
 	virtual void	Clear( void );
-	virtual void	PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage );
+	virtual void	PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage, int armorSave );
 
 	virtual	bool	IsType( gameStateType_t type ) const;
 	static gameStateType_t GetClassType( void );
@@ -83,10 +83,19 @@ protected:
 
 private:
 	void			ThawPlayer( idPlayer* frozen, idPlayer* thawer );
+	// a team mate may only thaw somebody they can actually see, unless the
+	// server says otherwise
+	bool			CanReachToThaw( idPlayer* frozen, idPlayer* mate, int thawRadiusSquared ) const;
+	// somewhere the thawed player can stand without telefragging their rescuer
+	bool			FindThawSpot( idPlayer* frozen, idPlayer* thawer, idVec3 &origin ) const;
 
 	// milliseconds of team mate contact accumulated against each frozen player
 	int				thawProgress[ MAX_CLIENTS ];
 	int				lastThawAnnounce[ MAX_CLIENTS ];
+	// when a frozen player thaws with no help at all, so a body nobody can
+	// reach - down a pit, in the lava, behind the enemy team - cannot hold the
+	// round hostage until the round clock runs out.  0 means never.
+	int				autoThawTime[ MAX_CLIENTS ];
 
 	static gameStateType_t type;
 };
@@ -123,6 +132,10 @@ protected:
 	virtual void	PrepareNextRound( void );
 
 private:
+	// tells the one player left on a side that they are alone; the round layer's
+	// shared warning is for elimination modes only
+	void			NotifyLastOnSide( int team ) const;
+
 	static gameStateType_t type;
 };
 

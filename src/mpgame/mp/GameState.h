@@ -81,8 +81,15 @@ public:
 	virtual bool	AllowRespawn( idPlayer* player );
 	// called on the server for every multiplayer death, after scoring
 	virtual void	PlayerDeath( idPlayer* dead, idPlayer* killer );
-	// called on the server whenever one player damages another
-	virtual void	PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage );
+	// A player removed themselves from play without dying - a team change kills
+	// them with nodamage, which never reaches idPlayer::Killed and so is invisible
+	// to PlayerDeath.  Elimination modes have to hear about it or a losing player
+	// can launder a certain death into a fresh spawn on the other side.
+	virtual void	PlayerWithdrew( idPlayer* player );
+	// Called on the server whenever one player damages another.  damage is what
+	// reaches health and armorSave is what the victim's armour absorbed; a mode
+	// that scores damage dealt wants both, and neither has been applied yet.
+	virtual void	PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage, int armorSave );
 	// true while player input should not be able to fire a weapon
 	virtual bool	WeaponsLocked( void ) const;
 	// what happens to a player AllowRespawn keeps out of the game

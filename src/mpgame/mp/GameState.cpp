@@ -318,7 +318,17 @@ void rvGameState::GameStateChanged( void ) {
 			} else {
 				player->vsMsgState = false;
 			}
-			if( gameLocal.gameType != GAME_TOURNEY ) {
+			// openQ4: a round mode is not fighting yet at GAMEON - the first round
+			// countdown has not even been scheduled.  Its own "FIGHT" comes from
+			// rvRoundGameState::GameStateChanged on the RS_ACTIVE edge, so calling
+			// it here shouts go while weapons are still locked, and again a few
+			// seconds later when the round really starts.
+			// openQ4: the Arena campaign holds control for its match-start camera
+			// move, so shouting go on this edge lands while the player is still
+			// frozen watching it. AdvanceArenaCampaignCeremony calls it when the
+			// shot lands and control actually returns.
+			if( gameLocal.gameType != GAME_TOURNEY && !gameLocal.IsRoundGameType() &&
+				!gameLocal.mpGame.IsArenaCampaignMatch() ) {
 				gameLocal.mpGame.ScheduleAnnouncerSound( AS_GENERAL_FIGHT, gameLocal.time );
 			}
 			//if ( gameLocal.gameType == GAME_DEADZONE ) {
@@ -486,6 +496,13 @@ void rvGameState::Run( void ) {
 #endif
 //RAVEN END
 			if ( gameLocal.mpGame.IsArenaCampaignMatch() ) {
+				// The introduction owns warmup until every authored opponent has
+				// been presented. Arena warmup has no other dwell: AllPlayersReady
+				// is true from the first frame because the roster is populated
+				// before any game frame runs.
+				if ( gameLocal.mpGame.ArenaCampaignIntroBlocksCountdown() ) {
+					break;
+				}
 				if ( gameLocal.mpGame.AllPlayersReady() && NewState( COUNTDOWN ) ) {
 					nextState = GAMEON;
 					nextStateTime = gameLocal.time + Max( ARENA_CAMPAIGN_ENTRANCE_MIN_MSEC,
@@ -647,9 +664,14 @@ bool rvGameState::NewState( mpGameState_t newState ) {
 					continue;
 				}
 				idPlayer *p = static_cast<idPlayer *>( ent );
-				p->SetLeader( false ); // don't carry the flag from previous games	
+				p->SetLeader( false ); // don't carry the flag from previous games
 				gameLocal.mpGame.SetPlayerScore( p, 0 );
 				gameLocal.mpGame.SetPlayerTeamScore( p, 0 );
+				// openQ4: warmup hands out the map's arsenal so the pre-match
+				// period is practice. Take it back now the match is real -
+				// nothing else does, because an MP respawn never clears
+				// inventory.weapons, so it would otherwise last all match.
+				p->RevokeWarmupArsenal();
 
 				// in normal gameplay modes, spawn the player in.  For tourney, the tourney manager handles spawning
 				if( gameLocal.gameType != GAME_TOURNEY ) {
@@ -794,7 +816,11 @@ bool rvGameState::NewState( mpGameState_t newState ) {
 						// RAVEN END
 						continue;
 					}
-					if ( static_cast< idPlayer *>( ent )->IsLeader() ) {
+					// openQ4: the Arena campaign never benches a combatant. Sudden
+					// death there would put the trailing human into spectator for
+					// the rest of their own single-player match.
+					if ( static_cast< idPlayer *>( ent )->IsLeader() ||
+						 gameLocal.mpGame.IsArenaCampaignMatch() ) {
  						static_cast<idPlayer *>(ent)->ServerSpectate( false );
 						continue;
 					}
@@ -855,10 +881,18 @@ void rvGameState::PlayerDeath( idPlayer* dead, idPlayer* killer ) {
 
 /*
 ================
+rvGameState::PlayerWithdrew
+================
+*/
+void rvGameState::PlayerWithdrew( idPlayer* player ) {
+}
+
+/*
+================
 rvGameState::PlayerDamage
 ================
 */
-void rvGameState::PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage ) {
+void rvGameState::PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage, int armorSave ) {
 }
 
 /*

@@ -48,6 +48,7 @@ const int GTF_FREEZE		= BIT( 17 );	// death freezes rather than kills
 const int GTF_TURNS			= BIT( 18 );	// teams alternate attacking each round
 const int GTF_DEADZONE		= BIT( 19 );	// the Ritual DeadZone control artifact
 const int GTF_SINGLEPLAYER	= BIT( 20 );	// not a multiplayer gametype at all
+const int GTF_FULLARSENAL	= BIT( 21 );	// spawn with every weapon, full ammo and full armour
 
 // convenience masks
 const int GTF_ANY_OBJECTIVE	= ( GTF_FLAG | GTF_OBELISK | GTF_CONTROLPOINT | GTF_DEADZONE );

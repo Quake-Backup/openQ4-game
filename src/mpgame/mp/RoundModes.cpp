@@ -62,9 +62,10 @@ void rvClanArenaGameState::Clear( void ) {
 ================
 rvClanArenaGameState::RoundBegin
 
-Everyone starts each round on equal terms: full arsenal, full ammo, no
-scavenging.  That is what makes Clan Arena a pure fight rather than a map
-control game.
+The loadout itself is granted on spawn, from the GTF_FULLARSENAL flag, so that
+a player is armed for the whole countdown rather than from "FIGHT" onwards.
+What is left here is the per-round scoring reset, and topping anyone back up
+who took chip damage during the countdown.
 ================
 */
 void rvClanArenaGameState::RoundBegin( void ) {
@@ -84,16 +85,21 @@ void rvClanArenaGameState::RoundBegin( void ) {
 		}
 
 		idPlayer *p = static_cast< idPlayer * >( ent );
-		if ( p->spectating || p->wantSpectate ) {
+
+		damageResidue[ i ] = 0;
+
+		// Never top up a corpse.  GiveStuffToPlayer writes health straight into
+		// idPlayer with no death test, and a dead player carrying full health is
+		// counted as a survivor by PlayerIsAlive and so by every round-end and
+		// tie-break tally - a wiped-out team that cannot lose the round.  Remote
+		// clients read the same health and draw a player who is not there.
+		if ( p->spectating || p->wantSpectate || p->health <= 0 ) {
 			continue;
 		}
 
-		GiveStuffToPlayer( p, "weapons", "" );
 		GiveStuffToPlayer( p, "ammo", "" );
 		GiveStuffToPlayer( p, "armor", "" );
 		GiveStuffToPlayer( p, "health", "" );
-
-		damageResidue[ i ] = 0;
 	}
 }
 
@@ -102,14 +108,14 @@ void rvClanArenaGameState::RoundBegin( void ) {
 rvClanArenaGameState::PlayerDamage
 ================
 */
-void rvClanArenaGameState::PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage ) {
-	int index, award;
+void rvClanArenaGameState::PlayerDamage( idPlayer* attacker, idPlayer* victim, int damage, int armorSave ) {
+	int index, award, credit;
 
 	if ( attacker == NULL || victim == NULL || attacker == victim ) {
 		return;
 	}
 
-	if ( !RoundIsLive() || damage <= 0 ) {
+	if ( !RoundIsLive() ) {
 		return;
 	}
 
@@ -123,7 +129,17 @@ void rvClanArenaGameState::PlayerDamage( idPlayer* attacker, idPlayer* victim, i
 		return;
 	}
 
-	damageResidue[ index ] += damage;
+	// Quake Live credits what the shot actually took off the target: the health
+	// it removes plus the armour it burns through, and no more than the target
+	// had left.  Crediting the raw damage instead would pay a rocket into a
+	// one-health player as if it had been a full hit, and would pay nothing at
+	// all for stripping somebody's armour.
+	credit = Min( Max( 0, damage ), Max( 0, victim->health ) ) + Max( 0, armorSave );
+	if ( credit <= 0 ) {
+		return;
+	}
+
+	damageResidue[ index ] += credit;
 
 	award = damageResidue[ index ] / CA_DAMAGE_PER_SCORE;
 	if ( award > 0 ) {
@@ -188,6 +204,7 @@ void rvFreezeTagGameState::Clear( void ) {
 	for ( i = 0; i < MAX_CLIENTS; i++ ) {
 		thawProgress[ i ] = 0;
 		lastThawAnnounce[ i ] = 0;
+		autoThawTime[ i ] = 0;
 	}
 }
 
@@ -195,6 +212,7 @@ void rvFreezeTagGameState::ShiftMatchTime( int deltaMsec ) {
 	rvRoundGameState::ShiftMatchTime( deltaMsec );
 	for ( int index = 0; index < MAX_CLIENTS; ++index ) {
 		mpMatchShiftOptionalDeadline( lastThawAnnounce[ index ], deltaMsec );
+		mpMatchShiftOptionalDeadline( autoThawTime[ index ], deltaMsec );
 	}
 }
 
@@ -211,6 +229,7 @@ void rvFreezeTagGameState::RoundBegin( void ) {
 	for ( i = 0; i < MAX_CLIENTS; i++ ) {
 		thawProgress[ i ] = 0;
 		lastThawAnnounce[ i ] = 0;
+		autoThawTime[ i ] = 0;
 	}
 }
 
@@ -233,11 +252,36 @@ void rvFreezeTagGameState::PlayerDeath( idPlayer* dead, idPlayer* killer ) {
 	thawProgress[ dead->entityNumber ] = 0;
 	lastThawAnnounce[ dead->entityNumber ] = 0;
 
-	gameLocal.mpGame.CenterPrint( dead->entityNumber, "#str_41350" );
+	// A frozen player is meant to be a body you have to reach, not a target.
+	// Quake Live makes them outright invulnerable; Quake 4 leaves the corpse
+	// takedamage so it can still be gibbed, which here means splash damage into
+	// a pile of frozen team mates feeds hit markers, damage numbers and stats
+	// for hits on people who are already out.  SpawnToPoint -> Init restores it
+	// on the way back in.
+	dead->fl.takedamage = false;
 
-	if ( killer != NULL && killer != dead ) {
-		gameLocal.mpGame.CenterPrintTeam( dead->team, "#str_41351", idMultiplayerGame::CPARM_CLIENT, killer->entityNumber );
+	// Arm the unattended thaw.  A player the world killed rather than an enemy
+	// is usually somewhere nobody can stand - the bottom of a pit, a lava pool -
+	// so they come back on a much shorter fuse, as they do in Quake Live.
+	{
+		const bool worldDeath = ( killer == NULL || killer == dead );
+		const int seconds = worldDeath
+			? gameLocal.serverInfo.GetInt( "si_freezeWorldDeathDelay" )
+			: gameLocal.serverInfo.GetInt( "si_freezeAutoThawTime" );
+
+		autoThawTime[ dead->entityNumber ] = ( seconds > 0 ) ? gameLocal.time + seconds * 1000 : 0;
 	}
+
+	// The team notice reaches the victim too and a notice replaces whatever is
+	// on screen, so the personal one is sent second and is the one they keep.
+	if ( killer != NULL && killer != dead ) {
+		// "%s froze %s" - both names, or the message reads with a hole in it
+		gameLocal.mpGame.CenterPrintTeam( dead->team, "#str_41351",
+			idMultiplayerGame::CPARM_CLIENT, killer->entityNumber,
+			idMultiplayerGame::CPARM_CLIENT, dead->entityNumber );
+	}
+
+	gameLocal.mpGame.CenterPrint( dead->entityNumber, "#str_41350" );
 }
 
 /*
@@ -248,9 +292,10 @@ rvFreezeTagGameState::ClientDisconnect
 void rvFreezeTagGameState::ClientDisconnect( idPlayer* player ) {
 	rvRoundGameState::ClientDisconnect( player );
 
-	if ( player != NULL ) {
+	if ( player != NULL && player->entityNumber >= 0 && player->entityNumber < MAX_CLIENTS ) {
 		thawProgress[ player->entityNumber ] = 0;
 		lastThawAnnounce[ player->entityNumber ] = 0;
+		autoThawTime[ player->entityNumber ] = 0;
 	}
 }
 
@@ -277,16 +322,40 @@ void rvFreezeTagGameState::ThawPlayer( idPlayer* frozen, idPlayer* thawer ) {
 
 	SetEliminated( frozen->entityNumber, false );
 	thawProgress[ frozen->entityNumber ] = 0;
+	lastThawAnnounce[ frozen->entityNumber ] = 0;
+	autoThawTime[ frozen->entityNumber ] = 0;
 
-	frozen->forceRespawn = true;
-	frozen->ServerSpectate( false );
-	frozen->Teleport( origin, angles, NULL );
+	// Respawn straight onto the body rather than respawning at a spawn point and
+	// then teleporting.  The old order ran a full SelectSpawnPoint first, which
+	// fired an unrelated spawn point's targets, played the spawn effect over
+	// there and telefragged whatever was standing on it - all for a position
+	// that was thrown away one line later.
+	// An unattended thaw is the timer giving up: nobody reached the body, and
+	// very often nobody could, because it is at the bottom of a pit or inside a
+	// hurt volume. Respawning onto it there kills the player again, freezes them
+	// again and re-arms the same fuse, for the rest of the round. FindThawSpot
+	// cannot see that hazard either - it only rejects solids and other players,
+	// and with no thawer to step away from it has no direction to search in. Take
+	// an ordinary spawn point instead; only a real rescue earns the body spot.
+	if ( thawer != NULL && FindThawSpot( frozen, thawer, origin ) ) {
+		frozen->forceRespawn = false;
+		frozen->SpawnToPoint( origin, angles );
+	} else {
+		// the body is somewhere nobody can stand; take an ordinary spawn point
+		frozen->forceRespawn = true;
+		frozen->ServerSpectate( false );
+	}
 
 	if ( thawer != NULL ) {
 		gameLocal.mpGame.AddPlayerScore( thawer, 1 );
-		gameLocal.mpGame.CenterPrint( frozen->entityNumber, "#str_41352", idMultiplayerGame::CPARM_CLIENT, thawer->entityNumber );
+		// "%s thawed %s" - the team wants to know who came back, not just who did it
 		gameLocal.mpGame.CenterPrintTeam( frozen->team, "#str_41353",
-			idMultiplayerGame::CPARM_CLIENT, thawer->entityNumber );
+			idMultiplayerGame::CPARM_CLIENT, thawer->entityNumber,
+			idMultiplayerGame::CPARM_CLIENT, frozen->entityNumber );
+		gameLocal.mpGame.CenterPrint( frozen->entityNumber, "#str_41352", idMultiplayerGame::CPARM_CLIENT, thawer->entityNumber );
+	} else {
+		// unattended thaw: say why they are suddenly back on their feet
+		gameLocal.mpGame.CenterPrint( frozen->entityNumber, "#str_41357" );
 	}
 }
 
@@ -311,7 +380,9 @@ void rvFreezeTagGameState::Run( void ) {
 	}
 
 	thawTime = Max( 1, gameLocal.serverInfo.GetInt( "si_freezeThawTime" ) ) * 1000;
-	thawRadiusSquared = gameLocal.serverInfo.GetInt( "si_freezeThawRadius" );
+	// a serverInfo that has somehow lost the key would otherwise square zero and
+	// make every frozen player permanently unreachable
+	thawRadiusSquared = Max( 16, gameLocal.serverInfo.GetInt( "si_freezeThawRadius" ) );
 	thawRadiusSquared *= thawRadiusSquared;
 
 	for ( i = 0; i < gameLocal.numClients; i++ ) {
@@ -326,8 +397,22 @@ void rvFreezeTagGameState::Run( void ) {
 			continue;
 		}
 
+		// A frozen player is a body lying where they fell.  Somebody who is
+		// spectating - held out of the round, or watching from the free-fly
+		// camera - has no body, and their camera position is not a place a team
+		// mate can stand next to.  Thawing that would spawn them out of thin air
+		// wherever they happened to be looking.
+		if ( frozen->spectating ) {
+			continue;
+		}
+
+		// nobody got there in time, or nobody could
+		if ( autoThawTime[ i ] > 0 && gameLocal.time >= autoThawTime[ i ] ) {
+			ThawPlayer( frozen, NULL );
+			continue;
+		}
+
 		idPlayer *thawer = NULL;
-		idVec3 frozenOrigin = frozen->GetPhysics()->GetOrigin();
 
 		for ( j = 0; j < gameLocal.numClients; j++ ) {
 			idEntity *other = gameLocal.entities[ j ];
@@ -341,7 +426,7 @@ void rvFreezeTagGameState::Run( void ) {
 				continue;
 			}
 
-			if ( ( mate->GetPhysics()->GetOrigin() - frozenOrigin ).LengthSqr() > thawRadiusSquared ) {
+			if ( !CanReachToThaw( frozen, mate, thawRadiusSquared ) ) {
 				continue;
 			}
 
@@ -352,10 +437,15 @@ void rvFreezeTagGameState::Run( void ) {
 		if ( thawer != NULL ) {
 			thawProgress[ i ] += gameLocal.msec;
 
-			// a heartbeat while the thaw runs, so both sides know it is happening
+			// A heartbeat once a second, to the two people it concerns: the one
+			// doing the work and the one waiting on it.  The frozen player is
+			// told last so the notice they keep is the one about them.
 			if ( gameLocal.time - lastThawAnnounce[ i ] > 1000 ) {
 				lastThawAnnounce[ i ] = gameLocal.time;
-				gameLocal.mpGame.CenterPrint( thawer->entityNumber, "#str_41354" );
+				gameLocal.mpGame.CenterPrint( thawer->entityNumber, "#str_41355",
+					idMultiplayerGame::CPARM_CLIENT, i );
+				gameLocal.mpGame.CenterPrint( i, "#str_41356",
+					idMultiplayerGame::CPARM_CLIENT, thawer->entityNumber );
 			}
 
 			if ( thawProgress[ i ] >= thawTime ) {
@@ -365,6 +455,127 @@ void rvFreezeTagGameState::Run( void ) {
 			thawProgress[ i ] = Max( 0, thawProgress[ i ] - gameLocal.msec );
 		}
 	}
+}
+
+/*
+================
+rvFreezeTagGameState::FindThawSpot
+
+Picks somewhere the thawed player can legally stand.  SpawnToPoint telefrags
+whatever occupies the destination, and the one player guaranteed to be near a
+body is the team mate who just spent two seconds thawing it, so the body's own
+position is only used when it is clear.  Failing that, step away from the thawer
+before giving up.
+================
+*/
+bool rvFreezeTagGameState::FindThawSpot( idPlayer* frozen, idPlayer* thawer, idVec3 &origin ) const {
+	// a player stands in a 32 wide, 74 tall box; anything closer than this
+	// overlaps and would be telefragged
+	const float		clearRadius = 34.0f;
+	const float		clearHeight = 72.0f;
+	const idVec3	body = origin;
+	idVec3			away;
+	int				attempt;
+
+	if ( frozen == NULL ) {
+		return false;
+	}
+
+	away.Zero();
+	if ( thawer != NULL ) {
+		away = body - thawer->GetPhysics()->GetOrigin();
+		away.z = 0.0f;
+		if ( away.Normalize() <= 0.0f ) {
+			away.Set( 1.0f, 0.0f, 0.0f );
+		}
+	}
+
+	for ( attempt = 0; attempt < 4; attempt++ ) {
+		const idVec3	candidate = body + away * ( clearRadius * attempt );
+		trace_t			trace;
+		int				i;
+		bool			blocked = false;
+
+		// inside the world, or with no floor under it, is not a place to stand
+		if ( gameLocal.Contents( frozen, candidate + idVec3( 0.0f, 0.0f, 8.0f ), NULL,
+				mat3_identity, MASK_PLAYERSOLID, frozen ) ) {
+			continue;
+		}
+		gameLocal.TracePoint( frozen, trace, body + idVec3( 0.0f, 0.0f, 8.0f ),
+			candidate + idVec3( 0.0f, 0.0f, 8.0f ), MASK_PLAYERSOLID, frozen );
+		if ( trace.fraction < 1.0f ) {
+			continue;
+		}
+
+		for ( i = 0; i < gameLocal.numClients; i++ ) {
+			idEntity *ent = gameLocal.entities[ i ];
+
+			if ( !ent || ent == frozen || !ent->IsType( idPlayer::GetClassType() ) ) {
+				continue;
+			}
+
+			idPlayer *other = static_cast< idPlayer * >( ent );
+			if ( other->spectating || other->health <= 0 ) {
+				continue;
+			}
+
+			const idVec3 delta = other->GetPhysics()->GetOrigin() - candidate;
+			if ( idMath::Fabs( delta.z ) < clearHeight &&
+				 ( delta.x * delta.x + delta.y * delta.y ) < ( clearRadius * clearRadius ) ) {
+				blocked = true;
+				break;
+			}
+		}
+
+		if ( !blocked ) {
+			origin = candidate;
+			return true;
+		}
+
+		if ( away.LengthSqr() <= 0.0f ) {
+			break;
+		}
+	}
+
+	return false;
+}
+
+/*
+================
+rvFreezeTagGameState::CanReachToThaw
+
+Quake Live requires line of sight to a frozen team mate unless the server turns
+that off.  Without it a body on a ledge, in a vent or one floor up thaws from
+wherever happens to be within the radius, including through the floor.
+================
+*/
+bool rvFreezeTagGameState::CanReachToThaw( idPlayer* frozen, idPlayer* mate, int thawRadiusSquared ) const {
+	idVec3	frozenOrigin;
+	idVec3	mateOrigin;
+	trace_t	trace;
+
+	if ( frozen == NULL || mate == NULL ) {
+		return false;
+	}
+
+	frozenOrigin = frozen->GetPhysics()->GetOrigin();
+	mateOrigin = mate->GetPhysics()->GetOrigin();
+
+	if ( ( mateOrigin - frozenOrigin ).LengthSqr() > thawRadiusSquared ) {
+		return false;
+	}
+
+	if ( gameLocal.serverInfo.GetBool( "si_freezeThawThroughSurface" ) ) {
+		return true;
+	}
+
+	// eye height on both ends, so a body lying on the floor is not blocked by
+	// the floor it is lying on
+	frozenOrigin.z += 16.0f;
+	mateOrigin.z += 16.0f;
+
+	gameLocal.TracePoint( frozen, trace, frozenOrigin, mateOrigin, MASK_SOLID, frozen );
+	return ( trace.fraction >= 1.0f );
 }
 
 /*
@@ -491,29 +702,71 @@ void rvRedRoverGameState::PrepareNextRound( void ) {
 ================
 rvRedRoverGameState::PlayerDeath
 
-The whole mode in one rule: whoever kills you gains you.
+The whole mode in one rule: dying puts you on the other side.
+
+Quake Live does not consult the killer at all - G_RRHandlePlayerDeath moves the
+victim from oldTeam to the opposite team for every death it sees, suicides and
+world deaths included.  Exempting those, as this used to, handed players a way
+to keep their own side alive indefinitely: with two sides left and one player on
+yours, typing "kill" respawns you on the same team and the round cannot resolve.
 ================
 */
 void rvRedRoverGameState::PlayerDeath( idPlayer* dead, idPlayer* killer ) {
+	int newTeam;
+
 	rvRoundGameState::PlayerDeath( dead, killer );
 
 	if ( gameLocal.isClient || dead == NULL || !RoundIsLive() ) {
 		return;
 	}
 
-	// suicides and world deaths do not hand anyone over
-	if ( killer == NULL || killer == dead ) {
+	if ( dead->team < 0 || dead->team >= TEAM_MAX ) {
 		return;
 	}
 
-	if ( killer->team < 0 || killer->team >= TEAM_MAX || dead->team == killer->team ) {
-		return;
-	}
+	// The userinfo round-trip below mutates dead->team synchronously, so the
+	// side they are leaving has to be captured first - the warning belongs to
+	// the team that just lost someone, not the one that gained them.
+	const int oldTeam = dead->team;
+	newTeam = ( dead->team == TEAM_MARINE ) ? TEAM_STROGG : TEAM_MARINE;
 
-	dead->GetUserInfo()->Set( "ui_team", gameLocal.mpGame.teamNames[ killer->team ] );
+	dead->GetUserInfo()->Set( "ui_team", gameLocal.mpGame.teamNames[ newTeam ] );
 	cmdSystem->BufferCommandText( CMD_EXEC_NOW, va( "updateUI %d\n", dead->entityNumber ) );
 
-	gameLocal.mpGame.CenterPrint( dead->entityNumber, "#str_41360", idMultiplayerGame::CPARM_TEAM, killer->team );
+	gameLocal.mpGame.CenterPrint( dead->entityNumber, "#str_41360", idMultiplayerGame::CPARM_TEAM, newTeam );
+
+	// Quake Live warns the last player left on a side here too.  The shared
+	// warning in the round layer only fires for elimination modes, and Red Rover
+	// is not one - nobody is out, they have just changed colours.
+	NotifyLastOnSide( oldTeam );
+}
+
+/*
+================
+rvRedRoverGameState::NotifyLastOnSide
+================
+*/
+void rvRedRoverGameState::NotifyLastOnSide( int team ) const {
+	int i;
+
+	if ( team < 0 || team >= TEAM_MAX || CountLiveTeamPlayers( team ) != 1 ) {
+		return;
+	}
+
+	for ( i = 0; i < gameLocal.numClients; i++ ) {
+		idEntity *ent = gameLocal.entities[ i ];
+
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+
+		idPlayer *p = static_cast< idPlayer * >( ent );
+		if ( p->team == team && PlayerIsAlive( p ) ) {
+			gameLocal.mpGame.CenterPrint( i, "#str_41336" );
+			gameLocal.mpGame.AnnounceTo( i, AS_MATCH_LAST_STANDING );
+			break;
+		}
+	}
 }
 
 /*

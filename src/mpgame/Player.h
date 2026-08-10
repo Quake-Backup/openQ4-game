@@ -397,6 +397,10 @@ public:
 	int						minRespawnTime;			// can respawn when time > this, force after g_forcerespawn
 	int						maxRespawnTime;			// force respawn after this time
 
+	// Loadout held before warmup armed the player, and whether it did.
+	int						warmupArsenalRestoreWeapons;
+	bool					warmupArsenalGranted;
+
 	// the first person view values are always calculated, even
 	// if a third person view is used
 	idVec3					firstPersonViewOrigin;
@@ -694,6 +698,7 @@ public:
  	float					GetInfluenceRadius( void ) { return influenceRadius; };
 
 	// server side work for in/out of spectate. takes care of spawning it into the world as well
+	void					RevokeWarmupArsenal( void );
 	void					ServerSpectate( bool spectate );
 
 	// for very specific usage. != GetPhysics()

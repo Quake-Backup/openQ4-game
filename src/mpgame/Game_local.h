@@ -346,6 +346,9 @@ enum {
 	GAME_RELIABLE_MESSAGE_MATCH_RESULT,
 	GAME_RELIABLE_MESSAGE_MATCH_VIEW,
 	GAME_RELIABLE_MESSAGE_MATCH_AUTH_CHALLENGE,
+	// openQ4: server driven announcer cue.  The announcer queue is client local,
+	// so a cue that only server-side game logic knows about needs its own channel.
+	GAME_RELIABLE_MESSAGE_ANNOUNCER,
 };
 
 enum {

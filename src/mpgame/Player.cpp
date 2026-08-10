@@ -1461,6 +1461,9 @@ idPlayer::idPlayer() {
 	minRespawnTime			= 0;
 	maxRespawnTime			= 0;
 
+	warmupArsenalRestoreWeapons = 0;
+	warmupArsenalGranted	= false;
+
 	firstPersonViewOrigin	= vec3_zero;
 	firstPersonViewAxis		= mat3_identity;
 
@@ -3240,6 +3243,30 @@ void idPlayer::Restart( void ) {
 idPlayer::ServerSpectate
 ================
 */
+/*
+================
+idPlayer::RevokeWarmupArsenal
+
+Hands back the loadout the player had before warmup armed them. Called when the
+match goes live: nothing else takes those weapons away, because MP respawns do
+not clear inventory.weapons.
+================
+*/
+void idPlayer::RevokeWarmupArsenal( void ) {
+	if ( !warmupArsenalGranted ) {
+		return;
+	}
+	inventory.weapons = warmupArsenalRestoreWeapons;
+	warmupArsenalRestoreWeapons = 0;
+	warmupArsenalGranted = false;
+	CacheWeapons();
+	// The warmup weapon may no longer be held, so make sure something valid is
+	// in hand rather than leaving the view model on a revoked slot.
+	if ( currentWeapon >= 0 && ( inventory.weapons & ( 1 << currentWeapon ) ) == 0 ) {
+		NextBestWeapon();
+	}
+}
+
 void idPlayer::ServerSpectate( bool spectate ) {
 	assert( !gameLocal.isClient );
 
@@ -3507,9 +3534,41 @@ void idPlayer::SpawnToPoint( const idVec3 &spawn_origin, const idAngles &spawn_a
 		mpGameState_t mpState = gameLocal.mpGame.GetGameState()->GetMPGameState();
 
 		if ( mpState == WARMUP || mpState == COUNTDOWN ) {
-			GiveStuffToPlayer( this, "weapons", "" );
+			// Only what the map actually contains: warmup is practice for the
+			// fight that follows, and a weapon that is not on the map is not
+			// part of it.
+			//
+			// Remember the loadout underneath so it can be handed back when the
+			// match goes live. Nothing clears inventory.weapons on an MP respawn
+			// (idInventory::Clear is not called there), so without this the
+			// warmup arsenal simply stays for the whole match.
+			if ( !warmupArsenalGranted ) {
+				warmupArsenalRestoreWeapons = inventory.weapons;
+				warmupArsenalGranted = true;
+			}
+			inventory.weapons |= gameLocal.mpGame.GetMapWeaponMask();
+			CacheWeapons();
 			GiveStuffToPlayer( this, "ammo", "" );
 		}
+	}
+
+	// Clan Arena is fought on a fixed loadout: everyone starts every round on
+	// exactly equal terms, which is what makes it a fight rather than a map
+	// control game.  Granting it here rather than on the round-live edge means a
+	// player is armed from the moment they exist - through the countdown, after
+	// a mid-round join, and after a thaw - instead of being handed the arsenal
+	// at "FIGHT" with a blaster already in their hands.
+	if ( gameLocal.isMultiplayer && !spectating &&
+		 MPGameTypeHasAny( gameLocal.gameType, GTF_FULLARSENAL ) ) {
+		// Magazines too. Init() preserves inventory.clip across a respawn, so
+		// without this a player carries last round's part-empty magazines into
+		// a mode whose whole point is that every round starts identical - and
+		// bots, which are built fresh, would get full ones.
+		memset( inventory.clip, -1, sizeof( inventory.clip ) );
+		GiveStuffToPlayer( this, "weapons", "" );
+		GiveStuffToPlayer( this, "ammo", "" );
+		GiveStuffToPlayer( this, "armor", "" );
+		GiveStuffToPlayer( this, "health", "" );
 	}
 // openQ4 END
 
@@ -6842,6 +6901,15 @@ void idPlayer::DropWeapon( void ) {
 	}
 // RITUAL END
 
+	// openQ4: a fixed-loadout mode has nothing to scavenge for. Everyone spawns
+	// with the whole arsenal and full ammo, so a dropped weapon can only ever be
+	// an ammo resupply - which turns an equal-terms round into a corpse-camping
+	// game and is exactly what the fixed loadout exists to prevent.
+	if ( gameLocal.isMultiplayer &&
+		 MPGameTypeHasAny( gameLocal.gameType, GTF_FULLARSENAL ) ) {
+		return;
+	}
+
  	if ( spectating || weaponGone || !weapon ) {
 		return;
 	}
@@ -8613,8 +8681,10 @@ void idPlayer::UpdateViewAngles( void ) {
 	int i;
 	idAngles delta;
 
-	if ( gameLocal.isMultiplayer && gameLocal.mpGame.ArenaCampaignLocksPlayers() ) {
-		// The Arena entrance and final tableau freeze facing as well as movement.
+	const bool arenaFreeLook =
+		gameLocal.isMultiplayer && gameLocal.mpGame.ArenaCampaignAllowsFreeLook();
+	if ( gameLocal.isMultiplayer && gameLocal.mpGame.ArenaCampaignLocksPlayers() && !arenaFreeLook ) {
+		// The Arena entrance and spawn-in freeze facing as well as movement.
 		// Keep input deltas current so returning to gameplay cannot snap the view.
 		UpdateDeltaViewAngles( viewAngles );
 		return;
@@ -8672,8 +8742,14 @@ void idPlayer::UpdateViewAngles( void ) {
 
 	UpdateDeltaViewAngles( viewAngles );
 
-	// orient the model towards the direction we're looking
-	SetAngles( idAngles( 0, viewAngles.yaw, 0 ) );
+	// The Arena final tableau lets the player orbit the frozen victor, so look
+	// input still integrates above -- but the bodies stay exactly where the match
+	// ended. Turning the model here would spin the victor on the spot while the
+	// camera circled it.
+	if ( !arenaFreeLook ) {
+		// orient the model towards the direction we're looking
+		SetAngles( idAngles( 0, viewAngles.yaw, 0 ) );
+	}
 
 	// save in the log for analyzing weapon angle offsets
 	loggedViewAngles[ gameLocal.framenum & (NUM_LOGGED_VIEW_ANGLES-1) ] = viewAngles;
@@ -9834,8 +9910,12 @@ void idPlayer::EvaluateControls( void ) {
 		gameLocal.sessionCommand = "died";
 	}
 
+	// openQ4: impulses are very much used in multiplayer. default.cfg binds
+	// reload, next/previous weapon and the direct weapon slots to _impulse*, and
+	// PerformImpulse carries its own client path for exactly this case. The
+	// assert this replaces was a stale Raven "is this reachable?" marker and it
+	// fired on every reload and every mouse-wheel weapon change.
 	if ( ( usercmd.flags & UCF_IMPULSE_SEQUENCE ) != ( oldFlags & UCF_IMPULSE_SEQUENCE ) )  {
-		assert( false ); // unused in multiplayer?
 		PerformImpulse( usercmd.impulse );
 	}
 
@@ -10152,7 +10232,12 @@ void idPlayer::Move( void ) {
 		physicsObj.SetContents( health <= 0
 			? CONTENTS_CORPSE | CONTENTS_MONSTERCLIP
 			: CONTENTS_BODY | ( use_combat_bbox ? CONTENTS_SOLID : 0 ) );
-		physicsObj.SetMovementType( PM_FREEZE );
+		// PM_FREEZE returns from MovePlayer before gravity and before the ground
+		// trace, so freezing a player who is still falling suspends them in
+		// mid-air in a falling pose - which is exactly what the match-start shot
+		// circles. Let gravity finish first and only hold them once they have
+		// landed; the zeroed input below is what actually stops them acting.
+		physicsObj.SetMovementType( physicsObj.OnGround() ? PM_FREEZE : PM_NORMAL );
 	} else if ( health <= 0 ) {
 		physicsObj.SetContents( CONTENTS_CORPSE | CONTENTS_MONSTERCLIP );
 		physicsObj.SetMovementType( PM_DEAD );
@@ -10173,7 +10258,21 @@ void idPlayer::Move( void ) {
 	}
 
 	physicsObj.SetDebugLevel( g_debugMove.GetBool() );
-	physicsObj.SetPlayerInput( usercmd, viewAngles );
+	if ( gameLocal.isMultiplayer && gameLocal.mpGame.ArenaCampaignLocksPlayers() ) {
+		// The Arena presentations let gravity settle a player who is still in the
+		// air, so movement is stopped here instead of by PM_FREEZE. Feed the
+		// physics a neutral command: they fall, land and stand, but cannot walk,
+		// jump or crouch out of the shot. Facing comes from the latched view
+		// angles so the body does not turn either.
+		usercmd_t held;
+		memset( &held, 0, sizeof( held ) );
+		held.angles[0] = usercmd.angles[0];
+		held.angles[1] = usercmd.angles[1];
+		held.angles[2] = usercmd.angles[2];
+		physicsObj.SetPlayerInput( held, viewAngles );
+	} else {
+		physicsObj.SetPlayerInput( usercmd, viewAngles );
+	}
 
 	// FIXME: physics gets disabled somehow
 	BecomeActive( TH_PHYSICS );
@@ -11521,7 +11620,7 @@ void idPlayer::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &di
 		// rather than per frag, so a support player is not stuck on zero.
 		if ( !gameLocal.isClient && gameLocal.mpGame.GetGameState() != NULL &&
 			 attacker != NULL && attacker->IsType( idPlayer::GetClassType() ) ) {
-			gameLocal.mpGame.GetGameState()->PlayerDamage( static_cast< idPlayer * >( attacker ), this, damage );
+			gameLocal.mpGame.GetGameState()->PlayerDamage( static_cast< idPlayer * >( attacker ), this, damage, armorSave );
 		}
 
 		// openQ4: floating damage numbers, ported from Quake Live's damage

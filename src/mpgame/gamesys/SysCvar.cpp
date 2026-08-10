@@ -117,6 +117,9 @@ idCVar si_shuffleDelay(				"si_shuffleDelay",			"5",			CVAR_GAME | CVAR_SERVERIN
 // Freeze Tag
 idCVar si_freezeThawTime(			"si_freezeThawTime",		"2",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds a team mate must stand by a frozen player to thaw them", 1, 30 );
 idCVar si_freezeThawRadius(			"si_freezeThawRadius",		"96",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "how close a team mate must be to thaw a frozen player, in world units", 16, 512 );
+idCVar si_freezeThawThroughSurface(	"si_freezeThawThroughSurface","0",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_BOOL, "allow thawing a team mate through world geometry, rather than requiring line of sight" );
+idCVar si_freezeAutoThawTime(		"si_freezeAutoThawTime",	"120",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds after which a frozen player thaws with no help, 0 to disable", 0, 600 );
+idCVar si_freezeWorldDeathDelay(	"si_freezeWorldDeathDelay",	"5",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "seconds before a player frozen by the world rather than an enemy comes back on their own, 0 to disable", 0, 60 );
 
 // Overload and Harvester
 idCVar si_obeliskHealth(			"si_obeliskHealth",			"2500",			CVAR_GAME | CVAR_SERVERINFO | PC_CVAR_ARCHIVE | CVAR_INTEGER, "hit points of a team obelisk", 100, 10000 );

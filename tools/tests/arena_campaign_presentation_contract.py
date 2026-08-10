@@ -114,15 +114,33 @@ def main() -> None:
         "reported-result camera lifetime",
     )
     require(player, "gameLocal.mpGame.ArenaCampaignLocksPlayers()", "player movement freeze")
-    require(player, "physicsObj.SetMovementType( PM_FREEZE );", "frozen movement mode")
+    # PM_FREEZE leaves MovePlayer before gravity, so a player still in the air
+    # when a presentation begins would hang there in a falling pose. Gravity is
+    # allowed to finish and the hold only applies once they are on the ground;
+    # a neutral usercmd is what actually stops them acting in the meantime.
     require(
         player,
-        "if ( gameLocal.isMultiplayer && gameLocal.mpGame.ArenaCampaignLocksPlayers() ) {\n"
-        "\t\t// The Arena entrance and final tableau freeze facing as well as movement.\n"
+        "physicsObj.SetMovementType( physicsObj.OnGround() ? PM_FREEZE : PM_NORMAL );",
+        "frozen movement mode settles to the floor first",
+    )
+    require(player, "physicsObj.SetPlayerInput( held, viewAngles );", "neutral input while locked")
+    # The final tableau hands look control back so the player can orbit the
+    # frozen victor, so the facing freeze has to yield to it - and the model must
+    # not follow, or the victor would spin on the spot as the camera circled.
+    require(
+        player,
+        "if ( gameLocal.isMultiplayer && gameLocal.mpGame.ArenaCampaignLocksPlayers() && !arenaFreeLook ) {\n"
+        "\t\t// The Arena entrance and spawn-in freeze facing as well as movement.\n"
         "\t\t// Keep input deltas current so returning to gameplay cannot snap the view.\n"
         "\t\tUpdateDeltaViewAngles( viewAngles );\n\t\treturn;",
         "frozen Arena facing without input snap",
     )
+    require(
+        player,
+        "if ( !arenaFreeLook ) {\n\t\t// orient the model towards the direction we're looking",
+        "tableau look input does not turn the frozen body",
+    )
+    require(multiplayer_h, "ArenaCampaignAllowsFreeLook", "tableau free-look predicate")
     require(game_state, "return gameLocal.mpGame.ArenaCampaignLocksPlayers();", "base weapon lock")
     require(round_state, "if ( rvGameState::WeaponsLocked() )", "round-mode weapon lock chaining")
     require(round_modes_h, "class rvClanArenaGameState : public rvRoundGameState", "Clan Arena base state")
@@ -228,17 +246,17 @@ def main() -> None:
     # one-shot framework handoff instead of opening the stock MP summary.
     require(multiplayer, "ARENA_RESULT_REVIEW_MSEC = 6000", "victory presentation duration")
     require(multiplayer, "ShowArenaCampaignVictoryPresentation();", "Arena victory GUI")
-    require(multiplayer, 'gameLocal.sessionCommand = va( "arenaComplete %d %d %d %d"', "framework result handoff")
+    require(multiplayer, 'gameLocal.sessionCommand = va( "arenaComplete %d %d %d %d %d"', "framework result handoff")
     require(multiplayer, "arenaResultReported = true;", "one-shot result guard")
     success_handoff = multiplayer[multiplayer.index("arenaResultReported = true;") :]
     require_before(
         success_handoff,
         "arenaResultReported = true;",
-        'gameLocal.sessionCommand = va( "arenaComplete %d %d %d %d"',
+        'gameLocal.sessionCommand = va( "arenaComplete %d %d %d %d %d"',
         "reported-result handoff ordering",
     )
     if "ClearArenaCampaignPresentation();" in success_handoff.split(
-        'gameLocal.sessionCommand = va( "arenaComplete %d %d %d %d"', 1
+        'gameLocal.sessionCommand = va( "arenaComplete %d %d %d %d %d"', 1
     )[0]:
         raise AssertionError("Successful Arena handoff clears the wipe-source presentation")
 

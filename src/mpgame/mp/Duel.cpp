@@ -225,6 +225,33 @@ void rvDuelGameState::ClientDisconnect( idPlayer* player ) {
 
 /*
 ================
+rvDuelGameState::AllowRespawn
+
+Vetoing the respawn is what keeps the queue out of the arena.  The loop at the
+end of Run() only puts a waiting player back into spectator after they have
+already been spawned, which costs a spawn point, a spawn effect and a KillBox
+every time their respawn timer comes round.
+================
+*/
+bool rvDuelGameState::AllowRespawn( idPlayer* player ) {
+	if ( player == NULL ) {
+		return false;
+	}
+
+	// before the seats are filled there is nothing to keep anyone out of
+	if ( contenders[ 0 ] < 0 && contenders[ 1 ] < 0 ) {
+		return rvDMGameState::AllowRespawn( player );
+	}
+
+	if ( !IsContender( player->entityNumber ) ) {
+		return false;
+	}
+
+	return rvDMGameState::AllowRespawn( player );
+}
+
+/*
+================
 rvDuelGameState::Run
 
 Everything above the queue is plain deathmatch: Duel is deathmatch with the
