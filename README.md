@@ -41,6 +41,7 @@ Standalone Linux builds are supported with GCC or Clang on x64 and ARM64 hosts. 
 Requirements:
 - GCC or Clang with C++17 support
 - Python 3, Meson, and Ninja
+- OpenGL development headers, because idlib's precompiled header pulls in `renderer/qgl.h`: `sudo apt-get install -y libgl1-mesa-dev libgl-dev libglx-dev` on Debian/Ubuntu
 
 1. Configure:
    `meson setup --wipe builddir . --backend ninja --buildtype release`

@@ -1412,6 +1412,15 @@ def main() -> None:
     require(workflow, "compiler: Clang", "native Linux x64 Clang build lane")
     require(workflow, "if: matrix.compiler == 'Clang'", "native Linux x64 Clang dependency gate")
     require(workflow, "sudo apt-get install -y clang", "native Linux x64 Clang dependency")
+    if workflow.count("name: Install Linux OpenGL headers") != 2:
+        raise AssertionError("Both Linux jobs must install the OpenGL headers renderer/qgl.h needs")
+    for package, context in (
+        ("libgl1-mesa-dev", "Mesa OpenGL development metapackage"),
+        ("libgl-dev", "GL/gl.h and GL/glext.h provider"),
+        ("libglx-dev", "GL/glx.h provider"),
+    ):
+        if workflow.count(f"              {package}") != 2:
+            raise AssertionError(f"Both Linux jobs must install the {context} ({package})")
     require(workflow, 'CC: ${{ matrix.cc }}', "native Linux x64 compiler selection")
     require(workflow, 'CXX: ${{ matrix.cxx }}', "native Linux x64 C++ compiler selection")
     require(workflow, '"${CXX}" -std=c++17', "native Linux compiler-specific probes")

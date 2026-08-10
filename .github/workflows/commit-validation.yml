@@ -39,12 +39,31 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Install Linux OpenGL headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          # idlib's precompiled header pulls in renderer/qgl.h, which needs
+          # GL/gl.h, GL/glext.h (libgl-dev) and GL/glx.h (libglx-dev).
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y \
+              libgl1-mesa-dev \
+              libgl-dev \
+              libglx-dev; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo 'Failed to install the Linux OpenGL development headers.' >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
       - name: Install Clang
         if: matrix.compiler == 'Clang'
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
           sudo apt-get install -y clang
 
       - name: Run static checks
@@ -167,12 +186,31 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Install Linux OpenGL headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          # idlib's precompiled header pulls in renderer/qgl.h, which needs
+          # GL/gl.h, GL/glext.h (libgl-dev) and GL/glx.h (libglx-dev).
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y \
+              libgl1-mesa-dev \
+              libgl-dev \
+              libglx-dev; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo 'Failed to install the Linux OpenGL development headers.' >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
       - name: Install Clang
         if: matrix.compiler == 'Clang'
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
           sudo apt-get install -y clang
 
       - name: Run ARM64 source-input checks

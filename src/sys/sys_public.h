@@ -103,7 +103,10 @@ class idStr;
 	#define CPU_EASYARGS				1
 #endif
 
-#define ALIGN16( x )					x __attribute__ ((aligned (16)))
+// Clang rejects an alignment attribute that trails a declarator with a
+// constructor initialiser, so prefix the declaration the way the Linux
+// branch does and keep parenthesised initialisers building on macOS.
+#define ALIGN16( x )					__attribute__((aligned(16))) x
 
 #ifdef __MWERKS__
 #define PACKED

@@ -28,6 +28,7 @@ def main() -> None:
     options = read("meson_options.txt")
     src_meson = read("src/meson.build")
     precompiled = read("src/idlib/precompiled.h")
+    sys_public = read("src/sys/sys_public.h")
     qgl = read("src/renderer/qgl.h")
     glext = read("src/renderer/glext.h")
     readme = read("README.md")
@@ -73,6 +74,16 @@ endif"""
 
     require(precompiled, "#if defined( __APPLE__ ) && !defined( MACOS_X )", "Apple compiler MACOS_X bridge")
     reject(precompiled, "#include <ppc_intrinsics.h>", "modern macOS precompiled header")
+    require(
+        sys_public,
+        "#define ALIGN16( x )\t\t\t\t\t__attribute__((aligned(16))) x",
+        "macOS 16-byte alignment",
+    )
+    reject(
+        sys_public,
+        "#define ALIGN16( x )\t\t\t\t\tx __attribute__ ((aligned (16)))",
+        "trailing alignment attribute Clang rejects on constructed declarations",
+    )
     require(qgl, "#define OPENQ4_MACOS_GLHANDLEARB_PROVIDED_BY_OPENGL", "macOS OpenGL GLhandleARB ownership guard")
     require(glext, "#ifndef OPENQ4_MACOS_GLHANDLEARB_PROVIDED_BY_OPENGL", "bundled glext macOS GLhandleARB guard")
 
