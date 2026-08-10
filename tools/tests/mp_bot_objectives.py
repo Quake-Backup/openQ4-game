@@ -109,9 +109,15 @@ def main() -> None:
     require_before(
         source,
         "if ( self->PowerUpActive( carriedPowerup ) )",
-        "idPlayer *enemyCarrier = BotObjectiveNearestCarrier",
+        "idPlayer *enemyCarrier = BotObjectiveTeamCarrier",
         "carrier capture before team roles",
     )
+    # The carrier every role query is measured against has to be the same one for
+    # every bot on the team, or BotObjectiveSelectClosestRolePlayers cannot keep
+    # its "same mask for every bot" promise.  A nearest-to-me carrier is fine
+    # while only one flag of each colour exists, but DeadZone runs several
+    # artifacts at once and each bot would then solve a different allocation.
+    reject(source, "BotObjectiveNearestCarrier", "team-global carrier selection")
     reject(source, "gameLocal.mpGame.NextAP( ownTeam )", "instance-local assault routing")
     require_before(
         source,

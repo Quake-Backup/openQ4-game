@@ -57,6 +57,9 @@ static const float	BOT_GOAL_PROGRESS_EPSILON = 24.0f;	// route shortening counts
 static const int	BOT_RECOVER_SEARCH_MSEC	= 500;		// how often the off-mesh search may run
 static const float	BOT_RECOVER_RADIUS		= 1536.0f;	// how far off the mesh a bot will look for a way back
 static const int	BOT_RECOVER_IDLE_MSEC	= 2000;		// no route this long means the bot is stranded
+static const int	BOT_MINPLAYERS_BACKOFF_MSEC	= 30000;	// autofill retry delay after a refused addbot
+static const int	BOT_RECOVER_WANDER_MSEC	= 2000;		// how long a stranded bot keeps one wander heading
+static const float	BOT_RECOVER_TURN_RATE	= 150.0f;	// degrees/second it turns onto that heading
 static const int	BOT_PATIENCE_HOLD_MSEC	= 4000;		// how long a maximally patient bot sits on a finished roam
 static const float	BOT_DEFEND_RADIUS		= 320.0f;	// useful perimeter around an authored team base
 
@@ -367,13 +370,14 @@ rvBot::rvBot( void ) {
 	recoverTarget.Zero();
 	recoverSearchTime	= 0;
 	recoverValid		= false;
+	recoverWanderUntil	= 0;
+	recoverWanderYaw	= 0.0f;
 	avoidNext			= 0;
 
 	for ( int i = 0; i < MAX_AVOID_GOALS; i++ ) {
 		avoidGoals[i].until = 0;
 	}
 
-	stuckOrigin.Zero();
 	stuckTime			= 0;
 	unstickUntil		= 0;
 	unstickSide			= 1.0f;
@@ -654,6 +658,8 @@ void rvBot::OnSpawn( void ) {
 	ResetTraversal();
 	recoverValid		= false;
 	recoverSearchTime	= 0;
+	recoverWanderUntil	= 0;
+	recoverWanderYaw	= 0.0f;
 	avoidNext			= 0;
 
 	for ( int i = 0; i < MAX_AVOID_GOALS; i++ ) {
@@ -699,6 +705,16 @@ void rvBot::OnSpawn( void ) {
 	strafeFlipTime		= 0;
 	dodgeJump			= false;
 
+	// These are absolute stamps like every other deadline here, and OnSpawn is
+	// what rvBotManager::OnMapShutdown runs to re-arm a bot that kept its slot
+	// across a map change.  gameLocal.time restarts at zero there, so a stamp
+	// taken on the previous map is not "a second from now", it is however long
+	// that map ran - long enough that a spectating bot would never ask to
+	// rejoin again.
+	nextRejoinTime		= 0;
+	nextStatusTime		= 0;
+	nextAimDebugTime	= 0;
+
 	// Whether this bot picks the best enemy or merely the nearest one is a
 	// property of the engagement, not of the frame, so it is rolled here and
 	// again on every fresh acquisition.
@@ -711,7 +727,6 @@ void rvBot::OnSpawn( void ) {
 	idPlayer *self = GetPlayer();
 	if ( self ) {
 		aimAngles	= self->viewAngles;
-		stuckOrigin	= self->GetPhysics()->GetOrigin();
 	}
 }
 
@@ -819,6 +834,14 @@ rvBot::IsEnemy
 */
 bool rvBot::IsEnemy( idPlayer *self, idPlayer *other ) const {
 	if ( !other || other == self ) {
+		return false;
+	}
+	// fl.notarget is "never attack or target this entity", and every other
+	// thing in the game that acquires a target honours it.  Multiplayer bots
+	// are the only AI a multiplayer session has, so without this the flag does
+	// nothing at all in the one place an operator would reach for it - watching
+	// bots navigate on a listen server without being shot at.
+	if ( other->fl.notarget ) {
 		return false;
 	}
 	if ( other->GetInstance() != self->GetInstance() ||
@@ -1095,6 +1118,12 @@ void rvBot::UpdateEnemy( idPlayer *self ) {
 	idPlayer *	current			= enemy.GetEntity();
 	float		currentScore	= idMath::INFINITY;
 
+	// The exposed point each contender was accepted on, kept so the winner does
+	// not have to be traced for a second time.
+	idVec3		nearestVisiblePoint	= enemyVisiblePoint;
+	idVec3		bestVisiblePoint	= enemyVisiblePoint;
+	idVec3		currentVisiblePoint	= enemyVisiblePoint;
+
 	for ( int i = 0; i < gameLocal.numClients; i++ ) {
 		idEntity *ent = gameLocal.entities[i];
 
@@ -1138,22 +1167,24 @@ void rvBot::UpdateEnemy( idPlayer *self ) {
 
 		const float score = TargetScore( other, distSqr );
 
+		// Keep each contender's exposed point as it is sampled.  Whichever wins
+		// below already had this computed here, and BotCombatFindVisibleAimPoint
+		// is up to seven traces - running it a second time for the winner is a
+		// full extra visibility query per bot per frame for an answer already in
+		// hand.
 		if ( distSqr < nearestDistSqr ) {
-			nearestDistSqr	= distSqr;
-			nearest			= other;
+			nearestDistSqr		= distSqr;
+			nearest				= other;
+			nearestVisiblePoint	= visiblePoint;
 		}
 		if ( score < bestScore ) {
-			bestScore	= score;
-			best		= other;
+			bestScore			= score;
+			best				= other;
+			bestVisiblePoint	= visiblePoint;
 		}
 		if ( other == current ) {
-			currentScore = score;
-		}
-
-		// Cache the sampled exposed point for the eventual winner below.  This is
-		// overwritten only for that winner before aim consumes it.
-		if ( other == current ) {
-			enemyVisiblePoint = visiblePoint;
+			currentScore		= score;
+			currentVisiblePoint	= visiblePoint;
 		}
 	}
 
@@ -1189,7 +1220,12 @@ void rvBot::UpdateEnemy( idPlayer *self ) {
 		enemyLastSeenTime	= gameLocal.time;
 		enemyLastSeenOrigin	= pick->GetPhysics()->GetOrigin();
 		enemyLastSeenVelocity = pick->GetPhysics()->GetLinearVelocity();
-		CanSee( self, pick, &enemyVisiblePoint );
+
+		// Taken from the loop above rather than re-traced.  pick is always one of
+		// the three contenders, and every one of them was only a contender
+		// because CanSee succeeded and handed back this exact point.
+		enemyVisiblePoint = ( pick == current ) ? currentVisiblePoint :
+							( pick == best ) ? bestVisiblePoint : nearestVisiblePoint;
 		return;
 	}
 
@@ -1265,15 +1301,34 @@ rvBot::Repath
 ================
 */
 bool rvBot::Repath( idPlayer *self, const idVec3 &goal, bool preserveProgress ) {
+	// This is the attempt clock the refresh throttles read, so it is stamped
+	// before the search and on every outcome.  Keying it off a successful
+	// search would leave the throttle dead on exactly the path it exists for.
 	pathTime	= gameLocal.time;
-	pathCorner	= 0;
-	stuckPathCorner = 0;
-	stuckCornerDistance = idMath::INFINITY;
 	holdUntil	= 0;		// somewhere to be again, so no longer standing and watching
-	ResetTraversal();
 
-	if ( !navMesh.FindPath( self->GetPhysics()->GetOrigin(), goal, path ) ) {
+	// rvNavMesh::FindPath clears whatever path it is handed before it does
+	// anything else, so searching straight into the live route destroys it on
+	// every transient failure - an endpoint that stepped off the mesh for a
+	// moment, or that snapped into another area.  Search into scratch and only
+	// commit over the route the bot is following once there is a replacement.
+	rvNavPath	found;
+	const bool	routeSurvives = preserveProgress && pathCorner < path.Num();
+
+	if ( !navMesh.FindPath( self->GetPhysics()->GetOrigin(), goal, found ) ) {
+		if ( routeSurvives ) {
+			// A refresh of a route that is still good.  Keeping it is the whole
+			// point of preserveProgress, and a bot that still has somewhere to
+			// walk is not off the mesh, so the recovery counters stay put.
+			return false;
+		}
+
 		path.Clear();
+		pathCorner	= 0;
+		stuckPathCorner = 0;
+		stuckCornerDistance = idMath::INFINITY;
+		ResetTraversal();
+
 		repathFailures++;
 		if ( !noRouteSince ) {
 			noRouteSince = gameLocal.time;
@@ -1288,6 +1343,12 @@ bool rvBot::Repath( idPlayer *self, const idVec3 &goal, bool preserveProgress ) 
 		}
 		return false;
 	}
+
+	path		= found;
+	pathCorner	= 0;
+	stuckPathCorner = 0;
+	stuckCornerDistance = idMath::INFINITY;
+	ResetTraversal();
 
 	repathFailures = 0;
 	noRouteSince = 0;
@@ -1443,15 +1504,33 @@ bool rvBot::RecoverToNavMesh( idPlayer *self, usercmd_t &cmd ) {
 		}
 	}
 
-	// Nothing to head for: wander so the bot is at least a moving target.
+	// Nothing to head for: wander so the bot is at least a moving target, and
+	// so that a genuinely stranded one covers ground looking for the mesh.
+	//
+	// The heading is held for a while rather than turned every frame.  A fixed
+	// per-frame increment is a per-FRAME rate, not a per-second one - at the
+	// fixed 60 Hz server tic three degrees a frame is 180 deg/s - and because
+	// the move direction is taken from the same angles it is spinning, and
+	// UpdateAim's no-target fallback aims straight down them so the slew never
+	// opposes it, the bot walks a circle barely wider than it is tall.  That
+	// looks broken and it cannot relocate anything.
+	if ( gameLocal.time >= recoverWanderUntil ) {
+		recoverWanderUntil	= gameLocal.time + BOT_RECOVER_WANDER_MSEC;
+		recoverWanderYaw	= gameLocal.random.RandomFloat() * 360.0f;
+	}
+
+	const float maxTurn	= BOT_RECOVER_TURN_RATE * MS2SEC( gameLocal.GetMSec() );
+	const float yawError	= idMath::AngleNormalize180( recoverWanderYaw - aimAngles.yaw );
+
+	aimAngles.yaw = idMath::AngleNormalize180( aimAngles.yaw +
+		idMath::ClampFloat( -maxTurn, maxTurn, yawError ) );
+
 	moveDir = aimAngles.ToForward();
 	moveDir.z = 0.0f;
 
 	if ( moveDir.Normalize() > 0.0f ) {
 		ApplyMove( moveDir, cmd );
 	}
-
-	aimAngles.yaw = idMath::AngleNormalize180( aimAngles.yaw + 3.0f );
 
 	return false;
 }
@@ -1821,6 +1900,17 @@ void rvBot::UpdateGoal( idPlayer *self ) {
 		return;
 	}
 
+	// What the bot was already going after, captured before the selection below
+	// overwrites it.  The give-up deadline may only be re-armed when the answer
+	// actually changes.  The stuck detector and the traversal timeout both
+	// clear the route without touching the goal, so a bot on a goal it cannot
+	// physically reach comes back through here every quarter second, rebuilds
+	// the same route, and would push its own deadline out forever - never
+	// reaching AbandonGoal, never putting the goal on the avoid list.
+	const int			previousGoalType	= goalType;
+	const idEntity *	previousGoalEntity	= goalEntity.GetEntity();
+	const int			previousObjective	= objectiveKind;
+
 	bool routeFound = false;
 	if ( desiredType == BOTGOAL_OBJECTIVE && objectiveAvailable ) {
 		goalOrigin = objectiveRouteOrigin;
@@ -1887,10 +1977,19 @@ void rvBot::UpdateGoal( idPlayer *self ) {
 		}
 		goalUtility = desiredPriority;
 		goalCommitUntil = gameLocal.time + BOT_GOAL_COMMIT_MSEC;
-		goalBestDistance = PathDistanceRemaining( origin );
-		goalProgressTime = gameLocal.time;
-		const int expectedTravel = (int)( goalBestDistance * ( 1000.0f / 180.0f ) );
-		goalGiveUpTime = gameLocal.time + Max( BOT_GOAL_GIVEUP_MSEC, expectedTravel * 2 + 4000 );
+
+		// Only a genuinely different goal gets a fresh deadline.  Identity is
+		// the entity and the kind, never goalOrigin, which legitimately moves
+		// every refresh while chasing a player.  An unchanged goal keeps the
+		// clock it was given, and route progress above is what extends it.
+		if ( goalType != previousGoalType ||
+			 goalEntity.GetEntity() != previousGoalEntity ||
+			 objectiveKind != previousObjective ) {
+			goalBestDistance = PathDistanceRemaining( origin );
+			goalProgressTime = gameLocal.time;
+			const int expectedTravel = (int)( goalBestDistance * ( 1000.0f / 180.0f ) );
+			goalGiveUpTime = gameLocal.time + Max( BOT_GOAL_GIVEUP_MSEC, expectedTravel * 2 + 4000 );
+		}
 		holdUntil = 0;
 		stuckPathCorner = 0;
 		stuckCornerDistance = idMath::INFINITY;
@@ -1899,7 +1998,14 @@ void rvBot::UpdateGoal( idPlayer *self ) {
 
 	// A preferred candidate can be temporarily unreachable.  Preserve any old
 	// valid route; otherwise fall back to a directed random wander.
-	if ( currentValid && routeActive ) {
+	//
+	// The route has to be re-tested here rather than read off the routeActive
+	// snapshot taken at the top of the scan: the searches above hand the live
+	// path to rvNavMesh::FindPath, which clears it before doing anything else,
+	// so a failed search for the new candidate can have emptied the very route
+	// this guard is trying to keep.  Returning on the stale flag would leave
+	// the bot with no route AND skip the wander that exists to give it one.
+	if ( currentValid && !path.IsEmpty() && pathCorner < path.Num() ) {
 		return;
 	}
 
@@ -2090,7 +2196,6 @@ bool rvBot::AdvancePath( idPlayer *self ) {
 					traversalStartTime = gameLocal.time;
 					unstickUntil	= 0;
 					stuckChecks		= 0;
-					stuckOrigin		= origin;
 					stuckTime		= gameLocal.time;
 				}
 
@@ -2108,7 +2213,6 @@ bool rvBot::AdvancePath( idPlayer *self ) {
 					traversalStarted	= true;
 					unstickUntil		= 0;
 					stuckChecks			= 0;
-					stuckOrigin			= origin;
 					stuckTime			= gameLocal.time;
 					continue;
 				}
@@ -2138,7 +2242,6 @@ bool rvBot::AdvancePath( idPlayer *self ) {
 			// takeoff, and its progress window starts here.
 			unstickUntil	= 0;
 			stuckChecks		= 0;
-			stuckOrigin		= origin;
 			stuckTime		= gameLocal.time;
 		}
 
@@ -2263,8 +2366,12 @@ int rvBot::LiquidAtEye( void ) const {
 ================
 rvBot::UpdateLiquidMovement
 
-Swimming and getting out of the fire. Held up rather than pulsed like PressJump, because in
-idPhysics_Player::WaterMove upmove is an analogue swim-up axis, not a jump edge.
+Swimming and getting out of the fire. Held up rather than pulsed like PressJump when the bot is
+actually swimming, because in idPhysics_Player::WaterMove upmove is an analogue swim-up axis and
+not a jump edge - but that is only true above WATERLEVEL_FEET. idPhysics_Player::MovePlayer routes
+anything shallower to WalkMove, where upmove IS the jump edge, so a held 127 sets PMF_JUMP_HELD and
+nothing ever clears it: the bot gets exactly one jump and can then never hop the lip of the pit it
+is standing in. Ankle-deep lava is precisely the case this code exists for, so it has to pulse.
 ================
 */
 void rvBot::UpdateLiquidMovement( idPlayer *self, usercmd_t &cmd ) {
@@ -2273,9 +2380,19 @@ void rvBot::UpdateLiquidMovement( idPlayer *self, usercmd_t &cmd ) {
 		return;
 	}
 
+	// GetPlayerPhysics rather than GetPhysics: this has to be the same object
+	// idPhysics_Player::MovePlayer branches on, not whatever the player is
+	// riding.
+	const bool swimming = static_cast<idPhysics_Player *>( self->GetPlayerPhysics() )->GetWaterLevel() >
+		WATERLEVEL_FEET;
+
 	// Lava and slime are killing the bot right now, so climbing is the whole plan.
 	if ( feetLiquid & ( CONTENTS_LAVA | CONTENTS_SLIME ) ) {
-		cmd.upmove = 127;
+		if ( swimming ) {
+			cmd.upmove = 127;
+		} else {
+			PressJump( cmd );
+		}
 		cmd.buttons |= BUTTON_RUN;
 		return;
 	}
@@ -2401,6 +2518,15 @@ void rvBot::ScheduleDodge( const idVec3 &threatDirection ) {
 	dodgeStartTime = gameLocal.time + Max( 0, delay );
 	dodgeEndTime = dodgeStartTime + BOT_DODGE_MSEC;
 	dodgeJump = ( gameLocal.random.RandomFloat() < traits.jumpChance );
+
+	// The dodge owns the strafe side until it is over.  The routed combat
+	// movement re-rolls strafeSide on its own rhythm - 400 plus up to 800 ms
+	// against a 700 ms dodge, so a flip lands inside the window more often than
+	// not - and that would spend the second half of the dodge accelerating back
+	// into the line of fire it was chosen to leave, harder than it would have
+	// moved without dodging at all.  Deferring the rhythm covers the reaction
+	// delay before dodgeStartTime as well.
+	strafeFlipTime = Max( strafeFlipTime, dodgeEndTime );
 
 	// Keep an existing useful side preference when the damage direction makes
 	// one obvious; otherwise make the choice once for this dodge, not per frame.
@@ -2582,7 +2708,17 @@ void rvBot::UpdateMovement( idPlayer *self, usercmd_t &cmd ) {
 			}
 		}
 
-		holdUntil = 0;
+		// The hold is over, or something cancelled it before it started: an
+		// enemy walked in, or the bot turned out to be stranded after all.  The
+		// goal scan was deferred to the end of the hold on purpose, because
+		// UpdateGoal would otherwise hand out a new wander and end the hold
+		// early - but that deferral has to be released with it.  Left standing,
+		// it costs the bot up to four seconds in which it cannot chase, cannot
+		// go for health and cannot react to an objective change.
+		if ( holdUntil ) {
+			holdUntil			= 0;
+			nextGoalSelectTime	= Min( nextGoalSelectTime, gameLocal.time );
+		}
 
 		// Combat movement does not require a route.  This matters both on a tiny
 		// platform where start and goal collapse to one node and while a failed
@@ -2645,7 +2781,19 @@ void rvBot::UpdateMovement( idPlayer *self, usercmd_t &cmd ) {
 	noRouteSince = 0;
 
 	const navCorner_t &corner = path[pathCorner];
-	const bool committedTravel = ( corner.travelType != NAVTRAVEL_WALK ) ||
+
+	// The approach to a deliberate action counts as committed, not just the
+	// action itself.  AdvancePath tightens the acceptance radius from
+	// BOT_CORNER_REACH to BOT_TRAVEL_ENTRY_REACH for exactly this leg, and a
+	// jump or a drop registers no traversal state at all while the bot is still
+	// walking the corner before it - so without this the combat strafe, the
+	// player separation push and the unstick shove all stay live while the bot
+	// is trying to hit a twelve unit takeoff point.  A bot under fire then
+	// circles the window instead of entering it and fails jumps it makes
+	// reliably when nobody is shooting at it.
+	const bool actionEntry = ( pathCorner + 1 < path.Num() &&
+							   path[pathCorner + 1].travelType != NAVTRAVEL_WALK );
+	const bool committedTravel = ( corner.travelType != NAVTRAVEL_WALK ) || actionEntry ||
 		( traversalEntered && traversalCorner == pathCorner + 1 );
 
 	idVec3 moveDir = corner.origin - origin;
@@ -2844,7 +2992,6 @@ void rvBot::UpdateMovement( idPlayer *self, usercmd_t &cmd ) {
 			stuckChecks = 0;
 		}
 
-		stuckOrigin	= origin;
 		stuckTime	= gameLocal.time;
 		stuckPathCorner = pathCorner;
 		stuckCornerDistance = cornerDistance;
@@ -3323,7 +3470,8 @@ void rvBot::UpdateFire( idPlayer *self, usercmd_t &cmd ) {
 	// disagreed the bot would aim at where it is leading and then refuse to
 	// pull the trigger because the centre of the target was outside the cone.
 	idVec3 dir = aimPoint - eye;
-	if ( dir.Normalize() <= 0.0f ) {
+	const float shotRange = dir.Normalize();
+	if ( shotRange <= 0.0f ) {
 		return;
 	}
 
@@ -3347,7 +3495,7 @@ void rvBot::UpdateFire( idPlayer *self, usercmd_t &cmd ) {
 	// stopped moving, which is what a rattled player does.
 	const bool settled = ( onTargetTime >= settleMsec ) || MistakeActive( BOTMISTAKE_MISTIMEDSHOT );
 
-	if ( !settled || !BurstAllows( self ) ) {
+	if ( !settled ) {
 		wasFiring = false;
 		return;
 	}
@@ -3359,9 +3507,31 @@ void rvBot::UpdateFire( idPlayer *self, usercmd_t &cmd ) {
 		return;
 	}
 
+	// Proven along the vector the weapon will actually fire down, which is the
+	// view axis - rvWeapon takes its muzzle axis from the player's view - and
+	// not along the direction to aimPoint.  The cone gate above deliberately
+	// lets those two differ by up to the whole effective fire cone, 18 degrees
+	// at skill 1 and 7 at skill 3, so clearing the aim ray says very little
+	// about where the round goes: at 400 units, 7 degrees is 49 units, enough
+	// to put a teammate squarely on the real trajectory and nowhere near the
+	// one that was tested.  aimPoint stays the cone and settle reference above,
+	// which is correct and is what makes the bot shoot where it is looking.
+	const idVec3 firePoint = eye + aimAngles.ToForward() * shotRange;
+
 	const float splashRadius = BotWeaponSplashRadius( self );
-	if ( !BotCombatLineOfFireIsSafe( self, foe, eye, aimPoint, splashRadius,
+	if ( !BotCombatLineOfFireIsSafe( self, foe, eye, firePoint, splashRadius,
 										 !suppressing ) ) {
+		wasFiring = false;
+		return;
+	}
+
+	// Asked last, because BurstAllows is not a query: it opens the burst window,
+	// schedules the pause that follows it and rolls this burst's lead error.
+	// Asking before the shot has cleared every other gate spends a burst on
+	// rounds that are never fired - the window is wall clock, so it drains while
+	// the bot is refusing - and leaves the bot owing a pause and a full
+	// re-settle for an obstruction that may have lasted half a second.
+	if ( !BurstAllows( self ) ) {
 		wasFiring = false;
 		return;
 	}
@@ -3721,6 +3891,85 @@ void rvBot::OnMatchEnd( bool won ) {
 
 /*
 ================
+rvBot::ShiftMatchTime
+
+A competitive pause freezes rvBotManager::Think but not gameLocal.time, so every
+absolute deadline a bot holds would come back from a thirty second timeout
+thirty seconds overdue: the reaction it had not finished paying would be
+forgiven, the goal it was walking to would be abandoned and blacklisted, and the
+stuck detector would fire on a sample taken before the pause.  The rest of the
+game answers this by shifting its deadlines forward for every frozen frame -
+idPlayer, idInventory, rvWeapon, the game states and the movers all do it - and
+so must the bots.
+
+Only absolute stamps move.  onTargetTime is an accumulated duration and
+goalBestDistance is a distance, so both are deliberately absent.
+================
+*/
+void rvBot::ShiftMatchTime( int deltaMsec ) {
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+
+	const int maxInt = 0x7fffffff;
+#define SHIFT_BOT_TIME( value ) \
+	do { if ( ( value ) > 0 ) { ( value ) = ( value ) > maxInt - deltaMsec ? maxInt : ( value ) + deltaMsec; } } while ( 0 )
+
+	// -- navigation --
+	SHIFT_BOT_TIME( pathTime );
+	SHIFT_BOT_TIME( goalGiveUpTime );
+	SHIFT_BOT_TIME( goalCommitUntil );
+	SHIFT_BOT_TIME( goalProgressTime );
+	SHIFT_BOT_TIME( enemyPathTime );
+	SHIFT_BOT_TIME( nextGoalSelectTime );
+	SHIFT_BOT_TIME( holdUntil );
+	SHIFT_BOT_TIME( noRouteSince );
+	SHIFT_BOT_TIME( traversalStartTime );
+	SHIFT_BOT_TIME( recoverSearchTime );
+	SHIFT_BOT_TIME( recoverWanderUntil );
+
+	for ( int i = 0; i < MAX_AVOID_GOALS; i++ ) {
+		SHIFT_BOT_TIME( avoidGoals[i].until );
+	}
+
+	// -- stuck detection --
+	SHIFT_BOT_TIME( stuckTime );
+	SHIFT_BOT_TIME( unstickUntil );
+
+	// -- combat, aim and trigger --
+	SHIFT_BOT_TIME( enemyAcquiredTime );
+	SHIFT_BOT_TIME( enemyLastSeenTime );
+	SHIFT_BOT_TIME( lastAttackerTime );
+	SHIFT_BOT_TIME( enemyFireTime );
+	SHIFT_BOT_TIME( burstEndTime );
+	SHIFT_BOT_TIME( burstRestTime );
+	SHIFT_BOT_TIME( nextSingleShotTime );
+	SHIFT_BOT_TIME( mistakeEndTime );
+	SHIFT_BOT_TIME( nextMistakeTime );
+
+	// -- dodging --
+	// damageStamp mirrors idPlayer::lastDmgTime, which idPlayer shifts for the
+	// same pause; leaving it behind would make the bot react a second time to a
+	// hit it has already answered.
+	SHIFT_BOT_TIME( damageStamp );
+	SHIFT_BOT_TIME( dodgeStartTime );
+	SHIFT_BOT_TIME( dodgeEndTime );
+	SHIFT_BOT_TIME( nextThreatScanTime );
+	SHIFT_BOT_TIME( strafeFlipTime );
+
+	// -- weapon, chat and throttles --
+	SHIFT_BOT_TIME( chatSendTime );
+	SHIFT_BOT_TIME( nextWeaponTime );
+	SHIFT_BOT_TIME( lastWeaponSwitchTime );
+	SHIFT_BOT_TIME( nextRejoinTime );
+	SHIFT_BOT_TIME( nextStatusTime );
+	SHIFT_BOT_TIME( nextAimDebugTime );
+
+#undef SHIFT_BOT_TIME
+}
+
+/*
+================
 rvBot::Think
 ================
 */
@@ -3902,12 +4151,32 @@ void rvBotManager::OnMapShutdown( void ) {
 	nextLeaderCheck	= 0;
 	ResetReplyCooldowns();
 
+	// Every remaining deadline here is an absolute gameLocal.time stamp, and
+	// idGameLocal::LoadMap sets that clock back to zero.  Anything left over is
+	// therefore unreachable for roughly as long as the previous map ran, not
+	// for the throttle it was written as.  The autofill check is the expensive
+	// one to lose - bot_minPlayers simply stops topping the match up - and the
+	// chat throttle otherwise gags every bot until the GAMEON transition.
+	nextMinPlayerCheck = 0;
+	botCharacterManager.ResetChatThrottle();
+
 	// Surviving bots re-arm.  Empty slots are skipped now that OnSpawn resolves
 	// a personality: an inactive slot has clientNum -1, which is not a seed.
 	for ( int i = 0; i < MAX_CLIENTS; i++ ) {
-		if ( bots[i].IsActive() ) {
-			bots[i].OnSpawn();
+		if ( !bots[i].IsActive() ) {
+			continue;
 		}
+
+		// A queued line deliberately outlives a respawn, so OnSpawn keeps it.
+		// It must not outlive the map: its send time is on the old clock, which
+		// would pin the composing icon on and block every reply for the rest of
+		// the match, and the line itself is about a fight nobody is still in.
+		bots[i].chatPending.Clear();
+		bots[i].chatTeamOnly		= false;
+		bots[i].chatPendingIsReply	= false;
+		bots[i].chatSendTime		= 0;
+
+		bots[i].OnSpawn();
 	}
 }
 
@@ -4210,7 +4479,15 @@ rvBotManager::EnsureNavMesh
 ================
 */
 bool rvBotManager::EnsureNavMesh( void ) {
-	if ( navBuilt && navMesh.IsValid() ) {
+	// The mesh itself is the authority, not the flag.  `navmesh build` calls
+	// rvNavMesh::Build directly - it is a deliberate forced rebuild, so it
+	// cannot go through here - and rvNavMesh::Build opens with an unconditional
+	// Clear().  Gating on the flag alone would therefore throw away a perfectly
+	// good hand-built mesh and re-run the whole collision sweep on the next
+	// addbot, stalling the server thread for seconds to arrive back where it
+	// already was.
+	if ( navMesh.IsValid() ) {
+		navBuilt = true;
 		return true;
 	}
 	if ( navFailed ) {
@@ -4623,6 +4900,43 @@ void rvBotManager::OnMatchEnd( void ) {
 
 /*
 ================
+rvBotManager::ShiftMatchTime
+
+Every bot deadline moved forward by one frozen frame.  Hooked from
+idMultiplayerGame::RebaseCompetitivePauseFrame, beside the game state's own
+shift, because idGameLocal::RunFrame keeps advancing gameLocal.time through a
+competitive pause while it skips rvBotManager::Think.
+================
+*/
+void rvBotManager::ShiftMatchTime( int deltaMsec ) {
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+
+	const int maxInt = 0x7fffffff;
+#define SHIFT_BOT_MANAGER_TIME( value ) \
+	do { if ( ( value ) > 0 ) { ( value ) = ( value ) > maxInt - deltaMsec ? maxInt : ( value ) + deltaMsec; } } while ( 0 )
+
+	SHIFT_BOT_MANAGER_TIME( nextMinPlayerCheck );
+	SHIFT_BOT_MANAGER_TIME( nextLeaderCheck );
+
+	for ( int i = 0; i < MAX_CLIENTS; i++ ) {
+		SHIFT_BOT_MANAGER_TIME( nextReplySourceTime[i] );
+	}
+
+#undef SHIFT_BOT_MANAGER_TIME
+
+	botCharacterManager.ShiftChatThrottle( deltaMsec );
+
+	for ( int i = 0; i < MAX_CLIENTS; i++ ) {
+		if ( bots[i].IsActive() ) {
+			bots[i].ShiftMatchTime( deltaMsec );
+		}
+	}
+}
+
+/*
+================
 rvBotManager::OnPlayerDeath
 
 Hooked from idMultiplayerGame::PlayerDeath, after the scores have been
@@ -4776,7 +5090,14 @@ void rvBotManager::CheckMinPlayers( void ) {
 	}
 
 	if ( players < wanted ) {
-		AddBot( NULL );
+		// A refusal here is normally permanent for this map - no navigation
+		// could be generated, the slots are full, bots are disabled - and
+		// AddBot prints the reason itself.  Retrying on the ordinary two second
+		// tick would repeat that line for the rest of the match, so an autofill
+		// that is being refused backs off instead.
+		if ( !AddBot( NULL ) ) {
+			nextMinPlayerCheck = gameLocal.time + BOT_MINPLAYERS_BACKOFF_MSEC;
+		}
 	} else if ( players > wanted && NumBots() > 0 && humans + NumBots() > wanted ) {
 		RemoveBot( NULL );
 	}

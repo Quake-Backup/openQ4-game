@@ -540,6 +540,9 @@ public:
 	bool					AllowChat( int clientNum );
 	void					ResetChatThrottle( void );
 
+	// Move the throttle stamps forward by one frozen competitive-pause frame.
+	void					ShiftChatThrottle( int deltaMsec );
+
 	// Console command backings: botcharacters and botreload.
 	void					ListCharacters( void ) const;
 

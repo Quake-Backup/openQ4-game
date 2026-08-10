@@ -32,7 +32,6 @@ rvBotCharacterManager		botCharacterManager;
 // therefore not merely annoying, it can kick real players off the server.
 static const int	BOT_CHAT_CLIENT_THROTTLE_MSEC	= 6000;		// one bot may not speak twice inside this
 static const int	BOT_CHAT_GLOBAL_THROTTLE_MSEC	= 1200;		// and no two bots may speak inside this
-static const float	BOT_CHAT_CHATTY_BONUS			= 0.35f;	// added to chatiness at bot_chat 2
 
 // Where the content lives.  New subdirectories and new extensions, so a reader
 // can never pick up the dead Quake 3 prototypes still sitting in botfiles/.
@@ -539,6 +538,8 @@ void rvBotTraitMods::Apply( botTraits_t &traits ) const {
 			continue;
 		}
 
+		const float previous = *value;
+
 		switch ( mods[i].op ) {
 			case BOTTRAITOP_SET:
 				*value = mods[i].value;
@@ -554,6 +555,17 @@ void rvBotTraitMods::Apply( botTraits_t &traits ) const {
 		}
 
 		const botTraitField_t *field = rvBotCharacterManager::GetTraitField( mods[i].field );
+
+		// A statement whose result is a NaN is dropped rather than clamped: the
+		// clamp is two comparisons and every comparison against a NaN is false,
+		// so it would pass straight through and poison the trait for the life of
+		// the bot.  A file that looks perfectly in range can produce one, because
+		// an overlarge literal parses to infinity and scaling zero by infinity is
+		// NaN.  Infinity itself still clamps normally and is left alone.
+		if ( FLOAT_IS_NAN( *value ) && !FLOAT_IS_INF( *value ) ) {
+			*value = previous;
+			continue;
+		}
 
 		*value = idMath::ClampFloat( field->min, field->max, *value );
 	}
@@ -1955,6 +1967,17 @@ void rvBotCharacterManager::ClampTraits( botTraits_t &traits ) {
 
 		float *value = (float *)( (byte *)&traits + def.field.offset );
 
+		// A NaN has to be answered before the clamp, not by it.  idMath::ClampFloat
+		// is two comparisons, and every comparison against a NaN is false, so a
+		// NaN is returned untouched by the one thing this format relies on to
+		// keep bad content from producing a nonsense bot.  Infinity is fine - it
+		// compares and clamps normally - which is why this is not FLOAT_IS_NAN on
+		// its own, that macro is an exponent test and answers true for both.
+		if ( FLOAT_IS_NAN( *value ) && !FLOAT_IS_INF( *value ) ) {
+			*value = def.field.min;
+			continue;
+		}
+
 		*value = idMath::ClampFloat( def.field.min, def.field.max, *value );
 	}
 
@@ -1994,12 +2017,12 @@ void rvBotCharacterManager::ResolveTraits( const rvBotCharacter *character, int 
 	}
 
 	// bot_chat 2 is "chatty", and the only thing that means is that a
-	// chat-worthy event is more likely to produce a line.  Applied here so the
-	// chat code has exactly one number to consult.
-	if ( bot_chat.GetInteger() >= 2 ) {
-		traits.chatiness += BOT_CHAT_CHATTY_BONUS;
-	}
-
+	// chat-worthy event is more likely to produce a line.  That bonus is NOT
+	// folded in here.  Traits are resolved once per spawn, so baking a live
+	// cvar into them would leave an operator who sets bot_chat 2 mid-match with
+	// the halved throttles - which are read at the point of use - but the old
+	// chatiness until everybody had died once.  Both chat sites apply it to
+	// their own copy instead; see rvBot::QueueChat and rvBot::TryQueueReply.
 	ClampTraits( traits );
 }
 
@@ -2459,6 +2482,33 @@ void rvBotCharacterManager::ResetChatThrottle( void ) {
 	for ( int i = 0; i < MAX_CLIENTS; i++ ) {
 		nextClientChatTime[i] = 0;
 	}
+}
+
+/*
+================
+rvBotCharacterManager::ShiftChatThrottle
+
+The other half of the same problem: a competitive pause advances gameLocal.time
+without running the bots, so these stamps have to move with it or the whole
+server falls silent for the length of the pause once play resumes.
+================
+*/
+void rvBotCharacterManager::ShiftChatThrottle( int deltaMsec ) {
+	if ( deltaMsec <= 0 ) {
+		return;
+	}
+
+	const int maxInt = 0x7fffffff;
+#define SHIFT_CHAT_TIME( value ) \
+	do { if ( ( value ) > 0 ) { ( value ) = ( value ) > maxInt - deltaMsec ? maxInt : ( value ) + deltaMsec; } } while ( 0 )
+
+	SHIFT_CHAT_TIME( nextGlobalChatTime );
+
+	for ( int i = 0; i < MAX_CLIENTS; i++ ) {
+		SHIFT_CHAT_TIME( nextClientChatTime[i] );
+	}
+
+#undef SHIFT_CHAT_TIME
 }
 
 /*

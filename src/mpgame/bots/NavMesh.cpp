@@ -34,6 +34,8 @@ static const float	NAV_MAX_DROP			= 192.0f;	// furthest one-way ledge drop we wi
 static const float	NAV_MERGE_HEIGHT		= 28.0f;	// two floors this close in a cell are one node
 static const float	NAV_GROUND_OFFSET		= 1.0f;		// lift traces off the surface they start on
 static const int	NAV_MAX_NODES			= 65536;
+static const int	NAV_HASH_BUCKETS		= 16384;	// cell hash size; idHashIndex never rehashes
+static const int	NAV_MAX_WALKABLE_PROBES	= 48;		// collision probes one snap query may spend
 static const int	NAV_SMOOTH_LOOKAHEAD	= 8;		// nodes a single string-pull step may skip
 static const float	NAV_SMOOTH_MAX_DIP		= 48.0f;	// how far a shortcut may float above the ground it crosses
 static const int	NAV_MAX_ROUTE_REPAIRS	= 16;		// blocked graph edges excluded before giving up
@@ -313,7 +315,13 @@ void rvNavPath::SetTravelCost( const idVec3 &origin, float cost ) {
 rvNavMesh::rvNavMesh
 ================
 */
-rvNavMesh::rvNavMesh( void ) {
+// The cell hash is sized for the mesh rather than left on idHashIndex's default
+// 1024 buckets.  idHashIndex never rehashes - Add only ever grows the index
+// chain - so a default-constructed table stays 64x oversubscribed at
+// NAV_MAX_NODES, and every FindNode during generation walks a chain that long.
+// The buckets are not allocated until the first Add, so a small map pays
+// nothing for this.
+rvNavMesh::rvNavMesh( void ) : nodeHash( NAV_HASH_BUCKETS, NAV_HASH_BUCKETS ) {
 	gridOrigin.Zero();
 	cellSize		= 24.0f;
 	numAreas		= 0;
@@ -659,12 +667,27 @@ void rvNavMesh::FloodFill( const idList<idVec3> &seeds ) {
 	}
 
 	// Breadth first so the mesh grows evenly and the open list stays small.
+	//
+	// Hitting the node limit stops the graph GROWING; it must not stop the
+	// expansion loop.  Everything still queued was discovered by some earlier
+	// node and therefore already has an inbound link, so abandoning it leaves it
+	// with firstLink == -1 - a sink.  BuildAreas walks the links as undirected
+	// and folds a sink into the same area as the rest of the map, so the cheap
+	// area rejection says "reachable", A* then pops the node, finds nowhere to
+	// go, and reports no route from it at all.  Draining the queue without
+	// adding to it costs one more pass over a list that can no longer grow, and
+	// leaves a smaller graph that is properly closed instead of a larger one
+	// with a rim nobody can move off.
+	bool atNodeLimit = false;
+
 	for ( i = 0; i < openList.Num(); i++ ) {
 		const int current = openList[i];
 
-		if ( nodes.Num() >= NAV_MAX_NODES ) {
-			gameLocal.Warning( "rvNavMesh: node limit (%d) reached, navmesh is truncated", NAV_MAX_NODES );
-			break;
+		if ( !atNodeLimit && nodes.Num() >= NAV_MAX_NODES ) {
+			atNodeLimit = true;
+			gameLocal.Warning( "rvNavMesh: node limit (%d) reached at bot_navCellSize %.0f. Part of "
+							   "this map has no navigation; raise the cell size to cover it all",
+							   NAV_MAX_NODES, cellSize );
 		}
 
 		// Copied, because AddNode below can reallocate the node list.
@@ -685,6 +708,10 @@ void rvNavMesh::FloodFill( const idList<idVec3> &seeds ) {
 
 			int neighbour = FindNode( gx, gy, toFloor.z );
 			if ( neighbour == -1 ) {
+				// Out of nodes: link only to ground that already exists.
+				if ( atNodeLimit ) {
+					continue;
+				}
 // openQ4 BEGIN
 				if ( NavPointInLethalLiquid( toFloor ) ) {
 					continue;
@@ -961,7 +988,18 @@ int rvNavMesh::FindNearestNode( const idVec3 &origin, float maxRadius, bool requ
 	int			best		= -1;
 	float		bestDistSqr = maxRadius * maxRadius;
 
-	for ( int ring = 0; ring <= maxRings; ring++ ) {
+	// Walkability probes are budgeted.  bestDistSqr only tightens on a SUCCESS,
+	// so when nothing is walk-reachable the ring early-out below can never fire
+	// and every node inside maxRadius gets a WalkableLine - which is two box
+	// sweeps at minimum plus an interior SampleFloor per cell crossed.  That
+	// failure path is not the rare one: the widest caller is the off-mesh
+	// recovery search at 1536 units, and it runs precisely when the bot is
+	// somewhere no node can reach, twice a second, for as long as it is stuck.
+	// Rings are walked outwards, so the budget is spent nearest-first and the
+	// answer in every success case is the one it would have found anyway.
+	int probesLeft = requireWalkable ? NAV_MAX_WALKABLE_PROBES : nodes.Num();
+
+	for ( int ring = 0; ring <= maxRings && probesLeft > 0; ring++ ) {
 		for ( int dy = -ring; dy <= ring; dy++ ) {
 			// Step across the shell of this ring rather than walking the whole
 			// square and skipping the interior: the interior was covered by the
@@ -979,11 +1017,23 @@ int rvNavMesh::FindNearestNode( const idVec3 &origin, float maxRadius, bool requ
 					}
 
 					const float distSqr = ( nodes[i].origin - origin ).LengthSqr();
-					if ( distSqr < bestDistSqr &&
-						 ( !requireWalkable || WalkableLine( origin, nodes[i].origin ) ) ) {
-						bestDistSqr	= distSqr;
-						best		= i;
+					if ( distSqr >= bestDistSqr ) {
+						continue;
 					}
+
+					if ( requireWalkable ) {
+						if ( probesLeft <= 0 ) {
+							continue;
+						}
+						probesLeft--;
+
+						if ( !WalkableLine( origin, nodes[i].origin ) ) {
+							continue;
+						}
+					}
+
+					bestDistSqr	= distSqr;
+					best		= i;
 				}
 			}
 		}
@@ -1181,16 +1231,60 @@ bool rvNavMesh::LinkTraversable( int fromNode, int linkIndex ) const {
 		case NAVTRAVEL_WALK:
 		case NAVTRAVEL_DROP:
 		case NAVTRAVEL_JUMP: {
-			idVec3 start = nodes[fromNode].origin;
-			idVec3 end = nodes[link.node].origin;
-			trace_t trace;
-
-			start.z += NAV_GROUND_OFFSET;
-			end.z += NAV_GROUND_OFFSET;
-
 			// The static world and traversal type were proven when this graph edge
 			// was generated.  Only dynamic solid entities can make that proof stale.
-			return NavEntityTranslationThroughDoors( trace, start, end, navAgentModel );
+			//
+			// Reproduce the SHAPE the generator proved - lift, cross at that
+			// height, then drop - instead of sweeping the straight chord between
+			// the two node origins.  That chord is not a movement any player
+			// makes, and for a drop or a jump it runs diagonally through the very
+			// surface being left or landed on.  Harmless while the trace also
+			// sees the world, because the world was proven; fatal here, because
+			// this trace sees ONLY entities, so a ledge, crate or lift platform
+			// that happens to be a brush model blocks its own link on every
+			// single route and A* pays a full repair flood to route around ground
+			// the bot can plainly stand on.
+			const idVec3	fromFloor	= nodes[fromNode].origin;
+			const idVec3	toFloor		= nodes[link.node].origin;
+			const float		rise		= Max( 0.0f, toFloor.z - fromFloor.z );
+			trace_t			trace;
+
+			idVec3 start = fromFloor;
+			start.z += NAV_GROUND_OFFSET;
+
+			// A jump commits to the full height whatever the rise; a step only
+			// lifts as far as it has to, so a flat walk is not failed by a low
+			// ceiling it passes under perfectly well.
+			const float lift = ( link.travelType == NAVTRAVEL_JUMP ) ?
+				pm_jumpheight.GetFloat() : Min( rise, pm_stepsize.GetFloat() );
+
+			if ( lift > 0.0f ) {
+				idVec3 lifted = start;
+				lifted.z = fromFloor.z + NAV_GROUND_OFFSET + lift;
+
+				if ( !NavEntityTranslationThroughDoors( trace, start, lifted, navAgentModel ) ) {
+					return false;
+				}
+				start = lifted;
+			}
+
+			idVec3 across = toFloor;
+			across.z = start.z;
+
+			if ( !NavEntityTranslationThroughDoors( trace, start, across, navAgentModel ) ) {
+				return false;
+			}
+
+			// Then down onto the destination floor.  This is the whole fall for a
+			// drop, and nothing at all when the crossing already ended level.
+			idVec3 down = across;
+			down.z = toFloor.z + NAV_GROUND_OFFSET;
+
+			if ( down.z >= across.z ) {
+				return true;
+			}
+
+			return NavEntityTranslationThroughDoors( trace, across, down, navAgentModel );
 		}
 
 		case NAVTRAVEL_JUMPPAD:

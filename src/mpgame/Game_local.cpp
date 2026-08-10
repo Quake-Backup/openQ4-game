@@ -677,6 +677,7 @@ void idGameLocal::Init( void ) {
 	// describes an opponent, and opponents outlive a map change because bots
 	// hold their client slots across one.
 	botCharacterManager.Init();
+	botManager.Init();
 
 // jnewquist: Tag scope and callees to track allocations using "new".
 	MEM_SCOPED_TAG(tag,MA_RENDER);
@@ -752,6 +753,10 @@ void idGameLocal::Shutdown( void ) {
 // jscott: FAS
 	FAS_Shutdown();
 
+	// Before the character manager, not after: every live bot is holding a
+	// character pointer, and rvBotManager::Shutdown is what hands those back.
+	// Freeing the roster first would leave each bot pointing at released memory.
+	botManager.Shutdown();
 	botCharacterManager.Shutdown();
 
 // shouchard:  clean up ban list stuff

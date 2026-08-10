@@ -124,9 +124,18 @@ def main() -> None:
         "friendly safety ordering",
     )
     require(line_safety, "if ( requireUsefulImpact )", "visible-shot usefulness gate")
+    # An unobstructed shot, and one that stops on another hostile, are useful by
+    # construction and must be answered before the splash test.  Weapons with no
+    # splash carry a zero radius, and BotCombatSplashThreatensPlayer rejects a
+    # zero radius unconditionally (pinned just below as the "hitscan splash
+    # bypass"), so putting them through it makes every hitscan weapon and every
+    # splash-free projectile hold fire unless the trace happens to land on the
+    # target hull - which the deliberate aim-belief error usually prevents.
+    require(line_safety, "if ( !hit )", "unobstructed shot is useful")
+    require(line_safety, "if ( hitPlayer )", "hostile intercept is useful")
     require(
         line_safety,
-        "BotCombatSplashThreatensPlayer( intendedFoe, splashTargetIgnore",
+        "BotCombatSplashThreatensPlayer( intendedFoe, hit,",
         "trajectory-aware direct-or-splash target reach",
     )
     splash_player = function_body(source, "static bool BotCombatSplashThreatensPlayer")

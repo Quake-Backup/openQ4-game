@@ -35,11 +35,19 @@ bool BotCombatFindVisibleAimPoint( idPlayer *observer, idPlayer *target,
 // An intended foe is a valid trace hit, but is deliberately not exempt from
 // the point-blank splash check.  A clear hitscan trace is safe.
 //
-// requireUsefulImpact asks the same trajectory query to prove that the intended
-// foe is hit directly or exposed to the resulting splash.  Leave it false for
-// deliberate doorway suppression, where a safe world impact is useful by
-// definition.  Pass zero for hitscan weapons.  impactPoint may be NULL; when
-// supplied it receives the trace end position.
+// aimPoint is the point the round will actually travel toward, which for a
+// player weapon means along the view axis - not the point the bot would like to
+// be aiming at.  The two are allowed to differ by the whole fire cone, and a
+// safety proof run down the wrong one of them proves nothing.
+//
+// requireUsefulImpact asks the same trajectory query to prove the shot is worth
+// taking: an unobstructed shot and one that stops on another hostile are useful
+// by construction, and anything that terminates on the world has to put the
+// intended foe inside the resulting splash.  Leave it false for deliberate
+// doorway suppression, where a safe world impact is useful by definition.  Pass
+// a zero splash radius for weapons that have none - it correctly makes a world
+// impact useless without gating the clear shot, which is the common case.
+// impactPoint may be NULL; when supplied it receives the trace end position.
 //----------------------------------------------------------------
 bool BotCombatLineOfFireIsSafe( idPlayer *shooter, idPlayer *intendedFoe,
 								const idVec3 &shotOrigin, const idVec3 &aimPoint,

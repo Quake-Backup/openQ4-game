@@ -335,14 +335,24 @@ static int BotObjectiveNearbyEnemies( idPlayer *self, const idVec3 &origin, floa
 
 /*
 ================
-BotObjectiveNearestCarrier
+BotObjectiveTeamCarrier
+
+The carrier a whole team agrees on, by lowest client number.
+
+Deliberately not "the one nearest me".  The role allocator below promises to
+produce the same mask for every bot on a team, and it can only keep that promise
+if every bot hands it the same targetOrigin and the same excluded player.  With
+one flag of each colour there is only ever one carrier and the distinction does
+not arise, but DeadZone runs several artifacts at once by design, and there a
+per-bot answer makes each bot solve a different allocation: every one of them
+can come out an interceptor and nobody escorts the carrier or holds the zone -
+in the one mode whose entire scoring rule is standing in the zone.
+
+Which carrier is picked matters far less than that everyone picks the same one;
+the allocator still assigns the closest useful players to it.
 ================
 */
-static idPlayer *BotObjectiveNearestCarrier( idPlayer *self, int team, int powerup ) {
-	idPlayer *best = NULL;
-	float bestDistanceSqr = idMath::INFINITY;
-	const idVec3 selfOrigin = self->GetPhysics()->GetOrigin();
-
+static idPlayer *BotObjectiveTeamCarrier( idPlayer *self, int team, int powerup ) {
 	for ( int i = 0; i < gameLocal.numClients; i++ ) {
 		idPlayer *candidate = gameLocal.GetClientByNum( i );
 		if ( candidate == self || !BotObjectiveLivePlayer( self, candidate ) ||
@@ -350,14 +360,10 @@ static idPlayer *BotObjectiveNearestCarrier( idPlayer *self, int team, int power
 			continue;
 		}
 
-		const float distanceSqr = ( candidate->GetPhysics()->GetOrigin() - selfOrigin ).LengthSqr();
-		if ( distanceSqr < bestDistanceSqr ) {
-			bestDistanceSqr = distanceSqr;
-			best = candidate;
-		}
+		return candidate;
 	}
 
-	return best;
+	return NULL;
 }
 
 /*
@@ -494,8 +500,8 @@ static bool BotFindCTFObjective( idPlayer *self, botObjective_t &out ) {
 	// and the carrier powerup, never through the two-element flag-state arrays.
 	const int hostilePowerup = oneFlag ? POWERUP_CTF_ONEFLAG : BotObjectiveFlagPowerup( ownTeam );
 	const int friendlyPowerup = oneFlag ? POWERUP_CTF_ONEFLAG : BotObjectiveFlagPowerup( enemyTeam );
-	idPlayer *enemyCarrier = BotObjectiveNearestCarrier( self, enemyTeam, hostilePowerup );
-	idPlayer *friendlyCarrier = BotObjectiveNearestCarrier( self, ownTeam, friendlyPowerup );
+	idPlayer *enemyCarrier = BotObjectiveTeamCarrier( self, enemyTeam, hostilePowerup );
+	idPlayer *friendlyCarrier = BotObjectiveTeamCarrier( self, ownTeam, friendlyPowerup );
 
 	rvCTFGameState *state = NULL;
 	rvGameState *rawState = gameLocal.mpGame.GetGameState();
@@ -751,8 +757,8 @@ static bool BotFindDeadZoneObjective( idPlayer *self, botObjective_t &out ) {
 		return false;
 	}
 
-	idPlayer *enemyCarrier = BotObjectiveNearestCarrier( self, enemyTeam, POWERUP_DEADZONE );
-	idPlayer *friendlyCarrier = BotObjectiveNearestCarrier( self, self->team, POWERUP_DEADZONE );
+	idPlayer *enemyCarrier = BotObjectiveTeamCarrier( self, enemyTeam, POWERUP_DEADZONE );
+	idPlayer *friendlyCarrier = BotObjectiveTeamCarrier( self, self->team, POWERUP_DEADZONE );
 	bool assigned[MAX_CLIENTS];
 	bool selected[MAX_CLIENTS];
 	memset( assigned, 0, sizeof( assigned ) );

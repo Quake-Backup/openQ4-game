@@ -229,7 +229,8 @@ static bool BotCombatValidFoe( idPlayer *shooter, idPlayer *foe ) {
 	if ( !BotCombatValidClientPlayer( shooter ) || !BotCombatValidClientPlayer( foe ) ||
 		 !gameLocal.mpGame.CanPlay( shooter ) || shooter->spectating || shooter->health <= 0 ||
 		 foe == shooter || foe->GetInstance() != shooter->GetInstance() ||
-		 !gameLocal.mpGame.CanPlay( foe ) || foe->spectating || foe->health <= 0 ) {
+		 !gameLocal.mpGame.CanPlay( foe ) || foe->spectating || foe->health <= 0 ||
+		 foe->fl.notarget ) {
 		return false;
 	}
 
@@ -617,11 +618,33 @@ bool BotCombatLineOfFireIsSafe( idPlayer *shooter, idPlayer *intendedFoe,
 	}
 
 	if ( requireUsefulImpact ) {
-		// A projectile may correctly aim above or beside the player and terminate
-		// at its feet.  Reuse the same impact-time bounds and exposure model used
-		// by splash safety instead of reintroducing a straight eye-to-foe ray.
-		idEntity *splashTargetIgnore = hit ? hit : shooter;
-		return BotCombatSplashThreatensPlayer( intendedFoe, splashTargetIgnore,
+		// Nothing stopped the shot, so it travels to the exact point the bot
+		// chose to aim at.  Whatever distance remains between that point and the
+		// target is the aim model's own error, which is deliberate and is the
+		// whole of how skill reads in play - re-testing it here is the failure
+		// the design record warns about, a bot that tracks correctly and then
+		// refuses to pull the trigger.  It also has to be answered before the
+		// exposure test below, because a weapon with no splash carries a zero
+		// radius, and BotCombatSplashThreatensPlayer answers false for a zero
+		// radius unconditionally: every hitscan weapon and every splash-free
+		// projectile would hold fire unless the trace happened to terminate on
+		// the target hull, which the deliberate aim error usually prevents.
+		if ( !hit ) {
+			return true;
+		}
+
+		// The shot stops on another hostile instead.  Team safety was already
+		// proven above, so that is a hit and not a wasted round; only geometry
+		// and cover make an impact useless.
+		if ( hitPlayer ) {
+			return true;
+		}
+
+		// It terminated on the world, a mover or a crate.  Now it is only worth
+		// taking if the resulting splash still reaches the foe.  Reuse the same
+		// impact-time bounds and exposure model used by splash safety instead of
+		// reintroducing a straight eye-to-foe ray.
+		return BotCombatSplashThreatensPlayer( intendedFoe, hit,
 			actualImpact, splashSafetyRadius, impactTime );
 	}
 
@@ -792,6 +815,21 @@ bool BotCombatFindIncomingProjectileThreat( idPlayer *self,
 		const int steps = idMath::ClampInt( BOTCOMBAT_MIN_TRAJECTORY_STEPS,
 			BOTCOMBAT_MAX_TRAJECTORY_STEPS,
 			(int)idMath::Ceil( estimatedTravel / segmentLength ) );
+
+		// Analytic rejection first.  Over the horizon the projectile can cover at
+		// most estimatedTravel and the player at most its own speed times the
+		// horizon, so anything separated by more than the sum of those plus the
+		// clearance can never become a threat, whatever it does in between.
+		// Proving that with arithmetic matters because the sweep below is up to
+		// BOTCOMBAT_MAX_TRAJECTORY_STEPS bounds traces against the collision
+		// world, per projectile, per bot, several times a second: two players
+		// trading nailgun fire at the far end of the map would otherwise cost
+		// every bot on the server a full sweep of every round in flight.
+		const float reach = estimatedTravel + selfVelocity.Length() * lookAheadSeconds +
+			unsafeClearance;
+		if ( selfBounds.ShortestDistance( projectileOrigin ) > reach ) {
+			continue;
+		}
 
 		// A terminating wall/actor collision limits the direct-flight search.  A
 		// bounce does not: without simulating the contact normal, it cannot prove

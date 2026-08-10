@@ -1802,6 +1802,11 @@ void idMultiplayerGame::RebaseCompetitivePauseFrame( int deltaMsec ) {
 		}
 	}
 	gameState->ShiftMatchTime( deltaMsec );
+
+	// Bots are skipped entirely while gameplay is frozen (idGameLocal::RunFrame),
+	// so every deadline they hold has to move with the clock exactly as the
+	// players' do.
+	botManager.ShiftMatchTime( deltaMsec );
 }
 
 /*
@@ -10756,6 +10761,11 @@ void idMultiplayerGame::PlayerDeath( idPlayer *dead, idPlayer *killer, int metho
 	SendDeathMessage( killer, dead, methodOfDeath, killer ? killer->PowerUpActive( POWERUP_QUADDAMAGE ) : false );
 
 	statManager->Kill( dead, killer, methodOfDeath );
+
+	// openQ4: bots react here rather than in idPlayer::Killed, because scoring
+	// has been committed by this point and a bot reading the board for its kill
+	// streak or its next line already sees the post-frag standings.
+	botManager.OnPlayerDeath( dead, killer, methodOfDeath );
 
 	// openQ4: let the game state react to the death.  Round modes use this to
 	// eliminate the victim, Freeze Tag to freeze them, Red Rover to switch

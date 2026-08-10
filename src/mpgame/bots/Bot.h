@@ -119,6 +119,10 @@ public:
 	void					OnMatchStart( void );
 	void					OnMatchEnd( bool won );
 
+	// Move every absolute deadline forward by one frozen competitive-pause
+	// frame.  gameLocal.time advances through a pause; this bot does not think.
+	void					ShiftMatchTime( int deltaMsec );
+
 	// Read-only coordination state used by rvBotManager to keep a whole team
 	// from reserving the same pickup or support target.
 	idEntity *				GetGoalEntity( void ) const { return goalEntity.GetEntity(); }
@@ -237,6 +241,12 @@ private:
 	int						recoverSearchTime;
 	bool					recoverValid;
 
+	// With nowhere known to head for, the bot picks a heading and keeps it for
+	// a while.  Turning a fixed amount every frame is a per-frame rate, and it
+	// only ever walks the bot in a circle it cannot escape.
+	int						recoverWanderUntil;
+	float					recoverWanderYaw;
+
 	// Goals that did not work out, so the bot does not ping-pong between two
 	// items it cannot take.  One slot would only ever remember the last one.
 	static const int		MAX_AVOID_GOALS = 8;
@@ -247,7 +257,11 @@ private:
 	int						avoidNext;
 
 	// -- stuck detection --
-	idVec3					stuckOrigin;
+	// Progress is measured against the route, not against displacement: a bot
+	// that is moving but not getting closer to its corner is stuck, and one
+	// that is standing still already fails the same test.  There is deliberately
+	// no "has it physically moved" member here - it read as a second signal and
+	// was never anything of the kind.
 	int						stuckTime;
 	int						unstickUntil;
 	float					unstickSide;
@@ -364,6 +378,13 @@ public:
 	void					OnMatchStart( void );
 	void					OnMatchEnd( void );
 	void					OnPlayerDeath( idPlayer *dead, idPlayer *killer, int methodOfDeath );
+
+	// Called once per frozen frame from
+	// idMultiplayerGame::RebaseCompetitivePauseFrame.  idGameLocal::RunFrame
+	// keeps advancing gameLocal.time through a competitive pause while it skips
+	// rvBotManager::Think, so without this every bot resumes with every deadline
+	// already expired: reactions forgiven, goals abandoned, stuck checks fired.
+	void					ShiftMatchTime( int deltaMsec );
 	void					OnPlayerDamaged( idPlayer *victim, idEntity *attacker, int damage, const idVec3 &dir );
 
 	// Called once for an accepted typed-chat line on the server.  It chooses at
