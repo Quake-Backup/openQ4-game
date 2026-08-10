@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -69,6 +70,15 @@ endif"""
     require(src_meson, "cpp.has_link_argument(link_arg)", "Darwin linker argument probing")
     require(src_meson, "name_suffix : 'dylib'", "macOS game module suffix")
     require(src_meson, "-Wl,-install_name,@loader_path/", "macOS game module install name")
+    darwin_module_kinds = re.findall(
+        r"  elif is_darwin\n(?:    #.*\n)*    (shared_\w+)\(",
+        src_meson,
+    )
+    if darwin_module_kinds != ["shared_library", "shared_library"]:
+        raise AssertionError(
+            "macOS SP and MP modules must be shared_library targets; meson links shared_module "
+            "on darwin as an MH_BUNDLE, which has no LC_ID_DYLIB for -install_name to land in"
+        )
     require(src_meson, "vs_module_defs : 'game/game.def'", "Windows SP export map")
     require(src_meson, "vs_module_defs : 'mpgame/mpgame.def'", "Windows MP export map")
 

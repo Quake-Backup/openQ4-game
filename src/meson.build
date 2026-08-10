@@ -383,7 +383,11 @@ if get_option('build_spgame')
       install : false,
     )
   elif is_darwin
-    shared_module(
+    # shared_library, not shared_module: meson links shared_module on darwin as
+    # an MH_BUNDLE with -undefined dynamic_lookup, which carries no LC_ID_DYLIB
+    # for -install_name to land in and drops the undefined-symbol closure the
+    # other hosts get. Mirrors the engine repo's content/baseoq4/meson.build.
+    shared_library(
       sp_module_name,
       game_sources,
       include_directories : source_inc,
@@ -447,7 +451,9 @@ if get_option('build_mpgame')
       install : false,
     )
   elif is_darwin
-    shared_module(
+    # See the SP module above: darwin needs shared_library for a real
+    # LC_ID_DYLIB install name and a closed undefined-symbol set.
+    shared_library(
       mp_module_name,
       mpgame_sources,
       include_directories : source_inc,
