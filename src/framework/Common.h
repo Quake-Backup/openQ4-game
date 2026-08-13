@@ -192,6 +192,10 @@ struct openq4AsyncTimingStats_t {
 
 void				openQ4_GetAsyncTimingStats( openq4AsyncTimingStats_t &stats, int maxSamples = 60 );
 void				openQ4_BeginPresentationFrame( void );
+// The presentation cap the throttle actually paces to. Callers that budget work
+// against a frame period must use this rather than com_maxfps directly, or their
+// budget and the throttle's period disagree and they sleep away the difference.
+int					openQ4_GetRequestedPresentationCap( void );
 void				openQ4_SetLoadingContinueInputActive( bool active );
 bool				openQ4_AcceptingLoadingContinueInput( void );
 int					openQ4_GetActiveToolFlags( int flags );

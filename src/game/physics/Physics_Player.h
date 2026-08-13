@@ -62,6 +62,12 @@ public:
 
 							// initialisation
 	void					SetSpeed( const float newWalkSpeed, const float newCrouchSpeed );
+// openQ4 BEGIN
+	// Swimming is its own gait, not a fraction of whatever the player was doing on land. idPlayer
+	// works the number out - it is the side that knows about multiplayer, stroggification and
+	// power-ups - and hands it down here.
+	void					SetSwimSpeed( const float newSwimSpeed );
+// openQ4 END
 	void					SetMaxStepHeight( const float newMaxStepHeight );
 	float					GetMaxStepHeight( void ) const;
 	void					SetMaxJumpHeight( const float newMaxJumpHeight );
@@ -139,6 +145,7 @@ private:
 	int						framemsec;
 	float					frametime;
 	float					playerSpeed;
+	float					swimSpeed;			// openQ4: speed while swimming, set by idPlayer::AdjustSpeed
 	idVec3					viewForward;
 	idVec3					viewRight;
 
@@ -157,7 +164,7 @@ private:
 	int						waterType;
 
 private:
-	float					CmdScale( const usercmd_t &cmd ) const;
+	float					CmdScale( const usercmd_t &cmd, bool allowVertical = false ) const;
 	void					Accelerate( const idVec3 &wishdir, const float wishspeed, const float accel );
 	bool					SlideMove( bool gravity, bool stepUp, bool stepDown, bool push );
 	void					Friction( void );

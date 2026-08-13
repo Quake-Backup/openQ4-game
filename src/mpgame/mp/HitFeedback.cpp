@@ -227,7 +227,11 @@ Stages one number.  The caller has already decided the hit is worth showing.
 void rvDamageNumbers::Add( const idVec3 &origin, int damage, int weapon, int flags ) {
 	damageNumber_t *number;
 
-	if ( damage <= 0 ) {
+	// Multiplayer only, and not merely by convention: single player runs game-sp,
+	// which links none of this and registers no hud_damageNumber* cvar.  The test
+	// is here so the same is true of any future caller inside game-mp - the Arena
+	// campaign aside, nothing in this module should stage a plum outside a match.
+	if ( !gameLocal.isMultiplayer || damage <= 0 ) {
 		return;
 	}
 
@@ -305,7 +309,8 @@ void rvDamageNumbers::Draw( const renderView_t *view ) {
 	int		i;
 	float	scale;
 
-	if ( view == NULL || hud_damageNumbers.GetInteger() <= DAMAGENUMBERS_OFF ) {
+	if ( !gameLocal.isMultiplayer || view == NULL ||
+		 hud_damageNumbers.GetInteger() <= DAMAGENUMBERS_OFF ) {
 		return;
 	}
 

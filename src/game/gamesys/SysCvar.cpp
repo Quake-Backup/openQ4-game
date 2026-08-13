@@ -410,6 +410,8 @@ idCVar pm_airTics(					"pm_air",					"1800",			CVAR_GAME | CVAR_NETWORKSYNC | CV
 
 // openQ4 BEGIN
 idCVar pm_waterAirTics(				"pm_waterAir",				"720",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how many 60Hz frames the player can stay submerged before drowning, 720 is Quake 3's twelve seconds" );
+idCVar pm_swimSpeed(				"pm_swimSpeed",				"160",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_FLOAT, "speed the player can swim, 160 is Quake 3's (its 320 run speed times pm_swimScale 0.5)" );
+idCVar pm_swimSpeedFast(			"pm_swimSpeedFast",			"200",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_FLOAT, "swim speed in multiplayer and after stroggification" );
 idCVar g_liquidDamageInterval(		"g_liquidDamageInterval",	"500",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "milliseconds between lava and slime damage ticks" );
 idCVar g_drownDamageMax(			"g_drownDamageMax",			"15",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "maximum damage per drowning tick, the ramp starts at the damage def's value and climbs to this" );
 idCVar g_liquidScreenTint(			"g_liquidScreenTint",		"1",			CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "strength of the full screen tint while the camera is under a liquid surface, 0 disables it", 0.0f, 1.0f );

@@ -6015,7 +6015,10 @@ void idEntity::ServerSendEvent( int eventId, const idBitMsg *msg, bool saveEvent
 	networkSystem->ServerSendReliableMessageExcluding( excludeClient, outMsg );
 
 	if ( saveEvent ) {
-		gameLocal.Error( "Unsupported saveEvent == true in idEntity::ServerSendEvent" );
+		// openQ4: this codebase has no saved-event list, so late-join replay simply does not happen.
+		// Dropping the entire server over a missing cosmetic replay is far worse than missing it, so
+		// warn (naming the entity) and let the event go out to the clients already connected.
+		gameLocal.Warning( "Unsupported saveEvent == true in idEntity::ServerSendEvent for '%s' (%s)", GetName(), GetClassname() );
 	}
 }
 
@@ -6050,7 +6053,9 @@ void idEntity::ServerSendInstanceEvent( int eventId, const idBitMsg *msg, bool s
 	gameLocal.ServerSendInstanceReliableMessageExcluding( this, excludeClient, outMsg );
 
 	if ( saveEvent ) {
-		gameLocal.Error( "Unsupported saveEvent == true in idEntity::ServerSendEvent" );
+		// openQ4: see idEntity::ServerSendEvent - no saved-event list exists, so warn instead of
+		// killing the server, and name the entity that asked for the unsupported replay.
+		gameLocal.Warning( "Unsupported saveEvent == true in idEntity::ServerSendInstanceEvent for '%s' (%s)", GetName(), GetClassname() );
 	}
 }
 

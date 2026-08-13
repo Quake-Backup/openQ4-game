@@ -95,6 +95,8 @@ private:
 	// while the view was visibly submerged.
 	int					LiquidAtEye( const renderView_t *view ) const;
 	void				LiquidOverlay( int liquidContents );
+	float				liquidViewAmount;	// eased 0-1 so breaking the surface does not cut
+	int					liquidViewContents;	// remembered while fading back out
 // openQ4 END
 
 	screenBlob_t *		GetScreenBlob();

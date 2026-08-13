@@ -210,7 +210,17 @@ rvWeaponGauntlet::Attack
 void rvWeaponGauntlet::Attack ( void ) {
 	trace_t		tr;
 	idEntity*	ent;
-	
+	// openQ4: the gauntlet traces itself instead of going through idGameLocal::HitScan, so it
+	// needs its own lag compensation bracket.  Only the trace is rewound, and the restore runs
+	// immediately after it, so none of the early returns below can escape it.
+	idGameLocal::mpLagCompRestore_t	lagCompRestore[ MAX_CLIENTS ];
+	int			lagCompRestoreCount = 0;
+	bool		lagCompApplied = false;
+
+	if ( gameLocal.isServer && gameLocal.isMultiplayer && owner ) {
+		lagCompApplied = gameLocal.BeginMPLagCompensation( owner, lagCompRestore, lagCompRestoreCount );
+	}
+
 	// Cast a ray out to the lock range
 // RAVEN BEGIN
 // ddynerman: multiple clip worlds
@@ -219,6 +229,11 @@ void rvWeaponGauntlet::Attack ( void ) {
 							playerViewOrigin + playerViewAxis[0] * range, 
 							MASK_SHOT_RENDERMODEL, owner );
 // RAVEN END
+
+	if ( lagCompApplied ) {
+		gameLocal.EndMPLagCompensation( lagCompRestore, lagCompRestoreCount );
+	}
+
 	owner->WeaponFireFeedback( &weaponDef->dict );
 
 	if ( tr.fraction >= 1.0f ) {
@@ -300,7 +315,10 @@ void rvWeaponGauntlet::Attack ( void ) {
 		} else {
 			PlayLoopSound( LOOP_NONE );
 		}
-		nextAttackTime = gameLocal.time + fireRate;
+		// openQ4: the gauntlet was the only weapon scheduling its next tick off a bare
+		// fireRate, so Haste never sped up its damage rate even though the melee damage
+		// powerup was already honoured above.
+		nextAttackTime = gameLocal.time + (fireRate * owner->PowerUpModifier ( PMOD_FIRERATE ));
 	}
 }
 

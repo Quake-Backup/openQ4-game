@@ -215,7 +215,17 @@ idCVar hud_inputColor(				"hud_inputColor",			"1 0 0",		CVAR_GAME | CVAR_ARCHIVE
 // Floating damage numbers, ported from Quake Live's damage plums.  Purely a
 // display choice: the server decides only whether it is allowed at all, through
 // g_hitFeedback.
-idCVar hud_damageNumbers(			"hud_damageNumbers",		"0",			CVAR_GAME | CVAR_ARCHIVE | CVAR_INTEGER, "floating damage numbers over the players you hit: 0 off, 1 opponents only, 2 all damage you deal including team mates and yourself", 0, 2 );
+//
+// This is a MULTIPLAYER-ONLY feature and it is declared here, in the mpgame
+// tree, precisely so that it does not exist in single player: game-sp links no
+// part of mp/HitFeedback.cpp and registers no hud_damageNumber* cvar at all.
+// Do not mirror any of this into src/game/.
+//
+// Ships at 1 - the plum only ever describes damage the local player themselves
+// dealt to an opponent, so it tells you nothing you did not earn, and reading a
+// fight without it is strictly harder.  2 additionally shows team mates and
+// self damage, which is diagnostic rather than competitive.
+idCVar hud_damageNumbers(			"hud_damageNumbers",		"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_INTEGER, "floating damage numbers over the players you hit: 0 off, 1 opponents only, 2 all damage you deal including team mates and yourself", 0, 2 );
 idCVar hud_damageNumberStyle(		"hud_damageNumberStyle",	"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_INTEGER, "damage number colouring: 1 white through red across the damage range, 2 one colour per damage band, 3 one colour per weapon", 1, 3 );
 idCVar hud_damageNumberScale(		"hud_damageNumberScale",	"1",			CVAR_GAME | CVAR_ARCHIVE | CVAR_FLOAT, "damage number size multiplier", 0.25f, 4.0f );
 
@@ -501,6 +511,8 @@ idCVar pm_airTics(					"pm_air",					"1800",			CVAR_GAME | CVAR_NETWORKSYNC | CV
 
 // openQ4 BEGIN
 idCVar pm_waterAirTics(				"pm_waterAir",				"720",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "how many 60Hz frames the player can stay submerged before drowning, 720 is Quake 3's twelve seconds" );
+idCVar pm_swimSpeed(				"pm_swimSpeed",				"160",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_FLOAT, "speed the player can swim, 160 is Quake 3's (its 320 run speed times pm_swimScale 0.5)" );
+idCVar pm_swimSpeedFast(			"pm_swimSpeedFast",			"200",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_FLOAT, "swim speed in multiplayer and after stroggification" );
 idCVar g_liquidDamageInterval(		"g_liquidDamageInterval",	"500",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "milliseconds between lava and slime damage ticks" );
 idCVar g_drownDamageMax(			"g_drownDamageMax",			"15",			CVAR_GAME | CVAR_NETWORKSYNC | CVAR_INTEGER, "maximum damage per drowning tick, the ramp starts at the damage def's value and climbs to this" );
 idCVar g_liquidScreenTint(			"g_liquidScreenTint",		"1",			CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "strength of the full screen tint while the camera is under a liquid surface, 0 disables it", 0.0f, 1.0f );
@@ -746,6 +758,20 @@ idCVar pm_powerslide(						"pm_powerslide",					"0.09",			CVAR_GAME | CVAR_FLOAT
 idCVar g_playerLean(						"g_playerLean",						"1",			CVAR_GAME | CVAR_FLOAT | CVAR_ARCHIVE, "scale down or disable client-side player lean" );
 
 idCVar net_clientPredictWeaponSwitch(		"net_clientPredictWeaponSwitch",	"1",			CVAR_GAME | CVAR_BOOL | CVAR_ARCHIVE, "predict weapon switches locally (most noticeable on high ping servers)" );
+
+// openQ4: server side hitscan lag compensation.  Same names, flags and ranges as the
+// single player tree it was ported from - but NOT the same default: the SP copy is
+// dead code (game-sp never runs multiplayer) and still declares "1".
+// This one ships OFF.  The machinery is complete and guarded, but openQ4 clients
+// extrapolate every remote player forward from the relayed user commands rather
+// than interpolating between snapshots, so a server-side rewind can double-count
+// the lead the client already applied.  Turning it on changes hit registration
+// for everybody on the server, so it stays an opt-in until it has been measured
+// against real ping distributions.
+idCVar net_mpLagCompensation(				"net_mpLagCompensation",			"0",			CVAR_GAME | CVAR_BOOL | CVAR_NOCHEAT, "enable server-side multiplayer lag compensation for hitscan traces" );
+idCVar net_mpLagCompMaxMS(					"net_mpLagCompMaxMS",				"200",			CVAR_GAME | CVAR_INTEGER | CVAR_NOCHEAT, "maximum rewind window in milliseconds for multiplayer lag compensation", 0, 1000 );
+idCVar net_mpLagCompBiasMS(					"net_mpLagCompBiasMS",				"0",			CVAR_GAME | CVAR_INTEGER | CVAR_NOCHEAT, "additional rewind bias in milliseconds applied to multiplayer lag compensation", -200, 200 );
+idCVar net_mpLagCompDebug(					"net_mpLagCompDebug",				"0",			CVAR_GAME | CVAR_INTEGER | CVAR_NOCHEAT, "multiplayer lag compensation debug output (0=off, 1=summary, 2=verbose)", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
 
 // Multiplayer bots.  Navigation is generated at map load from the collision
 // world, so none of this needs per-map authoring.

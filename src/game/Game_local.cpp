@@ -9323,6 +9323,41 @@ void idGameLocal::PlayLiquidEffectAt( const char *key, const idVec3 &origin ) {
 
 /*
 ================
+idGameLocal::PlayLiquidTrail
+
+The wake something leaves crossing a liquid: bubbles, not smoke. Smoke does not survive underwater,
+so a projectile trail or a tracer that is drawn there has to be replaced rather than tinted.
+
+Returns false when this liquid has no trail authored, so the caller can fall back to whatever it
+would normally have drawn.
+================
+*/
+bool idGameLocal::PlayLiquidTrail( int liquidContents, const idVec3 &start, const idVec3 &end ) {
+	if ( !liquidContents ) {
+		return false;
+	}
+
+	const idDict *liquidDict = FindEntityDefDict( "liquid_openq4", false );
+	if ( !liquidDict ) {
+		return false;
+	}
+
+	const idDecl *effect = GetEffect( *liquidDict, va( "fx_trail_%s", LiquidTypeName( liquidContents ) ) );
+	if ( !effect ) {
+		return false;
+	}
+
+	idVec3 dir = end - start;
+	if ( dir.Normalize() <= 0.0f ) {
+		dir.Set( 0.0f, 0.0f, 1.0f );
+	}
+
+	PlayEffect( effect, start, dir.ToMat3(), false, end, true );
+	return true;
+}
+
+/*
+================
 idGameLocal::PlayEffect
 
 Plays an effect at the given origin using the given direction
@@ -9797,7 +9832,12 @@ idEntity* idGameLocal::HitScan(
 			if ( tr.fraction >= 1.0f || (tr.c.material && tr.c.material->GetSurfaceFlags() & SURF_NOIMPACT) ) {					
 				PlayEffect( hitscanDict, "fx_path", fxOrigin, dir.ToMat3(), false, tr.endpos, false, EC_IGNORE, hitscanTint );	
 				if ( random.RandomFloat( ) < tracerChance ) {
-					PlayEffect( hitscanDict, "fx_tracer", fxOrigin, dir.ToMat3(), false, tr.endpos );
+// openQ4 BEGIN
+					// a tracer drawn underwater is a line of bubbles, not a streak of smoke
+					if ( !PlayLiquidTrail( LiquidContentsAtPoint( fxOrigin, owner ), fxOrigin, tr.endpos ) ) {
+						PlayEffect( hitscanDict, "fx_tracer", fxOrigin, dir.ToMat3(), false, tr.endpos );
+					}
+// openQ4 END
 					tracer = true;
 				} else {
 					tracer = false;

@@ -396,7 +396,84 @@ void rvGameState::SpawnDeadZonePowerup( void ) {
 		spawnSpot->PostEventMS( &EV_RespawnItem, 0 );
 		spawnSpot->srvReady = 1; // Go ahead and set this, so the loop works properly.
 	} else {
-		gameLocal.Error("Couldn't find enough dead zone spawn spots for the number of dead zone artifacts specified in the map def!");
+		// openQ4: this used to be a gameLocal.Error, which dropped the whole
+		// dedicated server at the instant the match went live just because the map
+		// shipped fewer hidden artifact spawn spots than its decl asks for.  A data
+		// shortfall degrades to fewer artifacts instead.
+		gameLocal.Warning( "Couldn't find enough dead zone spawn spots for the number of dead zone artifacts specified in the map def!" );
+	}
+}
+
+/*
+================
+rvGameState::CountDeadZonePowerupSpawns
+
+How many hidden artifact spawn spots SpawnDeadZonePowerup could still consume.
+Mirrors that function's eligibility test exactly - anything it would skip must
+not be counted here, or the caller asks for one more artifact than exists.
+================
+*/
+int rvGameState::CountDeadZonePowerupSpawns( void ) {
+	idEntity *ent;
+	int count = 0;
+
+	for ( ent = gameLocal.spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next() ) {
+		if ( !ent->IsType( riDeadZonePowerup::GetClassType() ) ) {
+			continue;
+		}
+
+		riDeadZonePowerup* flag;
+		flag = static_cast<riDeadZonePowerup*>(ent);
+		if ( flag->powerup != POWERUP_DEADZONE || flag->IsVisible() ) {
+			continue;
+		}
+
+		// a dropped artifact is removed rather than reused
+		if ( flag->spawnArgs.GetBool("dropped", "0") ) {
+			continue;
+		}
+
+		count++;
+	}
+
+	return count;
+}
+
+/*
+================
+rvGameState::SpawnDeadZonePowerups
+
+Puts out the map's full complement of DeadZone artifacts.  Both the match start
+and the sudden death restart used to carry their own copy of this block.
+================
+*/
+void rvGameState::SpawnDeadZonePowerups( void ) {
+	const char *mapName = gameLocal.serverInfo.GetString( "si_map" );
+	const idDict *mapDict = MultiplayerResolveMapDecl( mapName );
+	if ( mapDict ) {
+		gameLocal.mpGame.deadZonePowerupCount = mapDict->GetInt("deadZonePowerupCount", "3");
+	} else {
+		gameLocal.mpGame.deadZonePowerupCount = 3;
+	}
+
+	int pcount = gameLocal.mpGame.deadZonePowerupCount;
+	if ( pcount == -1 ) {
+		pcount = 3; // Good default.
+	}
+
+	pcount = idMath::ClampInt(1, 12, pcount);
+
+	// openQ4: the decl says how many artifacts the map wants, not how many spawn
+	// spots it actually ships.  Ask for more than exist and the last call finds
+	// nothing left to consume; take what the map has instead.
+	int available = CountDeadZonePowerupSpawns();
+	if ( available < pcount ) {
+		gameLocal.Warning( "map '%s' asks for %d dead zone artifacts but only has %d spawn spots left", mapName, pcount, available );
+		pcount = available;
+	}
+
+	for ( int i = 0; i < pcount; i++ ) {
+		SpawnDeadZonePowerup();
 	}
 }
 
@@ -612,21 +689,7 @@ bool rvGameState::NewState( mpGameState_t newState ) {
 
 			if ( gameLocal.gameType == GAME_DEADZONE ) {
 				// Spawn the powerups!
-				const char *mapName = gameLocal.serverInfo.GetString( "si_map" );
-				const idDict *mapDict = MultiplayerResolveMapDecl( mapName );
-				if ( mapDict )
-					gameLocal.mpGame.deadZonePowerupCount = mapDict->GetInt("deadZonePowerupCount", "3");
-				else
-					gameLocal.mpGame.deadZonePowerupCount = 3;
-
-				int pcount = gameLocal.mpGame.deadZonePowerupCount;
-				if ( pcount == -1 )
-					pcount = 3; // Good default.
-
-				pcount = idMath::ClampInt(1, 12, pcount);
-				for ( int i = 0; i<pcount; i++ ) {
-					SpawnDeadZonePowerup();
-				}
+				SpawnDeadZonePowerups();
 			}
 // RITUAL END
 
@@ -658,6 +721,16 @@ bool rvGameState::NewState( mpGameState_t newState ) {
 				gameLocal.mpGame.ServerWriteInitialReliableMessages( repeaterReliableSender.To( -1 ), ENTITYNUM_NONE );
 			}
 
+			// openQ4: the match is live from here on, and the loop below respawns
+			// everybody.  idPlayer::SpawnToPoint grants the si_warmupWeapons arsenal
+			// whenever GetMPGameState() is WARMUP or COUNTDOWN, so leaving the commit
+			// until the end of this function handed every weapon on the map straight
+			// back to the player it had just been taken from - permanently, because
+			// an MP respawn never clears inventory.weapons.  Publishing the state
+			// here closes that gate before the respawn rather than after it.
+			// (The assignment at the end of NewState then re-applies the same value.)
+			currentState = newState;
+
 			for( i = 0; i < gameLocal.numClients; i++ ) {
 				idEntity *ent = gameLocal.entities[ i ];
 				if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
@@ -665,8 +738,6 @@ bool rvGameState::NewState( mpGameState_t newState ) {
 				}
 				idPlayer *p = static_cast<idPlayer *>( ent );
 				p->SetLeader( false ); // don't carry the flag from previous games
-				gameLocal.mpGame.SetPlayerScore( p, 0 );
-				gameLocal.mpGame.SetPlayerTeamScore( p, 0 );
 				// openQ4: warmup hands out the map's arsenal so the pre-match
 				// period is practice. Take it back now the match is real -
 				// nothing else does, because an MP respawn never clears
@@ -681,6 +752,23 @@ bool rvGameState::NewState( mpGameState_t newState ) {
 						p->ServerSpectate( static_cast<idPlayer *>(ent)->wantSpectate );
 					}
 				}
+			}
+
+			// openQ4: zero the scoreboard AFTER the respawn loop, not inside it.
+			// The state is committed above so the arsenal gate closes before the
+			// respawns, which also means scoring is no longer suppressed during
+			// them - and every MP spawn runs idGameLocal::KillBox, so a player
+			// telefragged by a later client's spawn would otherwise start the
+			// live match on -1.  Resetting last makes the starting line 0 for
+			// everyone regardless of what the spawn wave did.
+			for( i = 0; i < gameLocal.numClients; i++ ) {
+				idEntity *ent = gameLocal.entities[ i ];
+				if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+					continue;
+				}
+				idPlayer *p = static_cast<idPlayer *>( ent );
+				gameLocal.mpGame.SetPlayerScore( p, 0 );
+				gameLocal.mpGame.SetPlayerTeamScore( p, 0 );
 			}
 
 			gameLocal.mpGame.ClearTeamScores();
@@ -788,21 +876,7 @@ bool rvGameState::NewState( mpGameState_t newState ) {
 
 			if ( gameLocal.gameType == GAME_DEADZONE ) {
 				// Spawn the powerups!
-				const char *mapName = gameLocal.serverInfo.GetString( "si_map" );
-				const idDict *mapDict = MultiplayerResolveMapDecl( mapName );
-				if ( mapDict )
-					gameLocal.mpGame.deadZonePowerupCount = mapDict->GetInt("deadZonePowerupCount", "3");
-				else
-					gameLocal.mpGame.deadZonePowerupCount = 3;
-
-				int pcount = gameLocal.mpGame.deadZonePowerupCount;
-				if ( pcount == -1 )
-					pcount = 3; // Good default.
-
-				pcount = idMath::ClampInt(1, 12, pcount);
-				for ( int i = 0; i<pcount; i++ ) {
-					SpawnDeadZonePowerup();
-				}
+				SpawnDeadZonePowerups();
 			}
 // RITUAL END
 
@@ -1237,7 +1311,7 @@ void rvCTFGameState::Clear( void ) {
 		previousGameState->Clear( );
 	}		
 
-	for( int i = 0; i < TEAM_MAX; i++ ) {
+	for( int i = 0; i < MAX_CTF_FLAGS; i++ ) {
 		flagStatus[ i ].state = FS_AT_BASE;
 		flagStatus[ i ].clientNum = -1;
 	}
@@ -1317,7 +1391,10 @@ void rvCTFGameState::PackState( idBitMsg& outMsg ) {
 	// use indexing to pack in info
 	int index = 0;
 
-	for( int i = 0; i < TEAM_MAX; i++ ) {
+	// openQ4: MAX_CTF_FLAGS, not TEAM_MAX - the neutral one flag slot is part of
+	// the index space now.  UnpackState below moves with it; both sides of this
+	// wire format live in this file and ship in the same game library.
+	for( int i = 0; i < MAX_CTF_FLAGS; i++ ) {
 		if( flagStatus[ i ] != ((rvCTFGameState*)previousGameState)->flagStatus[ i ] ) {
 			outMsg.WriteByte( index );
 			outMsg.WriteByte( flagStatus[ i ].state );
@@ -1344,13 +1421,20 @@ void rvCTFGameState::UnpackState( const idBitMsg& inMsg ) {
 	while( inMsg.GetRemainingData() ) {
 		int index = inMsg.ReadByte();
 
-		if( index >= 0 && index < TEAM_MAX ) {
+		if( index >= 0 && index < MAX_CTF_FLAGS ) {
 			flagStatus[ index ].state = (flagState_t)inMsg.ReadByte();
 			flagStatus[ index ].clientNum = inMsg.ReadByte();
-		} else if( index >= TEAM_MAX && index < ( TEAM_MAX + MAX_AP ) ) {
-			apState[ index - TEAM_MAX ] = (apState_t)inMsg.ReadByte();
+		} else if( index >= MAX_CTF_FLAGS && index < ( MAX_CTF_FLAGS + MAX_AP ) ) {
+			apState[ index - MAX_CTF_FLAGS ] = (apState_t)inMsg.ReadByte();
 		} else {
-			gameLocal.Error( "rvCTFGameState::UnpackState() - Unknown data identifier '%d'\n", index );
+			// openQ4: this blob also reaches us from a recorded server demo, and
+			// the index space widened when the neutral one-flag slot got real
+			// storage - so a demo from an older build can land here.  Abandoning
+			// the rest of the delta loses a scoreboard update; killing the process
+			// loses the demo and everything else with it.
+			gameLocal.Warning( "rvCTFGameState::UnpackState() - unknown data identifier '%d', "
+				"ignoring the rest of this state block", index );
+			return;
 		}
 	}
 }
@@ -1397,6 +1481,16 @@ void rvCTFGameState::GameStateChanged( void ) {
 
 	bool noSounds = false;
 
+	// openQ4: deliberately still only the two team flags, even though flagStatus
+	// now has a third slot for the neutral one-flag entity.  Every branch below
+	// reads flagTeam as the team that OWNS the flag ("flagTeam == player->team"
+	// means "my flag"), while the one-flag remap at the top of the loop sets it
+	// to the team that HOLDS it - so feeding the neutral slot through here plays
+	// each announcement to exactly the wrong side, and FS_DROPPED/FS_AT_BASE are
+	// not remapped at all and would push team index 2 into the MP HUD.  Giving
+	// One Flag CTF real flag feedback means reworking the owner/holder sense of
+	// this whole loop; the widened storage below is what stops it corrupting
+	// apState in the meantime.
 	for( int i = 0; i < TEAM_MAX; i++ ) {
 		if( flagStatus[ i ] == ((rvCTFGameState*)previousGameState)->flagStatus[ i ] ) {
 			continue;
@@ -1617,7 +1711,15 @@ void rvCTFGameState::SetFlagState( int flag, flagState_t newState ) {
 		return;
 	}
 
-	assert( gameLocal.isServer && ( flag >= 0 && flag < TEAM_MAX ) && IsType( rvCTFGameState::GetClassType() ) );
+	assert( IsType( rvCTFGameState::GetClassType() ) );
+
+	// openQ4: a real bound.  rvItemCTFFlag::ResetFlag passes -1 for a powerup it
+	// cannot map back to a flag, and the assert this replaces was compiled out of
+	// a release build, so the write landed on whatever follows the table.
+	if ( flag < 0 || flag >= MAX_CTF_FLAGS ) {
+		gameLocal.Warning( "rvCTFGameState::SetFlagState() - flag index %d out of range", flag );
+		return;
+	}
 
 	flagStatus[ flag ].state = newState;
 }
@@ -1628,7 +1730,14 @@ rvCTFGameState::SetFlagCarrier
 ================
 */
 void rvCTFGameState::SetFlagCarrier( int flag, int clientNum ) {
-	assert( gameLocal.isServer && ( flag >= 0 && flag < TEAM_MAX ) && (clientNum >= 0 && clientNum < MAX_CLIENTS) && IsType( rvCTFGameState::GetClassType() ) );
+	assert( gameLocal.isServer && IsType( rvCTFGameState::GetClassType() ) );
+
+	// openQ4: see SetFlagState - the one flag entity carries team == TEAM_MAX and
+	// this used to write past the end of the table with only an assert to catch it.
+	if ( flag < 0 || flag >= MAX_CTF_FLAGS || clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		gameLocal.Warning( "rvCTFGameState::SetFlagCarrier() - flag %d / client %d out of range", flag, clientNum );
+		return;
+	}
 
 	flagStatus[ flag ].clientNum = clientNum;
 }
@@ -1643,7 +1752,7 @@ bool rvCTFGameState::operator==( const rvCTFGameState& rhs ) const {
 		return false;
 	}
 
-	for( int i = 0; i < TEAM_MAX; i++ ) {
+	for( int i = 0; i < MAX_CTF_FLAGS; i++ ) {
 		if( flagStatus[ i ] != rhs.flagStatus[ i ] ) {
 			return false;
 		}
@@ -1666,7 +1775,7 @@ rvCTFGameState::operator=
 rvCTFGameState& rvCTFGameState::operator=( const rvCTFGameState& rhs ) {
 	(rvGameState&)(*this) = (rvGameState&)rhs;
 
-	for( int i = 0; i < TEAM_MAX; i++ ) {
+	for( int i = 0; i < MAX_CTF_FLAGS; i++ ) {
 		flagStatus[ i ] = rhs.flagStatus[ i ];
 	}
 

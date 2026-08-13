@@ -116,6 +116,12 @@ public:
 	void			ReadNetworkInfo( idFile *file, int clientNum );
 
 	void			SpawnDeadZonePowerup();
+// openQ4: the match start used to ask for the map decl's artifact count no
+// matter how many hidden spawn spots the map actually shipped, and running out
+// dropped the server with a fatal error at the exact moment the match went
+// live.  Both the GAMEON and the SUDDENDEATH block go through here now.
+	void			SpawnDeadZonePowerups( void );
+	int				CountDeadZonePowerupSpawns( void );
 
 // openQ4 BEGIN
 // Overtime, carried over from Quake Live.  Quake Live does not run a separate
@@ -231,6 +237,13 @@ struct flagStatus_t {
 	int			clientNum;
 };
 
+// openQ4: One Flag CTF's neutral flag entity carries team == TEAM_MAX, and
+// Item.cpp passes that straight into SetFlagState/SetFlagCarrier.  The table
+// used to be TEAM_MAX entries long, so every write for the neutral flag ran off
+// the end and into apState - no flag announcer, no HUD flag icon, and corrupt
+// DeadZone assault point state.  The neutral flag gets its own slot.
+const int MAX_CTF_FLAGS = TEAM_MAX + 1;
+
 class rvCTFGameState : public rvGameState {
 public:
 					rvCTFGameState( bool allocPrevious = true );
@@ -265,7 +278,7 @@ public:
 	virtual	bool	IsType( gameStateType_t type ) const;
 	static gameStateType_t GetClassType( void );
 private:
-	flagStatus_t	flagStatus[ TEAM_MAX ];	
+	flagStatus_t	flagStatus[ MAX_CTF_FLAGS ];
 	apState_t		apState[ MAX_AP ];
 
 	static gameStateType_t type;
@@ -281,14 +294,21 @@ ID_INLINE int rvCTFGameState::GetAPOwner( int ap ) {
 	return apState[ ap ];
 }
 
+// openQ4: a real bound, not an assert.  ResetFlag() passes -1 for a powerup it
+// does not recognise and the one flag entity passes TEAM_MAX, and the assert is
+// compiled out of a release build - so both used to index outside the table.
 ID_INLINE flagState_t rvCTFGameState::GetFlagState( int flag ) {
-	assert( flag >= 0 && flag < TEAM_MAX );
+	if ( flag < 0 || flag >= MAX_CTF_FLAGS ) {
+		return FS_AT_BASE;
+	}
 
 	return flagStatus[ flag ].state;
 }
 
 ID_INLINE int rvCTFGameState::GetFlagCarrier( int flag ) {
-	assert( flag >= 0 && flag < TEAM_MAX );
+	if ( flag < 0 || flag >= MAX_CTF_FLAGS ) {
+		return -1;
+	}
 
 	return flagStatus[ flag ].clientNum;
 }

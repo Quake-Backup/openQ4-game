@@ -401,6 +401,13 @@ public:
 	int						warmupArsenalRestoreWeapons;
 	bool					warmupArsenalGranted;
 
+	// openQ4: hit feedback staged this server frame, so a hitscan burst reports
+	// one accumulated number instead of one per pellet.
+	idEntityPtr<idPlayer>	hitFeedbackVictim;
+	int						hitFeedbackWeapon;
+	int						hitFeedbackDamage;
+	int						hitFeedbackFlags;
+
 	// the first person view values are always calculated, even
 	// if a third person view is used
 	idVec3					firstPersonViewOrigin;
@@ -595,6 +602,11 @@ public:
  	bool					CanShowWeaponViewmodel		( void ) const;
 
 	void					TriggerHitSound				( bool armor );
+
+	// openQ4: server side hit feedback, accumulated across a frame
+	void					AccumulateHitFeedback		( idPlayer *victim, int weapon, int damage, int hitFlags );
+	void					FlushHitFeedback			( void );
+	void					FlushHitFeedbackState		( void );
 
 	virtual bool			HandleSingleGuiCommand( idEntity *entityGui, idLexer *src );
 	bool					GuiActive( void ) { return focusType == FOCUS_GUI; }
@@ -1051,6 +1063,7 @@ private:
 	void					BobCycle( const idVec3 &pushVelocity );
 	void					EvaluateControls( void );
 	void					AdjustSpeed( void );
+	float					OpenQ4_SwimSpeed( void );		// openQ4: swimming is its own gait
 	void					AdjustBodyAngles( void );
 	void					Move( void );
 	void					SetSpectateOrigin( void );

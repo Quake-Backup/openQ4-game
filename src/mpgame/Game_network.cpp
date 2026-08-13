@@ -398,6 +398,9 @@ void idGameLocal::ServerClientConnect( int clientNum, const char *guid ) {
 	}
 	unreliableMessages[ clientNum ].Init( 0 );
 	userInfo[ clientNum ].Clear();
+	// openQ4: a slot reused by a new player must not inherit the previous
+	// occupant's reliable message cooldowns
+	ResetClientReliableFlood( clientNum );
 	mpGame.ServerClientConnect( clientNum );
 	Printf( "client %d connected.\n", clientNum );
 }
@@ -561,6 +564,10 @@ void idGameLocal::ServerClientDisconnect( int clientNum ) {
 	if ( clientNum == MAX_CLIENTS ) {
 		return;
 	}
+
+	// openQ4: drop this slot's reliable message cooldowns so the next player to
+	// take the slot starts clean
+	ResetClientReliableFlood( clientNum );
 
 	// only drop MP clients if we're in multiplayer and the server isn't going down
 	if ( gameLocal.isMultiplayer && !(gameLocal.isListenServer && clientNum == gameLocal.localClientNum ) ) {
@@ -1283,6 +1290,73 @@ void idGameLocal::NetworkEventWarning( const entityNetEvent_t *event, const char
 
 /*
 ================
+idGameLocal::CountQueuedClientEvents
+openQ4: how many events the given client already has pending in the shared
+event queue.  The queue is server wide, so a sender that can put an unbounded
+number of events in it starves every other client.
+================
+*/
+int idGameLocal::CountQueuedClientEvents( int clientNum ) {
+	int count = 0;
+
+	for ( const entityNetEvent_t *event = eventQueue.Start(); event; event = event->next ) {
+		if ( event->sender == clientNum ) {
+			count++;
+		}
+	}
+
+	return count;
+}
+
+/*
+================
+idGameLocal::CheckClientReliableFlood
+openQ4: returns true when the client may send another message of this flood
+class right now, stamping the time as it does so.  A false result means the
+message must be dropped outright - queueing it for later would only delay the
+flood rather than stop it.
+================
+*/
+bool idGameLocal::CheckClientReliableFlood( int clientNum, int floodClass, int delayMS ) {
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		// server generated traffic, or the repeater; not rate limited
+		return true;
+	}
+	if ( floodClass < 0 || floodClass >= RELIABLE_FLOOD_NUM ) {
+		return true;
+	}
+
+	const int last = clientReliableFloodTime[ clientNum ][ floodClass ];
+
+	// a map restart winds gameLocal.time back, so a stamp in the future is
+	// stale rather than a cooldown - only enforce while it is in the past
+	if ( time >= last && time - last < delayMS ) {
+		return false;
+	}
+
+	clientReliableFloodTime[ clientNum ][ floodClass ] = time;
+	return true;
+}
+
+/*
+================
+idGameLocal::ResetClientReliableFlood
+openQ4: clear a client slot's flood cooldowns so a slot reused by a new player
+does not inherit the previous occupant's throttle.
+================
+*/
+void idGameLocal::ResetClientReliableFlood( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+
+	for ( int i = 0; i < RELIABLE_FLOOD_NUM; i++ ) {
+		clientReliableFloodTime[ clientNum ][ i ] = RELIABLE_FLOOD_NEVER;
+	}
+}
+
+/*
+================
 idGameLocal::ServerProcessEntityNetworkEventQueue
 ================
 */
@@ -1302,6 +1376,20 @@ void idGameLocal::ServerProcessEntityNetworkEventQueue( void ) {
 			
 		if ( !entPtr.SetSpawnId( event->spawnId ) ) {
 			NetworkEventWarning( event, "Entity does not exist any longer, or has not been spawned yet." );
+		// openQ4: SetSpawnId only compares the spawn counter, and a freed slot
+		// holds -1, so a forged id with every high bit set resolves "successfully"
+		// to a NULL entity.  Reject that here rather than letting the dispatch
+		// below dereference it - the assert is compiled out of a release build.
+		} else if ( entPtr.GetEntity() == NULL ) {
+			NetworkEventWarning( event, "Entity does not exist any longer, or has not been spawned yet." );
+		// openQ4: the spawnId came off the wire.  Every client->server event is
+		// sent by an entity for itself - idEntity::ClientSendEvent always writes
+		// gameLocal.GetSpawnId( this ), and the only senders are idPlayer's own
+		// EVENT_IMPULSE and EVENT_EMOTE - so an event naming any other entity is
+		// a forged spawn id.  Without this check a modified client can drive
+		// PerformImpulse on any other player.
+		} else if ( event->sender >= 0 && ( event->sender >= MAX_CLIENTS || entPtr.GetEntity() != entities[ event->sender ] ) ) {
+			NetworkEventWarning( event, "client %d sent an event for an entity it does not own", event->sender );
 		} else {
 			ent = entPtr.GetEntity();
 			assert( ent );
@@ -1363,15 +1451,38 @@ void idGameLocal::ServerProcessReliableMessage( int clientNum, const idBitMsg &m
 			char text[128];
 			char parm[128];
 
+			// openQ4: every accepted chat line is rebroadcast to all clients, so
+			// an unthrottled sender fills the other clients' reliable queues and
+			// the engine disconnects the victims.  Drop, do not queue.
+			if ( !CheckClientReliableFlood( clientNum,
+				( id == GAME_RELIABLE_MESSAGE_TCHAT ) ? RELIABLE_FLOOD_TCHAT : RELIABLE_FLOOD_CHAT,
+				RELIABLE_FLOOD_CHAT_DELAY ) ) {
+				break;
+			}
+
 			msg.ReadString( name, sizeof( name ) );
 			msg.ReadString( text, sizeof( text ) );
 			// This parameter is ignored - it is only used when going to client from server
 			msg.ReadString( parm, sizeof( parm ) );
 
+			// openQ4: the display name arrived on the sender's own packet and is
+			// formatted straight into the broadcast, so a modified client could
+			// impersonate another player or the server.  Use the server's copy of
+			// the sender's userinfo instead of anything it told us.
+			if ( clientNum >= 0 && clientNum < MAX_CLIENTS ) {
+				const char *serverName = userInfo[ clientNum ].GetString( "ui_name" );
+				idStr::Copynz( name, ( serverName && *serverName ) ? serverName : "player", sizeof( name ) );
+			}
+
 			mpGame.ProcessChatMessage( clientNum, id == GAME_RELIABLE_MESSAGE_TCHAT, name, text, NULL, true );
 			break;
 		}
 		case GAME_RELIABLE_MESSAGE_VCHAT: {
+			// openQ4: voice chat is rebroadcast the same way chat is
+			if ( !CheckClientReliableFlood( clientNum, RELIABLE_FLOOD_VCHAT, RELIABLE_FLOOD_VCHAT_DELAY ) ) {
+				break;
+			}
+
 			int index = msg.ReadLong();
 			bool team = msg.ReadBits( 1 ) != 0;
 			mpGame.ProcessVoiceChat( clientNum, team, index );
@@ -1421,19 +1532,46 @@ void idGameLocal::ServerProcessReliableMessage( int clientNum, const idBitMsg &m
 
 			event->spawnId = msg.ReadBits( 32 );
 			event->event = msg.ReadByte();
-			event->time = msg.ReadLong();
+			// openQ4: the wire carries the sender's own gameLocal.time here, and
+			// that value is the ordering key of the server wide event queue -
+			// a client sending 0 makes Enqueue's OUTOFORDER_DROP delete everyone
+			// else's queued events, and 0x7FFFFFFF parks an event at the head
+			// that the drain loop never passes.  Read it to keep the wire format
+			// intact, then discard it and stamp the arrival time server side.
+			msg.ReadLong();
+			event->time = time;
+			// openQ4: remember who claimed this spawnId so the drain loop can
+			// prove the event targets the sender's own entity.
+			event->sender = clientNum;
 
-			eventQueue.Enqueue( event, idEventQueue::OUTOFORDER_DROP );
-
+			// openQ4: validate and enqueue at the end rather than enqueueing the
+			// event first and abandoning it on a bad param size.  Nothing was
+			// unsafe about the original order - the drain clamps through
+			// idBitMsg::SetSize - but a rejected event stayed in the queue where
+			// it still counted against the per sender cap added below.
 			event->paramsSize = msg.ReadBits( idMath::BitsForInteger( MAX_EVENT_PARAM_SIZE ) );
 			if ( event->paramsSize ) {
 				if ( event->paramsSize > MAX_EVENT_PARAM_SIZE ) {
 					NetworkEventWarning( event, "invalid param size" );
-					return;
+					eventQueue.Free( event );
+					break;
 				}
 				msg.ReadByteAlign();
 				msg.ReadData( event->paramsBuf, event->paramsSize );
 			}
+
+			// openQ4: cap the queue share of a single sender.  Log the drop at the
+			// same rate the chat flood limiter uses, otherwise the client that is
+			// flooding decides how fast the server writes to its console and log.
+			if ( CountQueuedClientEvents( clientNum ) >= MAX_CLIENT_QUEUED_EVENTS ) {
+				if ( CheckClientReliableFlood( clientNum, RELIABLE_FLOOD_EVENT, RELIABLE_FLOOD_EVENT_DELAY ) ) {
+					Warning( "Dropping network events from client %d: already has %d queued", clientNum, MAX_CLIENT_QUEUED_EVENTS );
+				}
+				eventQueue.Free( event );
+				break;
+			}
+
+			eventQueue.Enqueue( event, idEventQueue::OUTOFORDER_DROP );
 			break;
 		}
 
@@ -1494,6 +1632,13 @@ void idGameLocal::ServerProcessReliableMessage( int clientNum, const idBitMsg &m
 // RAVEN END
 
 		case GAME_RELIABLE_MESSAGE_GETVOTEMAPS: {
+			// openQ4: SendMapList is an 8 KB reliable send back to the caller;
+			// repeated requests overflow that client's own reliable queue and
+			// stall the server writing them
+			if ( !CheckClientReliableFlood( clientNum, RELIABLE_FLOOD_VOTEMAPS, RELIABLE_FLOOD_VOTEMAPS_DELAY ) ) {
+				break;
+			}
+
 			mpGame.SendMapList( clientNum );
 			break;
 		}
@@ -2508,6 +2653,9 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			event->spawnId = msg.ReadBits( 32 );
 			event->event = msg.ReadByte();
 			event->time = msg.ReadLong();
+			// openQ4: server originated, so there is no sending client to
+			// attribute it to.  idEventQueue::Alloc does not zero the struct.
+			event->sender = -1;
 
 			eventQueue.Enqueue( event, idEventQueue::OUTOFORDER_IGNORE );
 
@@ -2694,6 +2842,17 @@ void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &m
 			break;
 		}
 		case GAME_RELIABLE_MESSAGE_STAT: {
+			// openQ4: rvStatManager::ReceiveStat re-reads the client byte itself
+			// and indexes playerStats[] with it unchecked, so bound check it here
+			// without disturbing the read position.
+			int savedReadCount, savedReadBit;
+			msg.SaveReadState( savedReadCount, savedReadBit );
+			const int statClient = msg.ReadByte();
+			msg.RestoreReadState( savedReadCount, savedReadBit );
+			if ( statClient < 0 || statClient >= MAX_CLIENTS ) {
+				Warning( "Ignoring stat message for invalid client num %d", statClient );
+				break;
+			}
 			statManager->ReceiveStat( msg );
 			break;
 		}

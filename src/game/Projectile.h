@@ -99,6 +99,7 @@ protected:
 	rvSphericalInterpolate	rotation;
 
 	rvClientEffectPtr		flyEffect;
+	bool					flyEffectIsLiquid;	// openQ4: the fly trail is currently a bubble trail
 	float					flyEffectAttenuateSpeed;
 
 	int						bounceCount;

@@ -282,10 +282,17 @@ int main() {
 	CHECK( AppliedOnce( session.RequestResumeByTeam( 0,
 		session.GetSessionRevision() ) ) );
 	CHECK( !session.AdvanceFrame( mpMatchEngineTime::FromMilliseconds( 1799 ) ).WasApplied() );
+	// Mirror of the rule above: the frame that COMMITS a pause is suppressed and
+	// is not accrued, and the frame that COMPLETES a resume is simulated and so
+	// must be accrued.  The 1ms 1799->1800 frame completes the resume and counts
+	// (1500 -> 1501); the 1800->1900 frame then adds its full 100ms.  Accruing
+	// against the pre-transition state instead loses one frame per pause cycle,
+	// which is enough to deny a tied timed match its configured overtime.
 	CHECK( AppliedOnce( session.AdvanceFrame( mpMatchEngineTime::FromMilliseconds( 1800 ) ) ) );
 	CHECK( session.GetPause().state == MP_MATCH_PAUSE_RUNNING );
+	CHECK( session.GetMatchTime().Milliseconds() == 1501 );
 	CHECK( !session.AdvanceFrame( mpMatchEngineTime::FromMilliseconds( 1900 ) ).WasApplied() );
-	CHECK( session.GetMatchTime().Milliseconds() == 1600 );
+	CHECK( session.GetMatchTime().Milliseconds() == 1601 );
 
 	CHECK( AppliedOnce( session.TransitionRound( RS_COMPLETE,
 		MP_MATCH_ROUND_TRANSITION_RESULT_COMMITTED, session.GetSessionRevision() ) ) );

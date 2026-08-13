@@ -277,6 +277,17 @@ void rvWeaponLightningGun::Think ( void ) {
 		return;
 	}
 
+	// openQ4: the lightning gun traces itself instead of going through idGameLocal::HitScan,
+	// so it needs its own lag compensation bracket around the target selection traces.  There
+	// is no early return between the Begin and the End below, so the restore always runs.
+	idGameLocal::mpLagCompRestore_t	lagCompRestore[ MAX_CLIENTS ];
+	int		lagCompRestoreCount = 0;
+	bool	lagCompApplied = false;
+
+	if ( gameLocal.isServer && gameLocal.isMultiplayer && owner ) {
+		lagCompApplied = gameLocal.BeginMPLagCompensation( owner, lagCompRestore, lagCompRestoreCount );
+	}
+
 	// Cast a ray out to the lock range
 // RAVEN BEGIN
 // ddynerman: multiple clip worlds
@@ -304,6 +315,10 @@ void rvWeaponLightningGun::Think ( void ) {
 	currentPath.target = gameLocal.entities[tr.c.entityNum];
 
 	UpdateChainLightning();
+
+	if ( lagCompApplied ) {
+		gameLocal.EndMPLagCompensation( lagCompRestore, lagCompRestoreCount );
+	}
 	
 	UpdateEffects( origin );
 	

@@ -1464,6 +1464,11 @@ idPlayer::idPlayer() {
 	warmupArsenalRestoreWeapons = 0;
 	warmupArsenalGranted	= false;
 
+	hitFeedbackVictim		= NULL;
+	hitFeedbackWeapon		= -1;
+	hitFeedbackDamage		= 0;
+	hitFeedbackFlags		= 0;
+
 	firstPersonViewOrigin	= vec3_zero;
 	firstPersonViewAxis		= mat3_identity;
 
@@ -3235,6 +3240,10 @@ void idPlayer::Restart( void ) {
 	}
 
 	lastKiller = NULL;
+	// openQ4: a hit staged by a projectile or splash lands after this player's own
+	// think and is published on the next one.  If a restart happens in that window
+	// the plum would be positioned from the victim's NEW location, so drop it.
+	FlushHitFeedbackState();
 	useInitialSpawns = true;
 }
 
@@ -3374,6 +3383,12 @@ void idPlayer::SpawnToPoint( const idVec3 &spawn_origin, const idAngles &spawn_a
 	respawning = true;
 
 	Init();
+
+	// openQ4: a respawn teleports the player, so every position the lag
+	// compensation recorded for them is now a lie about where they can be shot.
+	if ( gameLocal.isServer ) {
+		gameLocal.InvalidateMPLagCompensationHistory( entityNumber );
+	}
 
 	// Force players to use bounding boxes when in multiplayer
 	if ( gameLocal.isMultiplayer ) {
@@ -9032,8 +9047,9 @@ void idPlayer::UpdateAir( void ) {
 	}
 
 	if ( g_debugLiquid.GetBool() && drowning && ( gameLocal.framenum % 60 ) == 0 ) {
-		gameLocal.Printf( "liquid: submerged, air %d/%d draining %d per frame, health %d\n",
-					   airTics, pm_airTics.GetInteger(), airDrain, health );
+		gameLocal.Printf( "liquid: submerged, air %d/%d draining %d per frame, health %d, speed %.1f\n",
+					   airTics, pm_airTics.GetInteger(), airDrain, health,
+					   GetPhysics()->GetLinearVelocity().Length() );
 	}
 // openQ4 END
 
@@ -9938,6 +9954,37 @@ void idPlayer::EvaluateControls( void ) {
 idPlayer::AdjustSpeed
 ==============
 */
+// openQ4 BEGIN
+/*
+==============
+idPlayer::OpenQ4_SwimSpeed
+
+Swimming is its own gait rather than a fraction of whatever the player was doing on land.
+
+Quake 3 swims at 160 units a second - its 320 run speed times pm_swimScale 0.5 - and openQ4 runs at
+160, so matching Quake 3 means the two happen to be the same number here. That is a consequence of
+Quake 4's slower footspeed, not a coincidence worth hiding: pm_swimSpeed states the target directly
+in units so it can be read against Q3 without doing arithmetic first.
+
+Multiplayer and a stroggified player get pm_swimSpeedFast instead - the strogg body is the campaign's
+own "you are faster now" moment, and multiplayer has always wanted more pace than the campaign.
+==============
+*/
+float idPlayer::OpenQ4_SwimSpeed( void ) {
+	float speed = ( gameLocal.isMultiplayer || isStrogg )
+				? pm_swimSpeedFast.GetFloat()
+				: pm_swimSpeed.GetFloat();
+
+	// carry the same modifiers the running speed gets, so haste still helps in water
+	speed *= PowerUpModifier( PMOD_SPEED );
+
+	if ( influenceActive == INFLUENCE_LEVEL3 ) {
+		speed *= 0.33f;
+	}
+	return speed;
+}
+// openQ4 END
+
 void idPlayer::AdjustSpeed( void ) {
 	float speed;
 
@@ -9962,6 +10009,10 @@ void idPlayer::AdjustSpeed( void ) {
 	}
 
 	physicsObj.SetSpeed( speed, pm_crouchspeed.GetFloat() );
+
+// openQ4 BEGIN
+	physicsObj.SetSwimSpeed( OpenQ4_SwimSpeed() );
+// openQ4 END
 }
 
 /*
@@ -10989,6 +11040,13 @@ void idPlayer::Think( void ) {
 		inBuyZone = false;
 
 	inBuyZonePrev = false;
+
+	// openQ4: publish the hits landed this frame as a single message.  Hitscan
+	// damage is applied from inside UpdateWeapon above, so a whole pellet burst
+	// has already been staged by the time we get here.
+	if ( gameLocal.isMultiplayer && !gameLocal.isClient ) {
+		FlushHitFeedback();
+	}
 }
 
 void idPlayer::ThinkMatchPaused( int deltaMsec ) {
@@ -11445,6 +11503,12 @@ void idPlayer::CalcDamagePoints( idEntity *inflictor, idEntity *attacker, const 
  		&& player != this		// you get self damage no matter what
  		&& player->team == team ) {
  			damage = 0;
+ 			// openQ4: the armour save is computed above, before this test, and
+ 			// idPlayer::Damage subtracts it from inventory.armor unconditionally.
+ 			// Zeroing only the health component let a team mate silently drain
+ 			// your armour to nothing with si_teamDamage off.  Self damage still
+ 			// burns your own armour: this branch never fires for player == this.
+ 			armorSave = 0;
  	}
 
 	*health = damage;
@@ -11600,7 +11664,14 @@ void idPlayer::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &di
  	// inform the attacker that they hit someone
  	attacker->DamageFeedback( this, inflictor, damage );
 	
-	if( gameLocal.isMultiplayer ) {
+	// openQ4: in multiplayer the body stays damageable after death - fl.takedamage
+	// is left alone above - so latch the health from before this hit is applied.
+	// Without it every extra pellet of the blast that killed someone reported
+	// another kill marker, another damage plum and more damage dealt against a
+	// corpse.  idPlayer::DamageFeedback already gates the hit sound this way.
+	const int preDamageHealth = health;
+
+	if( gameLocal.isMultiplayer && preDamageHealth > 0 ) {
 		idEntity* attacker = NULL;
 
 		int methodOfDeath = -1;
@@ -11634,11 +11705,19 @@ void idPlayer::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &di
 		if ( armorSave > 0 ) {
 			hitFlags |= HITFLAG_ARMOR;
 		}
-		if ( health - damage <= 0 && !undying ) {
+		if ( preDamageHealth - damage <= 0 && !undying ) {
 			hitFlags |= HITFLAG_KILL;
 		}
 
-		rvDamageNumbers::ServerSend( this, attacker, methodOfDeath, damage + armorSave, hitFlags );
+		// openQ4: hitscan weapons apply damage once per pellet - the shotgun
+		// fires eleven - so publishing here would be eleven unreliable
+		// messages, eleven hit marker re-arms and eleven jittered plums for
+		// one trigger pull.  Hand the hit to the attacker instead; they flush
+		// a single accumulated message at the end of their think, which for
+		// hitscan is the same frame the pellets were traced in.
+		if ( attacker != NULL && attacker->IsType( idPlayer::GetClassType() ) ) {
+			static_cast< idPlayer * >( attacker )->AccumulateHitFeedback( this, methodOfDeath, damage + armorSave, hitFlags );
+		}
 	}
 		
 // RAVEN BEGIN
@@ -12733,6 +12812,67 @@ void idPlayer::TriggerHitSound( bool armor ) {
 		}
 
 	}
+}
+
+/*
+=============
+idPlayer::AccumulateHitFeedback
+
+openQ4: stages one hit this player landed.  Damage is applied per pellet, so a
+single shotgun blast arrives here eleven times; holding it until the end of the
+frame turns that into one message, one hit marker and one number.  Only one hit
+is pending at a time - a different victim or a different weapon is a different
+number on the screen, so the pending one is published first.
+=============
+*/
+void idPlayer::AccumulateHitFeedback( idPlayer *victim, int weapon, int damage, int hitFlags ) {
+	if ( gameLocal.isClient || !gameLocal.isMultiplayer || victim == NULL || damage <= 0 ) {
+		return;
+	}
+
+	if ( hitFeedbackVictim.GetEntity() != victim || hitFeedbackWeapon != weapon ) {
+		FlushHitFeedback();
+	}
+
+	hitFeedbackVictim	= victim;
+	hitFeedbackWeapon	= weapon;
+	hitFeedbackDamage	+= damage;
+	hitFeedbackFlags	|= hitFlags;
+}
+
+/*
+=============
+idPlayer::FlushHitFeedback
+
+openQ4: publishes whatever AccumulateHitFeedback has staged.  Called at the end
+of this player's think, which for hitscan is the same frame the shot was traced
+in: the whole burst is applied from inside UpdateWeapon above this point.
+=============
+*/
+void idPlayer::FlushHitFeedback( void ) {
+	idPlayer *victim = hitFeedbackVictim.GetEntity();
+
+	if ( victim != NULL && hitFeedbackDamage > 0 ) {
+		rvDamageNumbers::ServerSend( victim, this, hitFeedbackWeapon, hitFeedbackDamage, hitFeedbackFlags );
+	}
+
+	FlushHitFeedbackState();
+}
+
+/*
+=============
+idPlayer::FlushHitFeedbackState
+
+openQ4: discard whatever is staged without publishing it.  Used wherever the
+world moves under a pending hit - a respawn or a round restart - because
+rvDamageNumbers::ServerSend samples the victim's position at publish time.
+=============
+*/
+void idPlayer::FlushHitFeedbackState( void ) {
+	hitFeedbackVictim	= NULL;
+	hitFeedbackWeapon	= -1;
+	hitFeedbackDamage	= 0;
+	hitFeedbackFlags	= 0;
 }
 
 /*

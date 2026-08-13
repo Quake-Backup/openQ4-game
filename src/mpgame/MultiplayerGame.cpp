@@ -88,6 +88,28 @@ static mpMatchItemTimingKind_t CompetitiveItemTimingKind( const idItem *item ) {
 	return MP_MATCH_ITEM_TIMING_KIND_INVALID;
 }
 
+// openQ4: the timing registry has a fixed slot count, so an item-dense map can
+// exhaust it before the items a match is actually timed around are ever seen.
+// Lower is registered first: powerups and mega health, then heavy armour, then
+// the rest.  Kinds which never reach the registry sort last.
+static int CompetitiveItemTimingPriority( mpMatchItemTimingKind_t kind ) {
+	switch ( kind ) {
+		case MP_MATCH_ITEM_TIMING_KIND_QUAD_DAMAGE:
+		case MP_MATCH_ITEM_TIMING_KIND_HASTE:
+		case MP_MATCH_ITEM_TIMING_KIND_REGENERATION:
+		case MP_MATCH_ITEM_TIMING_KIND_INVISIBILITY:
+		case MP_MATCH_ITEM_TIMING_KIND_MEGA_HEALTH:
+			return 0;
+		case MP_MATCH_ITEM_TIMING_KIND_LARGE_ARMOR:
+			return 1;
+		case MP_MATCH_ITEM_TIMING_KIND_SMALL_ARMOR:
+			return 2;
+		default:
+			return 3;
+	}
+}
+static const int COMPETITIVE_ITEM_TIMING_PRIORITY_COUNT = 3;
+
 static float CompetitiveItemRespawnSeconds( const idItem *item ) {
 	if ( item == NULL || item->spawnArgs.GetBool( "dropped" ) ||
 		item->spawnArgs.GetBool( "no_respawn" ) ||
@@ -230,6 +252,14 @@ int CompareTeamsByScore( const void* left, const void* right ) {
 	return ((const rvPair<int, int>*)right)->Second() -
 	 		((const rvPair<int, int>*)left)->Second();
 }
+
+// openQ4: how long a caller must wait after its own vote's deadline before it
+// may call another one.  Measured from the deadline, not from the resolution,
+// so passing a vote is never punished harder than failing one.
+static const int VOTE_CALL_COOLDOWN_TIME = 30000;
+
+// How often a client that keeps calling votes during its cooldown is told so.
+static const int VOTE_REJECT_NOTICE_INTERVAL = 5000;
 
 /*
 ================
@@ -1120,6 +1150,11 @@ idMultiplayerGame::idMultiplayerGame() {
 	memset( lastMatchRequestId, 0, sizeof( lastMatchRequestId ) );
 	memset( lastMatchRequestResultValid, 0, sizeof( lastMatchRequestResultValid ) );
 	memset( matchOperationNextAllowedTime, 0, sizeof( matchOperationNextAllowedTime ) );
+	memset( nextVoteAllowedTime, 0, sizeof( nextVoteAllowedTime ) );
+	memset( nextVoteRejectNoticeTime, 0, sizeof( nextVoteRejectNoticeTime ) );
+	mapListTruncationWarned = false;
+	matchItemTimingFullWarned = false;
+	currentStatClientNum = -1;
 	competitiveRulesValidForSession = false;
 	competitiveRulesInitialized = false;
 	competitiveRulesFailure = MP_RULE_VALID;
@@ -1989,6 +2024,11 @@ void idMultiplayerGame::ObserveCompetitiveItemState( const idItem *item,
 		mutation.reason != MP_MATCH_ITEM_TIMING_REASON_CAPACITY ) {
 		gameLocal.Warning( "competitive item timing rejected entity %d (reason %d)",
 			item->entityNumber, mutation.reason );
+	} else if ( mutation.WasRejected() && !matchItemTimingFullWarned ) {
+		// openQ4: a capacity rejection is otherwise silent, so an operator had no way
+		// to learn that the map carries more tracked items than the registry can hold
+		matchItemTimingFullWarned = true;
+		gameLocal.Warning( "competitive item timing registry is full - this map has more tracked items than the registry can hold, the remainder will have no timer" );
 	}
 }
 
@@ -2016,13 +2056,20 @@ void idMultiplayerGame::InitializeMatchItemTimingObservations( void ) {
 		!matchItemTiming.IsInitialized() ) {
 		return;
 	}
-	for ( int entityNumber = 0; entityNumber < MAX_GENTITIES; ++entityNumber ) {
-		idEntity *entity = gameLocal.entities[ entityNumber ];
-		if ( entity == NULL || !entity->IsType( idItem::GetClassType() ) ) {
-			continue;
-		}
-		const idItem *item = static_cast<const idItem *>( entity );
-		if ( !item->IsHidden() ) {
+	// openQ4: register by competitive importance rather than by entity number.  The
+	// initial scan used to walk entities from index 0, so on an item-dense map the
+	// registry filled with armour shards and the quad or mega never got a timer.
+	for ( int priority = 0; priority < COMPETITIVE_ITEM_TIMING_PRIORITY_COUNT; ++priority ) {
+		for ( int entityNumber = 0; entityNumber < MAX_GENTITIES; ++entityNumber ) {
+			idEntity *entity = gameLocal.entities[ entityNumber ];
+			if ( entity == NULL || !entity->IsType( idItem::GetClassType() ) ) {
+				continue;
+			}
+			const idItem *item = static_cast<const idItem *>( entity );
+			if ( item->IsHidden() || CompetitiveItemTimingPriority(
+				CompetitiveItemTimingKind( item ) ) != priority ) {
+				continue;
+			}
 			ObserveCompetitiveItemAvailable( item );
 		}
 	}
@@ -2864,7 +2911,15 @@ bool idMultiplayerGame::BuildMatchView( int clientNum, mpSessionView &view ) con
 					}
 					break;
 				case MP_MATCH_OP_TIMEOUT_REQUEST:
-					if ( pause.state != MP_MATCH_PAUSE_RUNNING ||
+					// openQ4: COUNTDOWN is a legal phase for this opcode at the
+					// descriptor now, so the phase mask alone no longer answers
+					// "can this side call a timeout right now" - the rule does.
+					// Without this the default ruleset (live play only) shows an
+					// enabled Timeout control all through the countdown and the
+					// server then refuses it with WRONG_PHASE.
+					if ( ( matchSession.GetPhase() == COUNTDOWN &&
+							!matchSession.IsTimeoutAllowedDuringCountdown() ) ||
+						pause.state != MP_MATCH_PAUSE_RUNNING ||
 						( localOperator || refereeRecipient ?
 							( matchSession.GetTimeoutBudget( 0 ).remaining <= 0 &&
 								matchSession.GetTimeoutBudget( 1 ).remaining <= 0 ) :
@@ -6946,7 +7001,13 @@ mpMatchTeamsPolicy_t idMultiplayerGame::BuildMatchTeamsPolicy( void ) const {
 		matchRules.Committed().GetInteger( MP_RULE_ROSTER_SIZE_PER_TEAM ) > 0;
 	policy.invitationBypassesLock = true;
 	policy.requireInvitationForSubstitution = true;
-	policy.allowLiveJoin = false;
+	// openQ4: Red Rover's entire rule is that a killed player changes side mid-round.
+	// The join evaluation's phase gate refused that while the match was live, and the
+	// user info correction below wrote the old side straight back over ui_team, so the
+	// mode could not work under a managed match at all.  Permit the live side change
+	// for gametypes which declare GTF_TEAMSWAP, and only for those.
+	const bool teamSwapGameType = MPGameTypeHasAny( gameLocal.gameType, GTF_TEAMSWAP );
+	policy.allowLiveJoin = teamSwapGameType;
 	policy.allowLiveSubstitution = false;
 	const int serverCapacity = idMath::ClampInt( 1, MAX_CLIENTS,
 		gameLocal.serverInfo.GetInt( "si_maxPlayers", "12" ) );
@@ -6955,6 +7016,15 @@ mpMatchTeamsPolicy_t idMultiplayerGame::BuildMatchTeamsPolicy( void ) const {
 		MP_RULE_ROSTER_SIZE_PER_TEAM );
 	policy.maximumActivePerSide = policy.teamMode ?
 		( rosterSize > 0 ? rosterSize : Max( 1, serverCapacity / 2 ) ) : 0;
+	if ( teamSwapGameType && policy.teamMode ) {
+		// A swap mode legitimately ends up lopsided, and in Red Rover one side
+		// holding everybody IS the win condition - so the per-side bound has to
+		// be the whole active total or the final swap of the round is refused on
+		// a full server.  Note this does also let ordinary joins stack a side,
+		// but not durably: an empty side ends the round immediately and
+		// rvRedRoverGameState::PrepareNextRound reshuffles for the next one.
+		policy.maximumActivePerSide = policy.maximumActiveTotal;
+	}
 	return policy;
 }
 
@@ -8920,6 +8990,7 @@ void idMultiplayerGame::Reset() {
 //asalmon: Need to refresh stats periodically if the player is looking at stats
 	currentStatClient = -1;
 	currentStatTeam = 0;
+	currentStatClientNum = -1;
 
 	iconManager->Shutdown();
 
@@ -8941,6 +9012,8 @@ idMultiplayerGame::ServerClientConnect
 void idMultiplayerGame::ServerClientConnect( int clientNum ) {
 	if ( clientNum >= 0 && clientNum < MAX_CLIENTS ) {
 		ClearMatchOperationTransportSlot( clientNum );
+		// openQ4: the vote cool-off belongs to the connection, never to the slot
+		ResetVoteCooldownSlot( clientNum );
 		if ( nextMatchConnectionId == UINT64_MAX ) {
 			gameLocal.Error( "competitive connection identity exhausted" );
 		}
@@ -9002,6 +9075,8 @@ void idMultiplayerGame::Clear() {
 	voteTimeOut = 0;
 	voteExecTime = 0;
 	voteEligibleCount = 0;
+	memset( nextVoteAllowedTime, 0, sizeof( nextVoteAllowedTime ) );
+	memset( nextVoteRejectNoticeTime, 0, sizeof( nextVoteRejectNoticeTime ) );
 	clientMatchView.Clear();
 	clientMatchViewValid = false;
 	clientMatchControlModel.Clear();
@@ -9093,6 +9168,8 @@ void idMultiplayerGame::Clear() {
 
 	voteMapDecls.Clear();
 	voteMapsWaiting = 0;
+	mapListTruncationWarned = false;
+	matchItemTimingFullWarned = false;
 
 	for ( i = 0; i < MPLIGHT_MAX; i ++ ) {
 		FreeLight( i );
@@ -10009,6 +10086,17 @@ const char* idMultiplayerGame::BuildSummaryListString( idPlayer* player, int ran
 	// track top 3 accuracies
 	rvPlayerStat* stat = statManager->GetPlayerStat( player->entityNumber );
 	idList<rvPair<int, float> > bestAccuracies;
+
+	// openQ4: GetPlayerStat is bounded now, so a player outside the client range -
+	// the fake TV client sits at ENTITYNUM_NONE - gets NULL rather than a read off
+	// the end of the table.  Every other call site already checks.
+	if( stat == NULL ) {
+		return va( "%d. %s\t%s\t%d\t\t",
+			player->GetRank() + 1,
+			player->GetUserInfo()->GetString( "ui_name" ),
+			player->GetUserInfo()->GetString( "ui_clan" ),
+			rankedScore );
+	}
 
 	for( int j = 0; j < MAX_WEAPONS; j++ ) {
 		// only consider weapons we fired more than a few shots
@@ -11236,6 +11324,9 @@ void idMultiplayerGame::ServerCallPackedVote( int clientNum, const idBitMsg &msg
 		common->Warning( "Ignoring packed vote from invalid client slot %d", clientNum );
 		return;
 	}
+	if ( !VoteRateLimitAccepted( clientNum ) ) {
+		return;
+	}
 
 	// Managed matches have one proposal service and one revisioned authority
 	// path.  The inherited packed vote is intentionally retained only for
@@ -11783,6 +11874,8 @@ void idMultiplayerGame::ServerStartPackedVote( int clientNum, const voteStruct_t
 	currentVoteData = voteData;
 	voteTimeOut = gameLocal.time + 30000;	// 30 seconds?  might need to be longer because it requires fiddling with the GUI
 	voteEligibleCount = 0;
+	// openQ4: a vote has actually started, so the caller now owes a cool-off
+	StampVoteRateLimit( clientNum );
 	// mark players allowed to vote - only current ingame players, players joining during vote will be ignored
 	for ( int i = 0; i < gameLocal.numClients; i++ ) {
 		if ( IsEligibleVotePlayerSlot( i ) ) {
@@ -11950,14 +12043,33 @@ void idMultiplayerGame::SendMapList( int clientNum ) {
 	outMsg.Init( msgBuf, sizeof( msgBuf ) );
 	outMsg.WriteByte( GAME_RELIABLE_MESSAGE_GETVOTEMAPS );
 
+	// openQ4: the list is bounded by the reliable message buffer, not by the map
+	// rotation.  idBitMsg::CheckOverflow calls FatalError, so a large rotation
+	// used to kill the server the moment any client asked for the vote maps.
+	// Reserve room for the terminating empty string and stop cleanly instead.
+	bool truncated = false;
 	for ( i = 0; i < numMaps; i++ ) {
 		dict = fileSystem->GetMapDecl( i );
 
 		const char *mapName = dict->GetString( "path" );
-		assert( mapName[ 0 ] != '\0' );
+		if ( mapName == NULL || mapName[ 0 ] == '\0' ) {
+			continue;
+		}
+		// WriteString emits the bytes plus a terminator, and one more byte has
+		// to survive for the empty string which ends the list
+		if ( outMsg.GetRemainingSpace() < idStr::Length( mapName ) + 2 ) {
+			truncated = true;
+			break;
+		}
 		outMsg.WriteString( mapName );
 	}
 	outMsg.WriteString( "" );
+
+	if ( truncated && !mapListTruncationWarned ) {
+		mapListTruncationWarned = true;
+		gameLocal.Warning( "vote map list truncated at %d of %d maps - the rotation exceeds the reliable message size",
+			i, numMaps );
+	}
 
 	if ( gameLocal.localClientNum == clientNum ) {
 		outMsg.BeginReading();
@@ -12345,11 +12457,23 @@ void idMultiplayerGame::CommonRun( void ) {
 
 
 	// asalmon: Need to refresh stats periodically if the player is looking at stats
+	// openQ4: currentStatClient is a GUI list selection index, not a client num.  Poll
+	// the freshness of the client the selection actually resolved to, otherwise an
+	// unrelated client's update time decides whether the selected player's panel ever
+	// refreshes - and a selected player's stats could freeze for the rest of the match.
 	if ( currentStatClient != -1 ) {
-		rvPlayerStat* clientStat = statManager->GetPlayerStat( currentStatClient );
-		if ( ( gameLocal.time - clientStat->lastUpdateTime ) > 5000 ) {
-			statManager->SelectStatWindow(currentStatClient, currentStatTeam);
-		} 
+		// The roster shifts under a live selection whenever somebody joins, leaves
+		// or changes team, so the resolved client number goes stale on its own.
+		// Re-resolve every poll through the side-effect-free lookup: caching it
+		// and only refreshing it after a successful poll latches the panel off
+		// for the rest of the match the first time the resolve fails.
+		currentStatClientNum = statManager->ResolveSelection( currentStatClient, currentStatTeam );
+		if ( currentStatClientNum >= 0 && currentStatClientNum < MAX_CLIENTS ) {
+			rvPlayerStat* clientStat = statManager->GetPlayerStat( currentStatClientNum );
+			if ( clientStat && ( gameLocal.time - clientStat->lastUpdateTime ) > 5000 ) {
+				statManager->SelectStatWindow( currentStatClient, currentStatTeam );
+			}
+		}
 	}
 
 	bool updateModels = false;
@@ -14782,6 +14906,7 @@ void idMultiplayerGame::DisableMenu( void ) {
 	// asalmon: Need to refresh stats periodically if the player is looking at stats
 	currentStatClient = -1;
 	currentStatTeam = -1;
+	currentStatClientNum = -1;
 }
 
 // jmarshall - idListGUI::Add was removed from the engine interface, so the map
@@ -15666,6 +15791,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 					// asalmon: Need to refresh stats periodically if the player is looking at stats
 					currentStatClient = currentSel;
 					currentStatTeam = TEAM_MAX;
+					currentStatClientNum = statManager->ResolveSelection( currentSel, TEAM_MAX );
 				} else if( !igArg.Icmp( "dm" ) ) {
 					int currentSel = currentGui->State().GetInt( "dm_names_sel_0", "-1" );
 					currentGui->SetStateString( "spec_names_sel_0", "-1" );
@@ -15676,6 +15802,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 					// asalmon: Need to refresh stats periodically if the player is looking at stats
 					currentStatClient = currentSel;
 					currentStatTeam = 0;
+					currentStatClientNum = statManager->ResolveSelection( currentSel, 0 );
 				} else if( !igArg.Icmp( "strogg" ) ) {
 					int currentSel = currentGui->State().GetInt( "team_2_names_sel_0", "-1" );
 					currentGui->SetStateString( "spec_names_sel_0", "-1" );
@@ -15686,6 +15813,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 					// asalmon: Need to refresh stats periodically if the player is looking at stats
 					currentStatClient = currentSel;
 					currentStatTeam = TEAM_STROGG;
+					currentStatClientNum = statManager->ResolveSelection( currentSel, TEAM_STROGG );
 				} else if( !igArg.Icmp( "marine" ) ) {
 					int currentSel = currentGui->State().GetInt( "team_1_names_sel_0", "-1" );
 					currentGui->SetStateString( "spec_names_sel_0", "-1" );
@@ -15696,6 +15824,7 @@ const char* idMultiplayerGame::HandleGuiCommands( const char *_menuCommand ) {
 					// asalmon: Need to refresh stats periodically if the player is looking at stats
 					currentStatClient = currentSel;
 					currentStatTeam = TEAM_MARINE;
+					currentStatClientNum = statManager->ResolveSelection( currentSel, TEAM_MARINE );
 				}
 			}
 			continue;
@@ -17882,6 +18011,68 @@ void idMultiplayerGame::ProcessRconReturn( bool success )	{
 
 /*
 ================
+idMultiplayerGame::VoteRateLimitAccepted
+
+openQ4: CheckVote clears `vote` the instant a vote resolves, so the inherited
+"a vote is already running" gate alone let one client re-issue on the very next
+frame and own the vote channel for the whole map.  Refuse a caller until its
+own cool-off has expired, following the shape of MatchOperationRateLimitAccepted.
+================
+*/
+bool idMultiplayerGame::VoteRateLimitAccepted( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return false;
+	}
+	const int now = Max( 0, gameLocal.time );
+	const int deadline = nextVoteAllowedTime[ clientNum ];
+	if ( now >= deadline ) {
+		return true;
+	}
+	// Answering every rejected attempt would queue one reliable message back at
+	// the caller per attempt - exactly the traffic the cooldown exists to stop.
+	// Tell them once per window and stay silent for the rest of it.
+	if ( now >= nextVoteRejectNoticeTime[ clientNum ] ) {
+		nextVoteRejectNoticeTime[ clientNum ] = now + VOTE_REJECT_NOTICE_INTERVAL;
+		gameLocal.ServerSendChatMessage( clientNum, "server",
+			va( common->GetLocalizedString( "#str_42750" ),
+				( deadline - now + 999 ) / 1000 ) );
+	}
+	common->DPrintf( "client %d: called vote while its vote cooldown was active - ignored\n",
+		clientNum );
+	return false;
+}
+
+/*
+================
+idMultiplayerGame::StampVoteRateLimit
+
+The stamp is taken from the vote's own deadline rather than from when it
+resolves, so a vote that passes never costs its caller more than one that fails.
+================
+*/
+void idMultiplayerGame::StampVoteRateLimit( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+	nextVoteAllowedTime[ clientNum ] = voteTimeOut > 0x7fffffff - VOTE_CALL_COOLDOWN_TIME ?
+		0x7fffffff : voteTimeOut + VOTE_CALL_COOLDOWN_TIME;
+}
+
+/*
+================
+idMultiplayerGame::ResetVoteCooldownSlot
+================
+*/
+void idMultiplayerGame::ResetVoteCooldownSlot( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+	nextVoteAllowedTime[ clientNum ] = 0;
+	nextVoteRejectNoticeTime[ clientNum ] = 0;
+}
+
+/*
+================
 idMultiplayerGame::ServerStartVote
 ================
 */
@@ -17897,6 +18088,8 @@ void idMultiplayerGame::ServerStartVote( int clientNum, vote_flags_t voteIndex, 
 	voteValue = value;
 	voteTimeOut = gameLocal.time + 20000;
 	voteEligibleCount = 0;
+	// openQ4: a vote has actually started, so the caller now owes a cool-off
+	StampVoteRateLimit( clientNum );
 	// mark players allowed to vote - only current ingame players, players joining during vote will be ignored
 	for ( i = 0; i < gameLocal.numClients; i++ ) {
 		if ( IsEligibleVotePlayerSlot( i ) ) {
@@ -18162,6 +18355,9 @@ void idMultiplayerGame::ServerCallVote( int clientNum, const idBitMsg &msg ) {
 	assert( !gameLocal.isClient );
 	if ( !IsEligibleVotePlayerSlot( clientNum ) ) {
 		common->Warning( "Ignoring vote from invalid client slot %d", clientNum );
+		return;
+	}
+	if ( !VoteRateLimitAccepted( clientNum ) ) {
 		return;
 	}
 	if ( matchRules.Committed().GetBool( MP_RULE_MANAGED_MATCH ) ) {
@@ -18469,6 +18665,7 @@ void idMultiplayerGame::DisconnectClient( int clientNum ) {
 	}
 	if ( clientNum >= 0 && clientNum < MAX_CLIENTS ) {
 		ClearMatchOperationTransportSlot( clientNum );
+		ResetVoteCooldownSlot( clientNum );
 		// Series contestant bindings are connection-scoped.  Retain the recorded
 		// id on the series side so a later occupant of this slot cannot inherit it.
 		matchConnectionId[ clientNum ] = 0;
@@ -18885,6 +19082,7 @@ void idMultiplayerGame::ProcessChatMessage( int clientNum, bool team, const char
 	int			i;
 	idEntity 	*ent;
 	idPlayer	*p;
+	idStr		display_name;
 	idStr		suffixed_name;
 	idStr		prefixed_text;
 	const bool managedTeamCommunicationRequested = team && gameLocal.isServer &&
@@ -18908,6 +19106,15 @@ void idMultiplayerGame::ProcessChatMessage( int clientNum, bool team, const char
 		if ( !( p && p->IsType( idPlayer::GetClassType() ) ) ) {
 // RAVEN END
 			return;
+		}
+
+		// openQ4: never broadcast a client supplied display name.  The caller side of
+		// the chat path is reachable from a modified client, so a doctored name would
+		// let one player speak as another - or as the server.  Resolve the name from
+		// the authoritative user info instead, the same way ProcessVoiceChat does.
+		display_name = gameLocal.userInfo[ clientNum ].GetString( "ui_name" );
+		if ( display_name.IsEmpty() && name ) {
+			display_name = name;
 		}
 
 		if ( managedTeamCommunicationRequested ) {
@@ -18952,15 +19159,17 @@ void idMultiplayerGame::ProcessChatMessage( int clientNum, bool team, const char
 	} else {
 		p = NULL;
 		send_to = 0;
+		// server originated line, the caller is trusted
+		display_name = name ? name : "";
 	}
 	// put the message together
 	outMsg.Init( msgBuf, sizeof( msgBuf ) );
 	outMsg.WriteByte( ( send_to == 2 ) ? GAME_RELIABLE_MESSAGE_TCHAT : GAME_RELIABLE_MESSAGE_CHAT );
 
 	if ( suffix ) {
-		suffixed_name = va( "^0%s^0 (%s)", name, suffix );
+		suffixed_name = va( "^0%s^0 (%s)", display_name.c_str(), suffix );
 	} else {
-		suffixed_name = va( "^0%s^0", name );
+		suffixed_name = va( "^0%s^0", display_name.c_str() );
 	}
 	if( p && send_to == 2 ) {
 		const bool stroggTeam = managedTeamCommunication ?

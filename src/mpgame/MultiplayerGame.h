@@ -1048,6 +1048,9 @@ private:
 						const mpMatchOperationResult_t &result );
 	bool			MatchOperationRateLimitAccepted( int clientNum,
 						const mpMatchOperationDescriptor_t &descriptor );
+	bool			VoteRateLimitAccepted( int clientNum );
+	void			StampVoteRateLimit( int clientNum );
+	void			ResetVoteCooldownSlot( int clientNum );
 	void			BuildMatchOperationContext( int clientNum,
 						mpMatchOperationOpcode_t opcode, bool enforceTransportCooldown,
 						mpOperationAdapterContext_t &context );
@@ -1151,11 +1154,18 @@ private:
 	idStr			kickVoteMapNames[ MAX_CLIENTS ];
 	voteStruct_t	currentVoteData;		// used for multi-field votes
 // RAVEN END
+	// openQ4: per-caller cool-off so one client cannot own the vote channel by
+	// re-issuing on the frame after its own vote resolves
+	int				nextVoteAllowedTime[ MAX_CLIENTS ];
+	int				nextVoteRejectNoticeTime[ MAX_CLIENTS ];
 
 	idStr			localisedGametype;
 
 	idList<int>		voteMapDecls;
 	int				voteMapsWaiting;
+	// openQ4: one-shot operator diagnostics, reset per map
+	bool			mapListTruncationWarned;
+	bool			matchItemTimingFullWarned;
 
 	// time related
 	int				matchStartedTime;		// time current match started
@@ -1196,8 +1206,11 @@ private:
 
 //RAVEN BEGIN
 //asalmon: Need to refresh stats periodically if the player is looking at stats
-	int currentStatClient;
+	int currentStatClient;			// GUI list selection index, NOT a client num
 	int currentStatTeam;
+	// openQ4: client num currentStatClient/currentStatTeam last resolved to, so the
+	// periodic refresh polls the selected player instead of an unrelated slot
+	int currentStatClientNum;
 //RAVEN END
 
 public:

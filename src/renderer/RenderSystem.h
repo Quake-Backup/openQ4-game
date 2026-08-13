@@ -518,6 +518,16 @@ public:
 	// state; the engine must not read the glConfig global directly (the
 	// renderer may live in a module whose glConfig is a separate object)
 	virtual const glconfig_t &	GetGLConfig( void ) const = 0;
+
+	// openQ4: publishes the underwater view state for this frame. amount is 0 when the eye is out
+	// of the liquid and rises to 1 fully submerged; tint is the liquid's colour.
+	//
+	// Returns true if the renderer will actually draw the effect. A backend that cannot - the
+	// Vulkan module only supports a fixed set of material programs - returns false, and the caller
+	// is expected to fall back to something simpler rather than showing nothing.
+	// fogDistance is how far light travels through this liquid before it is fully absorbed, in
+	// world units - the knob that separates clear water from lava you cannot see a foot into.
+	virtual bool			SetUnderwaterView( float amount, const idVec3 &tint, float fogDistance ) = 0;
 };
 
 extern idRenderSystem *		renderSystem;

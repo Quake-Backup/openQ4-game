@@ -971,6 +971,7 @@ public:
 	int						LiquidLevelForEntity	( idEntity *ent, int &liquidType );
 	void					PlayLiquidSoundOn		( idEntity *ent, const char *key, const s_channelType channel );
 	void					PlayLiquidEffectAt		( const char *key, const idVec3 &origin );
+	bool					PlayLiquidTrail			( int liquidContents, const idVec3 &start, const idVec3 &end );
 // openQ4 END
 
 	idList<idEntity*>		ambientLights; // lights that cast ambient

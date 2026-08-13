@@ -345,6 +345,13 @@ public:
 	// openQ4: muffles everything while the listener's head is under a liquid surface. Derived from
 	// the eye position every frame, so it is deliberately not part of the savegame.
 	virtual void			SetUnderwater( bool active ) = 0;
+
+	// openQ4: lets the sound world ask whether a point is inside a liquid, which only the game
+	// knows - liquid lives in the collision world, not the render world. Used to occlude sounds
+	// that have to cross the surface to reach the listener. Called from the same per-emitter
+	// spatialisation path that already does portal tracing, so it must be cheap and main-thread.
+	typedef bool ( *liquidTest_t )( const idVec3 &point );
+	virtual void			SetLiquidTest( liquidTest_t test ) = 0;
 };
 
 

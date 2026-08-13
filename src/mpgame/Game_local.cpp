@@ -465,6 +465,8 @@ void idGameLocal::Clear( void ) {
 	currentThinkingEntity = NULL;
 // RAVEN END
 
+	ResetMPLagCompensationHistory();
+
 	demoState = DEMO_NONE;
 	serverDemo = false;
 	timeDemo = false;
@@ -2704,6 +2706,13 @@ void idGameLocal::MapClear( bool clearClients, int instance ) {
 // RAVEN END
 	int i;
 
+	// openQ4: the rewind history describes positions in the world being torn down.
+	// LoadMap winds gameLocal.time back to 0 and a map restart does not wind it
+	// back at all, so entries kept across either transition are still inside the
+	// rewind window - shots in the first moments of a map or a round would rewind
+	// opponents to where they stood before it.
+	ResetMPLagCompensationHistory();
+
 // RAVEN BEGIN
 // bdube: delete client entities first since they reference real entities
 	for( i = 0; i < MAX_CENTITIES; i++ ) {
@@ -3891,8 +3900,11 @@ void idGameLocal::SetupPlayerPVS( void ) {
 
 	playerPVS.i = -1;
 	for ( i = 0; i < numClients; i++ ) {
+		// openQ4: numClients is a high water mark, not a count, so a disconnect leaves holes
+		// below it.  Bailing out on the first hole left the merged player PVS empty for the
+		// rest of the frame; skip the hole instead, exactly like UpdateClientsPVS does.
 		if ( !entities[i] ) {
-			return;
+			continue;
 		}
 		assert( entities[i]->IsType( idPlayer::GetClassType() ) );
 
@@ -4442,6 +4454,10 @@ TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 			mpGame.Run();
 			CheckAutoExecAfterMapLoad();
 		}
+
+		// openQ4: snapshot the players after they have moved this frame so hitscan lag
+		// compensation has a position history to rewind through.
+		CaptureMPLagCompensationFrame();
 
 		// free the player pvs
 		FreePlayerPVS();
@@ -8554,6 +8570,41 @@ void idGameLocal::PlayLiquidEffectAt( const char *key, const idVec3 &origin ) {
 
 /*
 ================
+idGameLocal::PlayLiquidTrail
+
+The wake something leaves crossing a liquid: bubbles, not smoke. Smoke does not survive underwater,
+so a projectile trail or a tracer that is drawn there has to be replaced rather than tinted.
+
+Returns false when this liquid has no trail authored, so the caller can fall back to whatever it
+would normally have drawn.
+================
+*/
+bool idGameLocal::PlayLiquidTrail( int liquidContents, const idVec3 &start, const idVec3 &end ) {
+	if ( !liquidContents ) {
+		return false;
+	}
+
+	const idDict *liquidDict = FindEntityDefDict( "liquid_openq4", false );
+	if ( !liquidDict ) {
+		return false;
+	}
+
+	const idDecl *effect = GetEffect( *liquidDict, va( "fx_trail_%s", LiquidTypeName( liquidContents ) ) );
+	if ( !effect ) {
+		return false;
+	}
+
+	idVec3 dir = end - start;
+	if ( dir.Normalize() <= 0.0f ) {
+		dir.Set( 0.0f, 0.0f, 1.0f );
+	}
+
+	PlayEffect( effect, start, dir.ToMat3(), false, end, true );
+	return true;
+}
+
+/*
+================
 idGameLocal::PlayEffect
 
 Plays an effect at the given origin using the given direction
@@ -8696,6 +8747,272 @@ void idGameLocal::CheckPlayerWhizzBy( idVec3 start, idVec3 end, idEntity* hitEnt
 
 /*
 ================
+idGameLocal::ResetMPLagCompensationHistory
+
+openQ4: server side hitscan lag compensation, ported from the single player tree so the
+multiplayer game library gets the same rewind behaviour.
+================
+*/
+void idGameLocal::ResetMPLagCompensationHistory( void ) {
+	mpLagCompHistoryHead = -1;
+	for ( int clientNum = 0; clientNum < MAX_CLIENTS; clientNum++ ) {
+		for ( int i = 0; i < MP_LAGCOMP_HISTORY; i++ ) {
+			mpLagCompHistory[ clientNum ][ i ].time = 0;
+			mpLagCompHistory[ clientNum ][ i ].origin = vec3_origin;
+			mpLagCompHistory[ clientNum ][ i ].axis = mat3_identity;
+			mpLagCompHistory[ clientNum ][ i ].valid = false;
+		}
+	}
+}
+
+/*
+================
+idGameLocal::CaptureMPLagCompensationFrame
+================
+*/
+void idGameLocal::CaptureMPLagCompensationFrame( void ) {
+	if ( !isServer || !isMultiplayer ) {
+		return;
+	}
+
+	mpLagCompHistoryHead = ( mpLagCompHistoryHead + 1 ) % MP_LAGCOMP_HISTORY;
+
+	for ( int clientNum = 0; clientNum < MAX_CLIENTS; clientNum++ ) {
+		mpLagCompFrame_t &frame = mpLagCompHistory[ clientNum ][ mpLagCompHistoryHead ];
+		frame.time = time;
+		frame.valid = false;
+
+		idEntity *ent = entities[ clientNum ];
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+
+		idPlayer *player = static_cast< idPlayer * >( ent );
+		// A corpse is not a hitscan target and its physics may already belong to
+		// a ragdoll, so do not record it - and do not let a shot a moment after
+		// the respawn rewind onto where the body fell.
+		if ( player->spectating || player->health <= 0 ) {
+			continue;
+		}
+
+		frame.origin = player->GetPhysics()->GetOrigin();
+		frame.axis = player->GetPhysics()->GetAxis();
+		frame.valid = true;
+	}
+}
+
+/*
+================
+idGameLocal::InvalidateMPLagCompensationHistory
+
+openQ4: forget one client's recorded positions.  Anything that places a player
+somewhere they did not walk to - a respawn or a teleport - makes every earlier
+sample a lie about where they could be shot, and the rewind window is long
+enough to reach across one.
+================
+*/
+void idGameLocal::InvalidateMPLagCompensationHistory( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return;
+	}
+
+	for ( int i = 0; i < MP_LAGCOMP_HISTORY; i++ ) {
+		mpLagCompHistory[ clientNum ][ i ].valid = false;
+	}
+}
+
+/*
+================
+idGameLocal::SelectMPLagCompensationFrame
+================
+*/
+bool idGameLocal::SelectMPLagCompensationFrame( int clientNum, int targetTime, mpLagCompFrame_t &outFrame ) const {
+	if ( mpLagCompHistoryHead < 0 || clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return false;
+	}
+
+	// openQ4: never rewind further than the configured window.  Without this the
+	// fallback below happily returns the oldest entry in the ring however old it
+	// is, which after a map load - where gameLocal.time restarts at 0 and every
+	// stamp is in the "future" - means the oldest surviving sample rather than
+	// anything near the shot.
+	const int maxRewindMS = idMath::ClampInt( 0, 1000, net_mpLagCompMaxMS.GetInteger() );
+	const int oldestAcceptableTime = time - maxRewindMS;
+
+	const mpLagCompFrame_t *oldestFrame = NULL;
+
+	for ( int i = 0; i < MP_LAGCOMP_HISTORY; i++ ) {
+		const int index = ( mpLagCompHistoryHead - i + MP_LAGCOMP_HISTORY ) % MP_LAGCOMP_HISTORY;
+		const mpLagCompFrame_t &frame = mpLagCompHistory[ clientNum ][ index ];
+		if ( !frame.valid ) {
+			continue;
+		}
+		// a stamp ahead of us is stale state from before a map load reset the clock
+		if ( frame.time > time || frame.time < oldestAcceptableTime ) {
+			continue;
+		}
+
+		oldestFrame = &frame;
+		if ( frame.time <= targetTime ) {
+			outFrame = frame;
+			return true;
+		}
+	}
+
+	if ( oldestFrame ) {
+		outFrame = *oldestFrame;
+		return true;
+	}
+
+	return false;
+}
+
+/*
+================
+idGameLocal::ComputeMPLagCompensationRewind
+================
+*/
+bool idGameLocal::ComputeMPLagCompensationRewind( const idPlayer *shooter, int &rewindMS ) const {
+	rewindMS = 0;
+
+	if ( !isServer || !isMultiplayer || !shooter || !net_mpLagCompensation.GetBool() ) {
+		return false;
+	}
+
+	const int maxRewindMS = idMath::ClampInt( 0, 1000, net_mpLagCompMaxMS.GetInteger() );
+	if ( maxRewindMS <= 0 ) {
+		return false;
+	}
+
+	int rewindEstimateMS = 0;
+
+	// openQ4: prefer the authoritative command age when the client's clock is
+	// genuinely behind ours, because that measures the real end-to-end pipeline.
+	// In practice it rarely is: idAsyncClient deliberately runs its game clock
+	// AHEAD of the server by net_clientPrediction, so usercmd.gameTime normally
+	// exceeds our own time and this yields nothing.  It is kept for the case
+	// where a client's clock has fallen behind, where it is the better estimate.
+	if ( shooter->usercmd.gameTime > 0 ) {
+		rewindEstimateMS = time - shooter->usercmd.gameTime;
+	}
+
+	// openQ4: otherwise rewind by the one-way trip the command took to reach us.
+	// Do NOT subtract the client's prediction lead: prediction advances the
+	// client's own view, it does not remove the travel time of the command, and
+	// subtracting it drove the whole estimate negative - the reason this
+	// compensation measurably did nothing before.  Half the round trip is the
+	// conservative half of the usual "ping + interpolation" rewind, which suits
+	// an engine whose clients already extrapolate remote players forward from
+	// the relayed user commands rather than interpolating between snapshots.
+	if ( rewindEstimateMS <= 0 ) {
+		int pingMS = 0;
+		if ( shooter->entityNumber >= 0 && shooter->entityNumber < MAX_CLIENTS ) {
+			pingMS = networkSystem->ServerGetClientPing( shooter->entityNumber );
+		}
+
+		if ( pingMS < 0 || pingMS >= 99999 ) {
+			pingMS = 0;
+		}
+
+		rewindEstimateMS = pingMS / 2;
+	}
+
+	rewindEstimateMS += net_mpLagCompBiasMS.GetInteger();
+	rewindMS = idMath::ClampInt( 0, maxRewindMS, rewindEstimateMS );
+	return rewindMS > 0;
+}
+
+/*
+================
+idGameLocal::BeginMPLagCompensation
+================
+*/
+bool idGameLocal::BeginMPLagCompensation( const idPlayer *shooter, mpLagCompRestore_t restoreState[MAX_CLIENTS], int &restoreCount ) {
+	restoreCount = 0;
+
+	int rewindMS = 0;
+	if ( !ComputeMPLagCompensationRewind( shooter, rewindMS ) ) {
+		return false;
+	}
+
+	const int targetTime = time - rewindMS;
+
+	for ( int clientNum = 0; clientNum < MAX_CLIENTS; clientNum++ ) {
+		if ( clientNum == shooter->entityNumber ) {
+			continue;
+		}
+
+		idEntity *ent = entities[ clientNum ];
+		if ( !ent || !ent->IsType( idPlayer::GetClassType() ) ) {
+			continue;
+		}
+
+		idPlayer *player = static_cast< idPlayer * >( ent );
+		// openQ4: dead players are not valid hitscan targets, and their physics may already
+		// have been handed over to a ragdoll, so leave them alone entirely.
+		if ( player->spectating || player->health <= 0 || player->GetInstance() != shooter->GetInstance() ) {
+			continue;
+		}
+
+		mpLagCompFrame_t rewoundFrame;
+		if ( !SelectMPLagCompensationFrame( clientNum, targetTime, rewoundFrame ) ) {
+			continue;
+		}
+
+		mpLagCompRestore_t &restore = restoreState[ restoreCount ];
+		restore.player = player;
+		restore.physics = player->GetPhysics();
+		restore.originalOrigin = restore.physics->GetOrigin();
+		restore.originalAxis = restore.physics->GetAxis();
+		restore.rewoundOrigin = rewoundFrame.origin;
+		restoreCount++;
+
+		restore.physics->SetOrigin( rewoundFrame.origin );
+		restore.physics->SetAxis( rewoundFrame.axis );
+	}
+
+	if ( net_mpLagCompDebug.GetInteger() > 0 ) {
+		common->DPrintf( "MPLagComp: shooter=%d rewind=%dms targetTime=%d rewound=%d\n",
+			shooter->entityNumber, rewindMS, targetTime, restoreCount );
+	}
+
+	return restoreCount > 0;
+}
+
+/*
+================
+idGameLocal::EndMPLagCompensation
+================
+*/
+void idGameLocal::EndMPLagCompensation( mpLagCompRestore_t restoreState[MAX_CLIENTS], int restoreCount ) {
+	for ( int i = restoreCount - 1; i >= 0; i-- ) {
+		mpLagCompRestore_t &restore = restoreState[ i ];
+		if ( !restore.player ) {
+			continue;
+		}
+
+		// openQ4: a shot that kills inside the bracket runs idPlayer::Killed ->
+		// StartRagdoll, which calls SetPhysics( &af.physicsObj ) - so the player
+		// is no longer on the physics object we rewound.  Writing the stored
+		// player-physics origin/axis into idPhysics_AF would rotate the whole
+		// fresh corpse about body 0.  The corpse has already been placed
+		// authoritatively; there is nothing of ours left to undo.
+		// (This covers a physics-object swap only.  A teleport keeps the same
+		// idPhysics_Player, and is instead handled by the translation term below
+		// plus InvalidateMPLagCompensationHistory on the spawn path.)
+		if ( restore.player->GetPhysics() != restore.physics ) {
+			continue;
+		}
+
+		// Preserve any intentional translation that happened while rewound (rare but possible).
+		idVec3 translated = restore.physics->GetOrigin() - restore.rewoundOrigin;
+		restore.physics->SetOrigin( restore.originalOrigin + translated );
+		restore.physics->SetAxis( restore.originalAxis );
+	}
+}
+
+/*
+================
 idGameLocal::HitScan
 
 Run a hitscan trace from the given origin and direction
@@ -8724,6 +9041,10 @@ idEntity* idGameLocal::HitScan(
 	float		tracerChance;
 	idEntity*	ignore;
 	float		penetrate;
+	idEntity *	hitResult = NULL;
+	mpLagCompRestore_t lagCompRestore[ MAX_CLIENTS ];
+	int			lagCompRestoreCount = 0;
+	bool		lagCompApplied = false;
 
 	if ( areas ) {
 		areas[ 0 ] = pvs.GetPVSArea( origFxOrigin );
@@ -8732,6 +9053,12 @@ idEntity* idGameLocal::HitScan(
 
 	ignore    = owner;
 	penetrate = hitscanDict.GetFloat( "penetrate" );
+
+	// openQ4: rewind the other players to where the shooter saw them before tracing.  This
+	// is a no-op on a client, in single player and when net_mpLagCompensation is off.
+	if ( isServer && isMultiplayer && owner && owner->IsType( idPlayer::GetClassType() ) ) {
+		lagCompApplied = BeginMPLagCompensation( static_cast<idPlayer *>( owner ), lagCompRestore, lagCompRestoreCount );
+	}
 
 	// openQ4: owner comes straight off the wire in ClientHitScan and is NULL whenever
 	// the shooter has not been spawned locally yet, so guard it the same way the
@@ -8815,7 +9142,12 @@ idEntity* idGameLocal::HitScan(
 			if ( tr.fraction >= 1.0f || (tr.c.material && tr.c.material->GetSurfaceFlags() & SURF_NOIMPACT) ) {					
 				PlayEffect( hitscanDict, "fx_path", fxOrigin, dir.ToMat3(), false, tr.endpos, false, false, EC_IGNORE, hitscanTint );	
 				if ( random.RandomFloat( ) < tracerChance ) {
-					PlayEffect( hitscanDict, "fx_tracer", fxOrigin, dir.ToMat3(), false, tr.endpos );
+// openQ4 BEGIN
+					// a tracer drawn underwater is a line of bubbles, not a streak of smoke
+					if ( !PlayLiquidTrail( LiquidContentsAtPoint( fxOrigin, owner ), fxOrigin, tr.endpos ) ) {
+						PlayEffect( hitscanDict, "fx_tracer", fxOrigin, dir.ToMat3(), false, tr.endpos );
+					}
+// openQ4 END
 					tracer = true;
 				} else {
 					tracer = false;
@@ -8828,7 +9160,8 @@ idEntity* idGameLocal::HitScan(
 					}
 				}
 
-				return NULL;
+				hitResult = NULL;
+				goto hitScanDone;
 			}
 
 			// computing the collisionArea from the collisionPoint fails sometimes
@@ -8971,7 +9304,11 @@ idEntity* idGameLocal::HitScan(
 		fxDir.Normalize( );
 		PlayEffect( hitscanDict, "fx_path", fxOrigin, fxDir.ToMat3(), false, collisionPoint, false, false, EC_IGNORE, hitscanTint );	
 		if ( !ent->fl.takedamage && random.RandomFloat ( ) < tracerChance ) {
-			PlayEffect( hitscanDict, "fx_tracer", fxOrigin, fxDir.ToMat3(), false, collisionPoint );
+// openQ4 BEGIN
+			if ( !PlayLiquidTrail( LiquidContentsAtPoint( fxOrigin, owner ), fxOrigin, collisionPoint ) ) {
+				PlayEffect( hitscanDict, "fx_tracer", fxOrigin, fxDir.ToMat3(), false, collisionPoint );
+			}
+// openQ4 END
 			tracer = true;
 		} else {
 			tracer = false;
@@ -9008,7 +9345,8 @@ idEntity* idGameLocal::HitScan(
 			}
 			
 			// End of reflection
-			return ent;
+			hitResult = ent;
+			goto hitScanDone;
 		} else {
 			PlayEffect( GetEffect( hitscanDict, "fx_reflect", tr.c.materialType ), collisionPoint, tr.c.normal.ToMat3() );
 		}
@@ -9024,8 +9362,14 @@ idEntity* idGameLocal::HitScan(
 	}	
 	
 	assert( false );
-	
-	return NULL;
+
+hitScanDone:
+	// openQ4: every exit from the trace loop funnels through here so the rewound players are
+	// always put back, whichever way the hitscan ended.
+	if ( lagCompApplied ) {
+		EndMPLagCompensation( lagCompRestore, lagCompRestoreCount );
+	}
+	return hitResult;
 }
 
 /*

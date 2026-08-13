@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HEADER = ROOT / "src/mpgame/mp/match/MatchProtocol.h"
 SOURCE = ROOT / "src/mpgame/mp/match/MatchProtocol.cpp"
 SESSION_HEADER = ROOT / "src/mpgame/mp/match/MatchSession.h"
+SESSION_SOURCE = ROOT / "src/mpgame/mp/match/MatchSession.cpp"
 
 
 def read(path: Path) -> str:
@@ -111,6 +112,57 @@ def stable_opcode_contract(header: str, source: str) -> None:
     invalid_tokens = [token for token in tokens if re.fullmatch(r"[a-z0-9_]{1,48}", token) is None]
     if invalid_tokens:
         raise AssertionError(f"descriptor tokens are not canonical: {invalid_tokens}")
+
+
+def descriptor_row(source: str, opcode: str) -> str:
+    rows = re.findall(
+        rf"\{{\s*{re.escape(opcode)}\s*,(?P<body>.*?)\}},",
+        source,
+        re.DOTALL,
+    )
+    if len(rows) != 1:
+        raise AssertionError(f"{opcode} must have exactly one descriptor row")
+    return rows[0]
+
+
+def timeout_window_phase_contract(source: str, session_source: str) -> None:
+    live = re.search(r"static const mpMatchPhaseMask_t PHASE_LIVE\s*=\s*(?P<mask>[^;]+);", source)
+    if live is None:
+        raise AssertionError("could not find the live phase mask")
+    live_phases = set(re.findall(r"MP_MATCH_PHASE_[A-Z]+", live.group("mask")))
+    if live_phases != {
+        "MP_MATCH_PHASE_COUNTDOWN",
+        "MP_MATCH_PHASE_GAMEON",
+        "MP_MATCH_PHASE_SUDDENDEATH",
+    }:
+        raise AssertionError(f"the live phase mask drifted: {sorted(live_phases)}")
+
+    # The timeout_request_window rule may open a countdown timeout, and the
+    # session (mpMatchSession::RequestTeamTimeout) is what enforces the window.
+    # The descriptor phase gate runs first, so a descriptor which excludes
+    # COUNTDOWN would reject a legally configured countdown timeout before the
+    # session ever sees it.
+    row = descriptor_row(source, "MP_MATCH_OP_TIMEOUT_REQUEST")
+    phases = set(re.findall(r"MP_MATCH_PHASE_[A-Z]+", row))
+    if "PHASE_LIVE" in row:
+        phases |= live_phases
+    for required in (
+        "MP_MATCH_PHASE_COUNTDOWN",
+        "MP_MATCH_PHASE_GAMEON",
+        "MP_MATCH_PHASE_SUDDENDEATH",
+    ):
+        if required not in phases:
+            raise AssertionError(
+                f"timeout_request must remain legal in {required} at the protocol gate"
+            )
+    if "MP_MATCH_PHASE_WARMUP" in phases:
+        raise AssertionError("timeout_request must not become legal in warmup")
+
+    require(
+        session_source,
+        "if ( !IsLivePhase() && !( phase == COUNTDOWN && timeoutAllowedDuringCountdown ) )",
+        "session-owned countdown timeout window",
+    )
 
 
 def dependency_and_namespace_contract(header: str, source: str, session: str) -> None:
@@ -306,7 +358,9 @@ def main() -> None:
     header = read(HEADER)
     source = read(SOURCE)
     session = read(SESSION_HEADER) if SESSION_HEADER.is_file() else ""
+    session_source = read(SESSION_SOURCE)
     stable_opcode_contract(header, source)
+    timeout_window_phase_contract(source, session_source)
     dependency_and_namespace_contract(header, source, session)
     bounded_schema_contract(header, source)
     veto_side_contract(header, source)

@@ -270,6 +270,8 @@ extern idCVar	pm_airTics;
 
 // openQ4 BEGIN
 extern idCVar	pm_waterAirTics;
+extern idCVar	pm_swimSpeed;
+extern idCVar	pm_swimSpeedFast;
 extern idCVar	g_liquidDamageInterval;
 extern idCVar	g_drownDamageMax;
 extern idCVar	g_liquidScreenTint;
@@ -495,6 +497,11 @@ extern idCVar pm_powerslide;
 extern idCVar g_playerLean;
 
 extern idCVar net_clientPredictWeaponSwitch;
+
+extern idCVar net_mpLagCompensation;
+extern idCVar net_mpLagCompMaxMS;
+extern idCVar net_mpLagCompBiasMS;
+extern idCVar net_mpLagCompDebug;
 
 extern idCVar bot_enable;
 extern idCVar bot_minPlayers;

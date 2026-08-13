@@ -21,7 +21,10 @@ const float PM_FLYACCELERATE	= 8.0f;
 
 const float PM_FRICTION			= 6.0f;
 const float PM_AIRFRICTION		= 0.0f;
-const float PM_WATERFRICTION	= 2.0f;
+// openQ4: Quake 3 uses 1.0 here. Doom 3 doubled it, which is most of why swimming in id Tech 4
+// feels like wading through treacle - the extra drag eats the acceleration before it ever reaches
+// the speed cap.
+const float PM_WATERFRICTION	= 1.0f;
 const float PM_FLYFRICTION		= 3.0f;
 const float PM_NOCLIPFRICTION	= 12.0f;
 const float PM_SLIDEFRICTION    = 0.5f;
@@ -57,7 +60,7 @@ This allows the clients to use axial -127 to 127 values for all directions
 without getting a sqrt(2) distortion in speed.
 ============
 */
-float idPhysics_Player::CmdScale( const usercmd_t &cmd ) const {
+float idPhysics_Player::CmdScale( const usercmd_t &cmd, bool allowVertical ) const {
 	int		max;
 	float	total;
 	float	scale;
@@ -70,9 +73,13 @@ float idPhysics_Player::CmdScale( const usercmd_t &cmd ) const {
 
 	// since the crouch key doubles as downward movement, ignore downward movement when we're on the ground
 	// otherwise crouch speed will be lower than specified
-	if ( walking ) {
+// openQ4 BEGIN
+	// ... but a swimmer standing on the bottom of a pool is still "walking", and dropping the
+	// vertical axis there is what stopped jump and crouch from raising and lowering the player.
+	if ( walking && !allowVertical ) {
+// openQ4 END
 		upmove = 0;
-	} else { 
+	} else {
 		upmove = cmd.upmove;
 	}
 
@@ -620,7 +627,11 @@ void idPhysics_Player::WaterMove( void ) {
 
 	idPhysics_Player::Friction();
 
-	scale = idPhysics_Player::CmdScale( command );
+// openQ4 BEGIN
+	// allowVertical: jump and crouch are the up and down axis underwater, and they have to keep
+	// working while the player is stood on the bottom
+	scale = idPhysics_Player::CmdScale( command, true );
+// openQ4 END
 
 	// user intentions
 	if ( !scale ) {
@@ -633,9 +644,13 @@ void idPhysics_Player::WaterMove( void ) {
 	wishdir = wishvel;
 	wishspeed = wishdir.Normalize();
 
-	if ( wishspeed > playerSpeed * PM_SWIMSCALE ) {
-		wishspeed = playerSpeed * PM_SWIMSCALE;
+// openQ4 BEGIN
+	// playerSpeed is already the swim speed by the time we get here - MovePlayer substitutes it -
+	// so this is a straight clamp rather than Quake 3's pm_swimScale fraction of the run speed.
+	if ( wishspeed > playerSpeed ) {
+		wishspeed = playerSpeed;
 	}
+// openQ4 END
 
 	idPhysics_Player::Accelerate( wishdir, wishspeed, PM_WATERACCELERATE );
 
@@ -1521,6 +1536,16 @@ void idPhysics_Player::MovePlayer( int msec ) {
 	// set clip model size
 	idPhysics_Player::CheckDuck();
 
+// openQ4 BEGIN
+	// Swimming is its own gait. It has to be applied after CheckDuck, which would otherwise drop
+	// the swimmer to crouch speed for holding the very key that makes them descend, and it has to
+	// override the walk/run choice, which counts "no forward or sideways input" as walking and so
+	// halved the speed of swimming straight up.
+	if ( waterLevel > WATERLEVEL_FEET && current.movementType == PM_NORMAL && swimSpeed > 0.0f ) {
+		playerSpeed = swimSpeed;
+	}
+// openQ4 END
+
 	// handle timers
 	idPhysics_Player::DropTimers();
 
@@ -1657,6 +1682,7 @@ idPhysics_Player::idPhysics_Player( void ) {
 	framemsec = 0;
 	frametime = 0;
 	playerSpeed = 0;
+	swimSpeed = 0.0f;
 	viewForward.Zero();
 	viewRight.Zero();
 	walking = false;
@@ -1733,6 +1759,7 @@ void idPhysics_Player::Save( idSaveGame *savefile ) const {
 	savefile->WriteInt( framemsec );
 	savefile->WriteFloat( frametime );
 	savefile->WriteFloat( playerSpeed );
+	savefile->WriteFloat( swimSpeed );
 	savefile->WriteVec3( viewForward );
 	savefile->WriteVec3( viewRight );
 
@@ -1770,6 +1797,7 @@ void idPhysics_Player::Restore( idRestoreGame *savefile ) {
 	savefile->ReadInt( framemsec );
 	savefile->ReadFloat( frametime );
 	savefile->ReadFloat( playerSpeed );
+	savefile->ReadFloat( swimSpeed );
 	savefile->ReadVec3( viewForward );
 	savefile->ReadVec3( viewRight );
 
@@ -1804,6 +1832,17 @@ void idPhysics_Player::SetSpeed( const float newWalkSpeed, const float newCrouch
 	walkSpeed = newWalkSpeed;
 	crouchSpeed = newCrouchSpeed;
 }
+
+// openQ4 BEGIN
+/*
+================
+idPhysics_Player::SetSwimSpeed
+================
+*/
+void idPhysics_Player::SetSwimSpeed( const float newSwimSpeed ) {
+	swimSpeed = newSwimSpeed;
+}
+// openQ4 END
 
 /*
 ================

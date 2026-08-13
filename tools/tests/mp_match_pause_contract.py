@@ -129,6 +129,13 @@ def central_frame_contracts() -> None:
         "session clock before pause overlay application",
     )
 
+    frozen_predicate = body(multiplayer, "bool idMultiplayerGame::IsGameplayFrozen")
+    require(
+        frozen_predicate,
+        "matchSession.GetPause().state != MP_MATCH_PAUSE_RUNNING",
+        "server pause predicate reads the post-boundary overlay",
+    )
+
     session = read("src/mpgame/mp/match/MatchSession.cpp")
     running_clock = body(session, "bool mpMatchSession::IsMatchClockRunning")
     require(running_clock, "pause.state == MP_MATCH_PAUSE_RUNNING", "frozen match clock")
@@ -136,6 +143,27 @@ def central_frame_contracts() -> None:
         running_clock,
         "MP_MATCH_PAUSE_PENDING",
         "pending boundary frame must not advance match time",
+    )
+
+    # The adapter simulates the frame using the post-transition overlay, so the
+    # accrual has to be decided from the same post-transition overlay.  Resolving
+    # the transitions after the accrual loses one frame per pause/resume cycle.
+    advance = body(session, "mpMatchMutationResult mpMatchSession::AdvanceFrame")
+    require(
+        advance,
+        "pause.state == MP_MATCH_PAUSE_RUNNING || resumeCompletes",
+        "post-transition match-clock gate",
+    )
+    require_before(
+        advance,
+        "const bool resumeCompletes",
+        "AddNonNegativeMsec( matchTime.Milliseconds(), delta, nextMatchMsec )",
+        "pause-overlay transitions decided before the accrual",
+    )
+    reject(
+        advance,
+        "IsMatchClockRunning()",
+        "pre-transition accrual gate",
     )
 
     shift_events = body(events, "bool idEvent::ShiftEvents")
@@ -405,10 +433,209 @@ int main() {
         subprocess.run([str(executable)], cwd=temp, check=True)
 
 
+MATCH_CLOCK_HARNESS = r'''
+#include "mpgame/mp/match/MatchSession.h"
+
+#define CHECK( condition ) do { if ( !( condition ) ) { return __LINE__; } } while ( 0 )
+#define STEP( session ) do { const int failedLine = StepFrame( session ); \
+	if ( failedLine != 0 ) { return failedLine; } } while ( 0 )
+
+static const int FRAME_MSEC = 16;
+static const int TIMEOUT_MSEC = 2000;
+static const int RESUME_COUNTDOWN_MSEC = 100;
+
+static int64_t engineMsec = 0;
+static int simulatedFrames = 0;
+static int resumeCompletions = 0;
+
+static bool AppliedOnce( const mpMatchMutationResult &result ) {
+	return result.WasApplied() && result.currentRevision == result.previousRevision + 1;
+}
+
+// Mirrors idMultiplayerGame::IsGameplayFrozen on the server.  The adapter reads
+// the overlay after AdvanceFrame has committed this frame's boundary, so the
+// match clock has to accrue exactly when this predicate is false.
+static bool GameplayFrozen( const mpMatchSession &session ) {
+	return session.GetPause().state != MP_MATCH_PAUSE_RUNNING;
+}
+
+static int StepFrame( mpMatchSession &session ) {
+	const mpMatchPauseState_t before = session.GetPause().state;
+	const int64_t beforeMatchMsec = session.GetMatchTime().Milliseconds();
+	engineMsec += FRAME_MSEC;
+	CHECK( !session.AdvanceFrame(
+		mpMatchEngineTime::FromMilliseconds( engineMsec ) ).WasRejected() );
+
+	const bool frozen = GameplayFrozen( session );
+	const int64_t accrued = session.GetMatchTime().Milliseconds() - beforeMatchMsec;
+	CHECK( accrued == ( frozen ? 0 : static_cast<int64_t>( FRAME_MSEC ) ) );
+	if ( !frozen ) {
+		++simulatedFrames;
+	}
+	if ( before != MP_MATCH_PAUSE_RUNNING && !frozen ) {
+		++resumeCompletions;
+	}
+	return 0;
+}
+
+static int ConfigureLobby( mpMatchSession &session, uint64_t sessionId,
+		bool allowTimeoutDuringCountdown ) {
+	CHECK( session.Reset( sessionId, mpMatchEngineTime::FromMilliseconds( 0 ) ) );
+	CHECK( AppliedOnce( session.FreezeRules( 1, 0x1234,
+		session.GetSessionRevision() ) ) );
+	CHECK( AppliedOnce( session.TransitionPhase( WARMUP,
+		MP_MATCH_TRANSITION_SESSION_INITIALIZED, mpParticipantId::Invalid(),
+		session.GetSessionRevision() ) ) );
+	CHECK( AppliedOnce( session.ConfigureRegulationPeriod( 600000,
+		session.GetSessionRevision() ) ) );
+	CHECK( AppliedOnce( session.ConfigureTimeouts( 1, TIMEOUT_MSEC,
+		allowTimeoutDuringCountdown, RESUME_COUNTDOWN_MSEC,
+		MP_MATCH_RESUME_OWNER_OR_AUTHORITY, session.GetSessionRevision() ) ) );
+	return 0;
+}
+
+int main() {
+	mpMatchSession session;
+	const int lobbyFailure = ConfigureLobby( session, 7, false );
+	if ( lobbyFailure != 0 ) {
+		return lobbyFailure;
+	}
+	CHECK( AppliedOnce( session.TransitionPhase( COUNTDOWN,
+		MP_MATCH_TRANSITION_READY_GATE, mpParticipantId::Invalid(),
+		session.GetSessionRevision() ) ) );
+	CHECK( AppliedOnce( session.TransitionPhase( GAMEON,
+		MP_MATCH_TRANSITION_COUNTDOWN_COMPLETE, mpParticipantId::Invalid(),
+		session.GetSessionRevision() ) ) );
+	CHECK( session.GetMatchTime().Milliseconds() == 0 );
+
+	// Every pause/resume cycle must leave the match clock equal to the number of
+	// frames the adapter actually simulated.  Accruing before the pause overlay
+	// transition dropped the resume-completing frame from the match clock, which
+	// is how a timed match reached its live-period deadline late and lost its
+	// configured overtime.
+	for ( int cycle = 0; cycle < 4; ++cycle ) {
+		for ( int frame = 0; frame < 5; ++frame ) {
+			STEP( session );
+		}
+		CHECK( AppliedOnce( session.RequestTechnicalPause(
+			MP_MATCH_PAUSE_REASON_TECHNICAL_FAULT, session.GetSessionRevision() ) ) );
+		STEP( session );
+		CHECK( session.GetPause().state == MP_MATCH_PAUSED );
+		for ( int frame = 0; frame < 3; ++frame ) {
+			STEP( session );
+		}
+		CHECK( AppliedOnce( session.RequestResumeByAuthority(
+			session.GetSessionRevision() ) ) );
+		CHECK( session.GetPause().state == MP_MATCH_RESUME_COUNTDOWN );
+		while ( session.GetPause().state != MP_MATCH_PAUSE_RUNNING ) {
+			STEP( session );
+		}
+	}
+	CHECK( resumeCompletions == 4 );
+	CHECK( session.GetMatchTime().Milliseconds() ==
+		static_cast<int64_t>( simulatedFrames ) * FRAME_MSEC );
+
+	// The automatic team-timeout expiry walks the same overlay: PAUSED becomes
+	// RESUME_COUNTDOWN on one boundary and RUNNING on a later one.
+	CHECK( AppliedOnce( session.RequestTeamTimeout( 0,
+		MP_MATCH_PAUSE_REASON_TACTICAL, session.GetSessionRevision() ) ) );
+	STEP( session );
+	CHECK( session.GetPause().state == MP_MATCH_PAUSED );
+	CHECK( session.GetTimeoutBudget( 0 ).remaining == 0 );
+	while ( session.GetPause().state != MP_MATCH_PAUSE_RUNNING ) {
+		STEP( session );
+	}
+	CHECK( resumeCompletions == 5 );
+	CHECK( session.GetMatchTime().Milliseconds() ==
+		static_cast<int64_t>( simulatedFrames ) * FRAME_MSEC );
+	CHECK( simulatedFrames > 0 );
+	CHECK( session.ValidateInvariants() );
+
+	// The timeout_request_window rule is the session's decision.  With the
+	// countdown window closed the session itself refuses with WRONG_PHASE; the
+	// protocol descriptor must not pre-empt that verdict.
+	mpMatchSession countdown;
+	const int closedFailure = ConfigureLobby( countdown, 8, false );
+	if ( closedFailure != 0 ) {
+		return closedFailure;
+	}
+	CHECK( AppliedOnce( countdown.TransitionPhase( COUNTDOWN,
+		MP_MATCH_TRANSITION_READY_GATE, mpParticipantId::Invalid(),
+		countdown.GetSessionRevision() ) ) );
+	CHECK( !countdown.IsTimeoutAllowedDuringCountdown() );
+	const uint64_t closedRevision = countdown.GetSessionRevision();
+	CHECK( countdown.RequestTeamTimeout( 0, MP_MATCH_PAUSE_REASON_TACTICAL,
+		closedRevision ).reason == MP_MATCH_REASON_WRONG_PHASE );
+	CHECK( countdown.GetSessionRevision() == closedRevision );
+	CHECK( countdown.GetPause().state == MP_MATCH_PAUSE_RUNNING );
+
+	mpMatchSession openWindow;
+	const int openFailure = ConfigureLobby( openWindow, 9, true );
+	if ( openFailure != 0 ) {
+		return openFailure;
+	}
+	CHECK( AppliedOnce( openWindow.TransitionPhase( COUNTDOWN,
+		MP_MATCH_TRANSITION_READY_GATE, mpParticipantId::Invalid(),
+		openWindow.GetSessionRevision() ) ) );
+	CHECK( openWindow.IsTimeoutAllowedDuringCountdown() );
+	CHECK( AppliedOnce( openWindow.RequestTeamTimeout( 0,
+		MP_MATCH_PAUSE_REASON_TACTICAL, openWindow.GetSessionRevision() ) ) );
+	CHECK( openWindow.GetPause().state == MP_MATCH_PAUSE_PENDING );
+	CHECK( openWindow.ValidateInvariants() );
+	return 0;
+}
+'''
+
+
+def compile_match_clock_harness() -> None:
+    compiler = next(
+        (path for name in ("clang++", "g++", "c++") if (path := shutil.which(name))),
+        None,
+    )
+    if compiler is None:
+        print("mp_match_pause_contract: match-clock executable checks skipped")
+        return
+
+    tmp_root = ROOT / ".tmp"
+    tmp_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="mp-match-clock-", dir=tmp_root) as raw:
+        temp = Path(raw)
+        source = temp / "match_clock_harness.cpp"
+        source.write_text(MATCH_CLOCK_HARNESS.lstrip(), encoding="utf-8", newline="\n")
+        executable = temp / (
+            "match_clock_harness.exe" if compiler.lower().endswith(".exe") else
+            "match_clock_harness"
+        )
+        command = [
+            compiler,
+            "-std=c++11",
+            "-DMP_MATCH_SESSION_STANDALONE_TEST",
+            f"-I{ROOT / 'src'}",
+            str(source),
+            str(ROOT / "src/mpgame/mp/match/MatchSession.cpp"),
+            "-o",
+            str(executable),
+        ]
+        compiled = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+        if compiled.returncode != 0:
+            raise AssertionError(
+                "standalone match-clock contract did not compile:\n"
+                + compiled.stdout
+                + compiled.stderr
+            )
+        ran = subprocess.run([str(executable)], cwd=ROOT, text=True, capture_output=True)
+        if ran.returncode != 0:
+            raise AssertionError(
+                "match-clock contract failed at harness line "
+                f"{ran.returncode}:\n" + ran.stdout + ran.stderr
+            )
+
+
 def main() -> None:
     central_frame_contracts()
     owned_deadline_contracts()
     compile_deadline_harness()
+    compile_match_clock_harness()
     print("mp_match_pause_contract: ok")
 
 

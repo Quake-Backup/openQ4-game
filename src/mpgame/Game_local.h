@@ -30,6 +30,7 @@ extern idRenderWorld *				gameRenderWorld;
 // classes used by idGameLocal
 class idEntity;
 class idActor;
+class idPhysics;
 class idPlayer;
 class idCamera;
 class idWorldspawn;
@@ -286,6 +287,10 @@ typedef struct entityNetEvent_s {
 	int						spawnId;
 	int						event;
 	int						time;
+	// openQ4: which client sent this event, or -1 when the server/client
+	// generated it locally.  The spawnId arrives on the wire, so the server
+	// drain needs to know who claimed it before it dispatches the event.
+	int						sender;
 	int						paramsSize;
 	byte					paramsBuf[MAX_EVENT_PARAM_SIZE];
 	struct entityNetEvent_s	*next;
@@ -368,6 +373,42 @@ enum {
 
 	GAME_UNRELIABLE_RECORD_COUNT
 };
+
+// openQ4: flood control classes for the client->server reliable messages that
+// each cause a server wide rebroadcast or a large reliable send.  One client
+// spamming them fills every other client's reliable queue and the engine then
+// disconnects the victims, so they are throttled at ingest.  Purely server
+// side bookkeeping - no wire format is involved.
+typedef enum {
+	RELIABLE_FLOOD_CHAT,
+	// say and say_team are separate buckets: players bind both, and pressing one
+	// of each inside the window must not silently swallow the second line.
+	RELIABLE_FLOOD_TCHAT,
+	RELIABLE_FLOOD_VCHAT,
+	RELIABLE_FLOOD_VOTEMAPS,
+	// not a send throttle - this one paces the "your events are being dropped"
+	// log line so a flooding client cannot drive the server's disk writes
+	RELIABLE_FLOOD_EVENT,
+
+	RELIABLE_FLOOD_NUM
+} reliableFloodClass_t;
+
+// Minimum spacing in milliseconds between accepted messages of each class.
+// A human types a chat line about once a second; these only bite on floods.
+const int RELIABLE_FLOOD_CHAT_DELAY		= 500;
+const int RELIABLE_FLOOD_VCHAT_DELAY	= 500;
+const int RELIABLE_FLOOD_VOTEMAPS_DELAY	= 2000;
+const int RELIABLE_FLOOD_EVENT_DELAY	= 5000;
+
+// "has never sent one of these".  It cannot be 0: gameLocal.time starts at 0 on
+// every map load, so a zero stamp reads as "sent just now" and swallows each
+// client's first message of the map.  For the vote map list that drop is
+// permanent - idMultiplayerGame::RequestVoteMaps only ever asks once.
+const int RELIABLE_FLOOD_NEVER			= -1000000;
+
+// openQ4: how many events one client may have pending in the shared event
+// queue at once, so a single sender cannot dominate it.
+const int MAX_CLIENT_QUEUED_EVENTS		= 32;
 
 typedef enum {
 	GAMESTATE_UNINITIALIZED,		// prior to Init being called
@@ -986,6 +1027,7 @@ public:
 	int						LiquidLevelForEntity	( idEntity *ent, int &liquidType );
 	void					PlayLiquidSoundOn		( idEntity *ent, const char *key, const s_channelType channel );
 	void					PlayLiquidEffectAt		( const char *key, const idVec3 &origin );
+	bool					PlayLiquidTrail			( int liquidContents, const idVec3 &start, const idVec3 &end );
 // openQ4 END
 
 	void					UpdateRepeaterInfo( bool transmit = false );
@@ -1192,6 +1234,11 @@ private:
 
 	idEventQueue			eventQueue;
 
+	// openQ4: gameLocal.time at which each client's last accepted message of a
+	// given flood class arrived.  Reset on connect and disconnect so a slot
+	// reused by a new player does not inherit a cooldown.
+	int						clientReliableFloodTime[ MAX_CLIENTS ][ RELIABLE_FLOOD_NUM ];
+
 	idList<idPlayerStart*>	spawnSpots;
 // RAVEN BEGIN
 // ddynerman: two lists to hold team spawn points for team based games
@@ -1259,6 +1306,10 @@ private:
 	void					WriteGameStateToSnapshot( idBitMsgDelta &msg ) const;
 	void					ReadGameStateFromSnapshot( const idBitMsgDelta &msg );
 	void					NetworkEventWarning( const entityNetEvent_t *event, const char *fmt, ... ) id_attribute((format(printf,3,4)));
+// openQ4: client->server reliable message abuse guards
+	int						CountQueuedClientEvents( int clientNum );
+	bool					CheckClientReliableFlood( int clientNum, int floodClass, int delayMS );
+	void					ResetClientReliableFlood( int clientNum );
 	void					ServerProcessEntityNetworkEventQueue( void );
 	void					ClientProcessEntityNetworkEventQueue( void );
 	void					ClientShowSnapshot( int clientNum ) const;
@@ -1296,6 +1347,40 @@ private:
 	void					BuildModList( void );
 
 public:
+	// openQ4: server side hitscan lag compensation, ported from the single
+	// player tree where it was unreachable (only game-mp loads in multiplayer).
+	// Public because the weapons that run their own traces - the lightning gun
+	// and the gauntlet - have to bracket them with Begin/End themselves.
+	enum { MP_LAGCOMP_HISTORY = 64 };
+
+	struct mpLagCompFrame_t {
+		int					time;
+		idVec3				origin;
+		idMat3				axis;
+		bool				valid;
+	};
+
+	struct mpLagCompRestore_t {
+		idPlayer *			player;
+		idPhysics *			physics;		// the physics object rewound, so a
+											// ragdoll swap inside the bracket
+											// cannot be "restored" onto the corpse
+		idVec3				originalOrigin;
+		idMat3				originalAxis;
+		idVec3				rewoundOrigin;
+	};
+
+	mpLagCompFrame_t		mpLagCompHistory[MAX_CLIENTS][MP_LAGCOMP_HISTORY];
+	int						mpLagCompHistoryHead;
+
+	void					ResetMPLagCompensationHistory( void );
+	void					InvalidateMPLagCompensationHistory( int clientNum );
+	void					CaptureMPLagCompensationFrame( void );
+	bool					SelectMPLagCompensationFrame( int clientNum, int targetTime, mpLagCompFrame_t &outFrame ) const;
+	bool					ComputeMPLagCompensationRewind( const idPlayer *shooter, int &rewindMS ) const;
+	bool					BeginMPLagCompensation( const idPlayer *shooter, mpLagCompRestore_t restoreState[MAX_CLIENTS], int &restoreCount );
+	void					EndMPLagCompensation( mpLagCompRestore_t restoreState[MAX_CLIENTS], int restoreCount );
+
 	void					LoadBanList();
 	void					SaveBanList();
 	void					FlushBanList();

@@ -65,6 +65,7 @@ idProjectile::idProjectile( void ) {
 	rotation.Init( 0, 0.0f, mat3_identity.ToQuat(), mat3_identity.ToQuat() );
 
 	flyEffect			= NULL;
+	flyEffectIsLiquid	= false;
 	flyEffectAttenuateSpeed = 0.0f;
 	bounceCount			= 0;
 	hitCount			= 0;
@@ -592,6 +593,36 @@ void idProjectile::Think( void ) {
 				}
 			}
 		}
+
+// openQ4 BEGIN
+		// Smoke does not survive underwater. Swap the fly trail for a bubble trail while the
+		// projectile is inside a liquid, and put the original back when it comes out.
+		{
+			const int trailLiquid = gameLocal.LiquidContentsAtPoint( GetPhysics()->GetOrigin(), this );
+			const bool wantLiquidTrail = ( trailLiquid != 0 );
+
+			if ( wantLiquidTrail != flyEffectIsLiquid ) {
+				if ( flyEffect ) {
+					flyEffect->Stop();
+					flyEffect = NULL;
+				}
+
+				if ( wantLiquidTrail ) {
+					const idDict *liquidDict = gameLocal.FindEntityDefDict( "liquid_openq4", false );
+					const idDecl *bubbles = liquidDict
+						? gameLocal.GetEffect( *liquidDict, va( "fx_trail_%s", gameLocal.LiquidTypeName( trailLiquid ) ) )
+						: NULL;
+					if ( bubbles ) {
+						flyEffect = PlayEffect( bubbles, renderEntity.origin, renderEntity.axis, true );
+					}
+				} else {
+					flyEffect = PlayEffect( "fx_fly", renderEntity.origin, renderEntity.axis, true );
+				}
+
+				flyEffectIsLiquid = wantLiquidTrail;
+			}
+		}
+// openQ4 END
 
 		// Stop the trail effect if the physics flag was removed
 		if ( flyEffect && flyEffectAttenuateSpeed > 0.0f ) {

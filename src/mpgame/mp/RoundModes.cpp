@@ -263,8 +263,15 @@ void rvFreezeTagGameState::PlayerDeath( idPlayer* dead, idPlayer* killer ) {
 	// Arm the unattended thaw.  A player the world killed rather than an enemy
 	// is usually somewhere nobody can stand - the bottom of a pit, a lava pool -
 	// so they come back on a much shorter fuse, as they do in Quake Live.
+	//
+	// openQ4: only a genuine world kill qualifies.  killer == dead is a suicide -
+	// idMultiplayerGame::PlayerDeath passes the victim as their own killer for the
+	// "kill" command and for self-inflicted splash - and that is a deliberate act
+	// in a place the player chose, not the mode failing to give them a reachable
+	// body.  Treating it as a world death let a cornered player type "kill" and be
+	// back in five seconds for the price of one point, which is the whole mode.
 	{
-		const bool worldDeath = ( killer == NULL || killer == dead );
+		const bool worldDeath = ( killer == NULL );
 		const int seconds = worldDeath
 			? gameLocal.serverInfo.GetInt( "si_freezeWorldDeathDelay" )
 			: gameLocal.serverInfo.GetInt( "si_freezeAutoThawTime" );

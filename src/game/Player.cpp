@@ -9266,8 +9266,9 @@ void idPlayer::UpdateAir( void ) {
 	}
 
 	if ( g_debugLiquid.GetBool() && drowning && ( gameLocal.framenum % 60 ) == 0 ) {
-		gameLocal.Printf( "liquid: submerged, air %d/%d draining %d per frame, health %d\n",
-					   airTics, pm_airTics.GetInteger(), airDrain, health );
+		gameLocal.Printf( "liquid: submerged, air %d/%d draining %d per frame, health %d, speed %.1f\n",
+					   airTics, pm_airTics.GetInteger(), airDrain, health,
+					   GetPhysics()->GetLinearVelocity().Length() );
 	}
 // openQ4 END
 
@@ -10189,6 +10190,41 @@ void idPlayer::EvaluateControls( void ) {
 idPlayer::AdjustSpeed
 ==============
 */
+// openQ4 BEGIN
+/*
+==============
+idPlayer::OpenQ4_SwimSpeed
+
+Swimming is its own gait rather than a fraction of whatever the player was doing on land.
+
+Quake 3 swims at 160 units a second - its 320 run speed times pm_swimScale 0.5 - and openQ4 runs at
+160, so matching Quake 3 means the two happen to be the same number here. That is a consequence of
+Quake 4's slower footspeed, not a coincidence worth hiding: pm_swimSpeed states the target directly
+in units so it can be read against Q3 without doing arithmetic first.
+
+Multiplayer and a stroggified player get pm_swimSpeedFast instead - the strogg body is the campaign's
+own "you are faster now" moment, and multiplayer has always wanted more pace than the campaign.
+==============
+*/
+float idPlayer::OpenQ4_SwimSpeed( void ) {
+	float speed = ( gameLocal.isMultiplayer || isStrogg )
+				? pm_swimSpeedFast.GetFloat()
+				: pm_swimSpeed.GetFloat();
+
+	// carry the same modifiers the running speed gets, so haste still helps in water
+	speed *= PowerUpModifier( PMOD_SPEED );
+
+	if ( influenceActive == INFLUENCE_LEVEL3 ) {
+		speed *= 0.33f;
+	}
+	if ( OpenQ4_TurboModeActive() ) {
+		speed *= OPENQ4_TURBO_MOVE_SCALE;
+	}
+
+	return speed;
+}
+// openQ4 END
+
 void idPlayer::AdjustSpeed( void ) {
 	float speed;
 
@@ -10221,6 +10257,10 @@ void idPlayer::AdjustSpeed( void ) {
 	}
 
 	physicsObj.SetSpeed( speed, crouchSpeed );
+
+// openQ4 BEGIN
+	physicsObj.SetSwimSpeed( OpenQ4_SwimSpeed() );
+// openQ4 END
 }
 
 /*

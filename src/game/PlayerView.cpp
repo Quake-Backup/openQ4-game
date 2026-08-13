@@ -45,6 +45,11 @@ idPlayerView::idPlayerView() {
 	dvScale = 1.0f;
 	shakeScale = 1.0f;
 	tvScale = 1.0f;
+
+// openQ4 BEGIN
+	liquidViewAmount = 0.0f;
+	liquidViewContents = 0;
+// openQ4 END
 }
 
 /*
@@ -781,6 +786,21 @@ idPlayerView::ScreenFade
 =================
 */
 // openQ4 BEGIN
+// openQ4 BEGIN
+/*
+===================
+OpenQ4_SoundPointInLiquid
+
+Handed to the sound world so it can tell which side of a liquid surface an emitter is on. Kept as a
+plain function rather than a member because the sound system holds it as a function pointer, and it
+is deliberately a bare contents query: it runs once per audible emitter per frame.
+===================
+*/
+static bool OpenQ4_SoundPointInLiquid( const idVec3 &point ) {
+	return gameLocal.LiquidContentsAtPoint( point, NULL ) != 0;
+}
+// openQ4 END
+
 /*
 ===================
 idPlayerView::LiquidAtEye
@@ -801,6 +821,9 @@ int idPlayerView::LiquidAtEye( const renderView_t *view ) const {
 	idSoundWorld *gameSoundWorld = soundSystem->GetSoundWorldFromId( SOUNDWORLD_GAME );
 	if ( gameSoundWorld ) {
 		gameSoundWorld->SetUnderwater( liquidContents != 0 );
+		// Lets the sound world work out which emitters have to shout through the surface to be
+		// heard. Liquid lives in the collision world, which only the game can reach.
+		gameSoundWorld->SetLiquidTest( OpenQ4_SoundPointInLiquid );
 	}
 
 	return liquidContents;
@@ -815,27 +838,66 @@ games shade the view underwater. Drawn over the world but under the HUD.
 ===================
 */
 void idPlayerView::LiquidOverlay( int liquidContents ) {
-	if ( !liquidContents || g_liquidScreenTint.GetFloat() <= 0.0f ) {
+	// Ease in and out rather than snapping. Breaking the surface is fast in life but a hard cut
+	// between two very different images reads as a glitch, so give it about a sixth of a second.
+	const float target = liquidContents ? 1.0f : 0.0f;
+	const float step = MS2SEC( gameLocal.msec ) * 6.0f;
+	if ( liquidViewAmount < target ) {
+		liquidViewAmount = Min( target, liquidViewAmount + step );
+	} else if ( liquidViewAmount > target ) {
+		liquidViewAmount = Max( target, liquidViewAmount - step );
+	}
+
+	// which liquid to colour it as: while fading out, keep the one we were in
+	if ( liquidContents ) {
+		liquidViewContents = liquidContents;
+	} else if ( liquidViewAmount <= 0.0f ) {
+		liquidViewContents = 0;
+	}
+
+	const float scale = idMath::ClampFloat( 0.0f, 1.0f, g_liquidScreenTint.GetFloat() );
+	const float amount = liquidViewAmount * scale;
+
+	// The post-process filter multiplies the scene, so these are absorption colours - what the
+	// liquid lets through - not a wash laid over the top. Water takes red out first, which is most
+	// of why underwater looks the way it does.
+	// The tint is what the liquid still lets through after fogDistance units of it, so the two
+	// numbers together describe the water rather than just colouring it: clear water carries a
+	// long way and loses red, lava carries almost nothing.
+	idVec3 filterTint( 0.35f, 0.65f, 0.85f );
+	float fogDistance = 1400.0f;
+	if ( liquidViewContents & CONTENTS_LAVA ) {
+		filterTint.Set( 1.0f, 0.42f, 0.18f );
+		fogDistance = 110.0f;
+	} else if ( liquidViewContents & CONTENTS_SLIME ) {
+		filterTint.Set( 0.42f, 0.76f, 0.32f );
+		fogDistance = 420.0f;
+	}
+
+	// Hand the state to the renderer. It answers false when it cannot draw the effect - the Vulkan
+	// module has no arbitrary GLSL, and the pass can be switched off with r_underwater - in which
+	// case fall back to a flat wash so the player still knows they are under something.
+	if ( renderSystem->SetUnderwaterView( amount, filterTint, fogDistance ) ) {
 		return;
 	}
 
-	idVec4 tint;
-	if ( liquidContents & CONTENTS_LAVA ) {
-		tint.Set( 0.65f, 0.14f, 0.02f, 0.65f );
-	} else if ( liquidContents & CONTENTS_SLIME ) {
-		tint.Set( 0.16f, 0.36f, 0.06f, 0.55f );
+	if ( amount <= 0.0f ) {
+		return;
+	}
+
+	idVec4 wash;
+	if ( liquidViewContents & CONTENTS_LAVA ) {
+		wash.Set( 0.65f, 0.14f, 0.02f, 0.65f );
+	} else if ( liquidViewContents & CONTENTS_SLIME ) {
+		wash.Set( 0.16f, 0.36f, 0.06f, 0.55f );
 	} else {
-		tint.Set( 0.03f, 0.26f, 0.44f, 0.45f );
+		wash.Set( 0.03f, 0.26f, 0.44f, 0.45f );
 	}
-
-	tint[3] *= idMath::ClampFloat( 0.0f, 1.0f, g_liquidScreenTint.GetFloat() );
-	if ( tint[3] <= 0.0f ) {
-		return;
-	}
+	wash[3] *= amount;
 
 	const bool previousUIViewportMode = renderSystem->GetUseUIViewportFor2D();
 	renderSystem->SetUseUIViewportFor2D( false );
-	renderSystem->SetColor4( tint[0], tint[1], tint[2], tint[3] );
+	renderSystem->SetColor4( wash[0], wash[1], wash[2], wash[3] );
 	renderSystem->DrawStretchPic( 0, 0, 640, 480, 0, 0, 1, 1, declManager->FindMaterial( "_white" ) );
 	renderSystem->SetUseUIViewportFor2D( previousUIViewportMode );
 }

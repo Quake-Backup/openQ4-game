@@ -1079,6 +1079,7 @@ private:
 	void					BobCycle( const idVec3 &pushVelocity );
 	void					EvaluateControls( void );
 	void					AdjustSpeed( void );
+	float					OpenQ4_SwimSpeed( void );		// openQ4: swimming is its own gait
 	void					AdjustBodyAngles( void );
 	void					Move( void );
 	void					SetSpectateOrigin( void );

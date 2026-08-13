@@ -902,6 +902,10 @@ bool mpMatchSession::IsMatchClockRunning( void ) const {
 	// A pending request is committed at the next frame boundary before that
 	// frame's gameplay simulation.  Counting the boundary delta here would add
 	// time for a simulation frame which is deliberately skipped.
+	//
+	// openQ4: this reports the published pause overlay, so AdvanceFrame cannot
+	// use it directly for the frame which completes a resume: that frame is
+	// simulated, and its delta belongs to the match clock.  See AdvanceFrame.
 	return IsLivePhase() && pause.state == MP_MATCH_PAUSE_RUNNING;
 }
 
@@ -921,18 +925,31 @@ mpMatchMutationResult mpMatchSession::AdvanceFrame( mpMatchEngineTime engineNow 
 	}
 
 	const int64_t delta = engineNow.Milliseconds() - engineTime.Milliseconds();
-	int64_t nextMatchMsec = matchTime.Milliseconds();
-	if ( IsMatchClockRunning() &&
-		!AddNonNegativeMsec( matchTime.Milliseconds(), delta, nextMatchMsec ) ) {
-		return Rejected( MP_MATCH_REASON_CLOCK_OVERFLOW );
-	}
 
+	// openQ4: the pause overlay transitions at this frame boundary, before the
+	// frame's gameplay simulation, and the adapter decides whether to simulate
+	// from the post-transition overlay ( idMultiplayerGame::IsGameplayFrozen is
+	// pause.state != MP_MATCH_PAUSE_RUNNING, evaluated after this call ).  The
+	// transitions are therefore resolved first, and the accrual below is gated on
+	// the post-transition overlay so that the frame which completes a resume -
+	// which is simulated - is also counted.
 	const bool commitPendingPause = pause.state == MP_MATCH_PAUSE_PENDING;
 	const bool timeoutExpires = pause.state == MP_MATCH_PAUSED &&
 		pause.kind == MP_MATCH_PAUSE_KIND_TEAM_TIMEOUT && engineNow >= pause.pauseExpiry;
 	const bool resumeCompletes = pause.state == MP_MATCH_RESUME_COUNTDOWN &&
 		engineNow >= pause.resumeDeadline;
 	const bool semanticMutation = commitPendingPause || timeoutExpires || resumeCompletes;
+
+	// Only the resume completion publishes MP_MATCH_PAUSE_RUNNING, so this is
+	// exactly "the overlay is running once this boundary has been applied".
+	const bool clockRunsThisFrame = IsLivePhase() &&
+		( pause.state == MP_MATCH_PAUSE_RUNNING || resumeCompletes );
+	int64_t nextMatchMsec = matchTime.Milliseconds();
+	if ( clockRunsThisFrame &&
+		!AddNonNegativeMsec( matchTime.Milliseconds(), delta, nextMatchMsec ) ) {
+		return Rejected( MP_MATCH_REASON_CLOCK_OVERFLOW );
+	}
+
 	if ( semanticMutation && !CanCommit() ) {
 		return Rejected( MP_MATCH_REASON_REVISION_EXHAUSTED );
 	}

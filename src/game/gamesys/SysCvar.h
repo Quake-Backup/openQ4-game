@@ -256,6 +256,8 @@ extern idCVar	pm_airTics;
 
 // openQ4 BEGIN
 extern idCVar	pm_waterAirTics;
+extern idCVar	pm_swimSpeed;
+extern idCVar	pm_swimSpeedFast;
 extern idCVar	g_liquidDamageInterval;
 extern idCVar	g_drownDamageMax;
 extern idCVar	g_liquidScreenTint;

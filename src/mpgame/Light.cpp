@@ -786,7 +786,9 @@ void idLight::BecomeBroken( idEntity *activator ) {
 
 	if ( gameLocal.isServer ) {
 
-		ServerSendInstanceEvent( EVENT_BECOMEBROKEN, NULL, true, -1 );
+		// openQ4: saveEvent must be false - saved-event replay is unimplemented here, and asking for
+		// it used to drop the server the moment anyone shot a breakable light
+		ServerSendInstanceEvent( EVENT_BECOMEBROKEN, NULL, false, -1 );
 
 		if ( spawnArgs.GetString( "def_damage", "", &damageDefName ) ) {
 			idVec3 origin = renderEntity.origin + renderEntity.bounds.GetCenter() * renderEntity.axis;
