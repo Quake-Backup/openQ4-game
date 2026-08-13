@@ -494,6 +494,7 @@ public:
 	int						mHz;					// hertz
 	mutable int			presentationClockGameTime;	// transient game-time anchor for render interpolation
 	mutable int			presentationClockRealTime;	// transient real-time anchor for render interpolation
+	mutable int			presentationClockLastTime;	// transient monotonic presentation result
 	int						autoExecAfterMapLoadStartTime;
 	bool					autoExecAfterMapLoadPending;
 	bool					autoExecAfterMapLoadWaitingLogged;

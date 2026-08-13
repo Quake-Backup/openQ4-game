@@ -1146,11 +1146,17 @@ void rvWeapon::UpdatePresentationViewModelState( const idVec3 &playerOrigin, con
 	}
 
 	if ( presentationViewModelTime == gameLocal.time ) {
+		const idVec3 originDelta = origin - presentationCurViewModelOrigin;
+		idAngles angleDelta = axis.ToAngles() - presentationCurViewModelAxis.ToAngles();
+		angleDelta.Normalize180();
+		const bool continuousPose =
+			originDelta.LengthSqr() <= Square( 24.0f ) &&
+			angleDelta.Length() <= 70.0f;
 		presentationCurPlayerViewOrigin = playerOrigin;
 		presentationCurPlayerViewAxis = playerAxis;
 		presentationCurViewModelOrigin = origin;
 		presentationCurViewModelAxis = axis;
-		if ( owner == NULL || !owner->CanInterpolatePresentationView() ) {
+		if ( owner == NULL || !owner->CanInterpolatePresentationView() || !continuousPose ) {
 			presentationViewModelCanInterpolate = false;
 			presentationPrevPlayerViewOrigin = presentationCurPlayerViewOrigin;
 			presentationPrevPlayerViewAxis = presentationCurPlayerViewAxis;

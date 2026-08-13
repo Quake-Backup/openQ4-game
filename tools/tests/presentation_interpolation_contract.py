@@ -80,11 +80,13 @@ def check_source_root(source_root: str) -> dict[str, str]:
     weapon_cpp = read(f"{source_root}/Weapon.cpp")
 
     require(game_local_h, "mutable int\t\t\tpresentationClockGameTime", f"{context} transient clock")
+    require(game_local_h, "presentationClockLastTime", f"{context} monotonic clock state")
     require(game_local_h, "GetPresentationInterpolationFraction", f"{context} interpolation API")
 
     clear = function(game_local_cpp, "void idGameLocal::Clear( void )", context)
     require(clear, "presentationClockGameTime = -1;", f"{context} clock reset")
     require(clear, "presentationClockRealTime = 0;", f"{context} clock reset")
+    require(clear, "presentationClockLastTime = -1;", f"{context} monotonic clock reset")
 
     clock = function(
         game_local_cpp,
@@ -94,7 +96,13 @@ def check_source_root(source_root: str) -> dict[str, str]:
     require(clock, "GetDemoState() == DEMO_PLAYING || IsTimeDemo()", f"{context} demo clock bypass")
     require(clock, "const int realTime = Sys_Milliseconds();", f"{context} exported clock source")
     require(clock, "presentationClockGameTime != time", f"{context} simulation anchor")
-    require(clock, "return time + Max( 0, realTime - presentationClockRealTime );", f"{context} mapped clock")
+    require(clock, "const int maxOffset = Max( 0, GetMSec() );", f"{context} authoritative-tic clock bound")
+    require(clock, "idMath::ClampInt( 0, maxOffset", f"{context} bounded clock offset")
+    require(clock, "time < presentationClockGameTime", f"{context} backward-time reset guard")
+    require(clock, "presentationClockLastTime = time;", f"{context} map-time clock reseed")
+    require(clock, "presentationClockLastTime = Max( presentationClockLastTime, presentationTime );", f"{context} monotonic resume clock")
+    require(clock, "return presentationClockLastTime;", f"{context} mapped clock")
+    reject(clock, "return time + Max( 0, realTime - presentationClockRealTime );", f"{context} unbounded paused clock")
     reject(clock, "common->GetPresentationTime", f"{context} game-DLL clock boundary")
 
     fraction = function(
@@ -120,6 +128,7 @@ def check_source_root(source_root: str) -> dict[str, str]:
     )
     require(prepare, "player->CalculateRenderView();", f"{context} draw-time camera refresh")
     require(prepare, "UpdatePresentationWeapon", f"{context} draw-time viewmodel refresh")
+    require(prepare, "GetDemoState() == DEMO_PLAYING || IsTimeDemo()", f"{context} demo presentation bypass")
     reject(prepare, "Think(", f"{context} presentation-only draw pass")
     reject(prepare, "RunFrame(", f"{context} presentation-only draw pass")
 
@@ -153,6 +162,15 @@ def check_source_root(source_root: str) -> dict[str, str]:
     require(update, "common->GetUserCmdMsecFloat()", f"{context} sequential-tic guard")
     require(update, "originDelta.LengthSqr() <= Square( 32.0f )", f"{context} teleport guard")
     require(update, "angleDelta.Length() <= 90.0f", f"{context} view discontinuity guard")
+    same_time_update = function(
+        "void synthetic() {" + update + "}",
+        "if ( presentationViewTime == gameLocal.time )",
+        context,
+    )
+    require(same_time_update, "originDelta.LengthSqr() <= Square( 32.0f )", f"{context} same-tic teleport guard")
+    require(same_time_update, "angleDelta.Length() <= 90.0f", f"{context} same-tic angle guard")
+    require(same_time_update, "presentationCanInterpolate = false;", f"{context} same-tic history collapse")
+    require(same_time_update, "presentationPrevViewOrigin = presentationCurViewOrigin;", f"{context} same-tic endpoint collapse")
     require(update, "gameLocal.GetMHz() == common->GetUserCmdHz()", f"{context} exact cadence guard")
     if source_root == "src/mpgame":
         require(update, "!activePredictionViewSmoothing", f"{context} prediction smoothing guard")
@@ -187,6 +205,15 @@ def check_source_root(source_root: str) -> dict[str, str]:
     require(update_viewmodel, "owner->CanInterpolatePresentationView()", f"{context} camera/viewmodel cadence pairing")
     require(update_viewmodel, "originDelta.LengthSqr() <= Square( 24.0f )", f"{context} viewmodel discontinuity guard")
     require(update_viewmodel, "angleDelta.Length() <= 70.0f", f"{context} viewmodel angle guard")
+    same_time_viewmodel = function(
+        "void synthetic() {" + update_viewmodel + "}",
+        "if ( presentationViewModelTime == gameLocal.time )",
+        context,
+    )
+    require(same_time_viewmodel, "originDelta.LengthSqr() <= Square( 24.0f )", f"{context} same-tic viewmodel origin guard")
+    require(same_time_viewmodel, "angleDelta.Length() <= 70.0f", f"{context} same-tic viewmodel angle guard")
+    require(same_time_viewmodel, "!continuousPose", f"{context} same-tic viewmodel collapse guard")
+    require(same_time_viewmodel, "presentationViewModelCanInterpolate = false;", f"{context} same-tic viewmodel history collapse")
 
     get_viewmodel = function(
         weapon_cpp,
@@ -256,6 +283,40 @@ def check_fraction_examples() -> None:
     assert fraction(24.0, 16.0) == 1.0
 
 
+def check_bounded_clock_examples() -> None:
+    def presentation_time(
+        game_time: int,
+        real_time: int,
+        state: tuple[int, int, int],
+        max_offset: int,
+    ) -> tuple[int, tuple[int, int, int]]:
+        anchor_game_time, anchor_real_time, last_time = state
+        reset_clock = anchor_game_time < 0 or game_time < anchor_game_time
+        if reset_clock:
+            last_time = game_time
+        if reset_clock or anchor_game_time != game_time or real_time < anchor_real_time:
+            anchor_game_time = game_time
+            anchor_real_time = real_time
+        offset = max(0, min(max_offset, real_time - anchor_real_time))
+        last_time = max(last_time, game_time + offset)
+        return last_time, (anchor_game_time, anchor_real_time, last_time)
+
+    presented, state = presentation_time(1000, 0, (-1, 0, -1), 16)
+    assert presented == 1000
+    presented, state = presentation_time(1000, 10_000, state, 16)
+    assert presented == 1016
+    resumed, state = presentation_time(1016, 10_000, state, 16)
+    assert resumed == presented
+    next_tic, state = presentation_time(1032, 10_016, state, 16)
+    assert next_tic >= resumed
+    assert next_tic <= 1032 + 16
+
+    # If timescale shrinks the next authoritative delta, hold the prior
+    # bounded result until simulation catches up instead of moving backwards.
+    slow_tic, state = presentation_time(1033, 10_016, state, 1)
+    assert slow_tic >= next_tic
+
+
 def main() -> None:
     sp_contract = check_source_root(SOURCE_ROOTS[0])
     mp_contract = check_source_root(SOURCE_ROOTS[1])
@@ -263,6 +324,7 @@ def main() -> None:
         if sp_body != mp_contract[method]:
             raise AssertionError(f"SP/MP presentation method drift: {method}")
     check_fraction_examples()
+    check_bounded_clock_examples()
     print("presentation_interpolation_contract: ok")
 
 

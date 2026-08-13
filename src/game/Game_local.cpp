@@ -650,6 +650,7 @@ void idGameLocal::Clear( void ) {
 	time = 0;
 	presentationClockGameTime = -1;
 	presentationClockRealTime = 0;
+	presentationClockLastTime = -1;
 	autoExecAfterMapLoadStartTime = 0;
 	autoExecAfterMapLoadPending = false;
 	autoExecAfterMapLoadWaitingLogged = false;
@@ -5129,7 +5130,7 @@ sample between authoritative game tics.
 ================
 */
 void idGameLocal::PreparePlayerSceneForRender( idPlayer *player ) {
-	if ( player == NULL ) {
+	if ( player == NULL || GetDemoState() == DEMO_PLAYING || IsTimeDemo() ) {
 		return;
 	}
 
@@ -9028,12 +9029,20 @@ int idGameLocal::GetPresentationTimeMsec( void ) const {
 	}
 
 	const int realTime = Sys_Milliseconds();
-	if ( presentationClockGameTime != time || realTime < presentationClockRealTime ) {
+	const int maxOffset = Max( 0, GetMSec() );
+	const bool resetClock = presentationClockGameTime < 0 || time < presentationClockGameTime;
+	if ( resetClock ) {
+		presentationClockLastTime = time;
+	}
+	if ( resetClock || presentationClockGameTime != time || realTime < presentationClockRealTime ) {
 		presentationClockGameTime = time;
 		presentationClockRealTime = realTime;
 	}
 
-	return time + Max( 0, realTime - presentationClockRealTime );
+	const int presentationOffset = idMath::ClampInt( 0, maxOffset, realTime - presentationClockRealTime );
+	const int presentationTime = time + presentationOffset;
+	presentationClockLastTime = Max( presentationClockLastTime, presentationTime );
+	return presentationClockLastTime;
 }
 
 /*

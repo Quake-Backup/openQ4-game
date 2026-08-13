@@ -13113,9 +13113,21 @@ void idPlayer::UpdatePresentationViewState( void ) {
 	}
 
 	if ( presentationViewTime == gameLocal.time ) {
+		const idVec3 originDelta = simViewOrigin - presentationCurViewOrigin;
+		idAngles angleDelta = simViewAxis.ToAngles() - presentationCurViewAxis.ToAngles();
+		angleDelta.Normalize180();
+		const bool continuousView =
+			originDelta.LengthSqr() <= Square( 32.0f ) &&
+			angleDelta.Length() <= 90.0f;
 		presentationCurViewOrigin = simViewOrigin;
 		presentationCurViewAxis = simViewAxis;
 		presentationCurFov = simFov;
+		if ( !continuousView ) {
+			presentationCanInterpolate = false;
+			presentationPrevViewOrigin = presentationCurViewOrigin;
+			presentationPrevViewAxis = presentationCurViewAxis;
+			presentationPrevFov = presentationCurFov;
+		}
 		return;
 	}
 
