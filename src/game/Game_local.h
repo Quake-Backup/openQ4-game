@@ -492,6 +492,8 @@ public:
 	int						time;					// in msec
 	int						msec;					// time since last update in milliseconds
 	int						mHz;					// hertz
+	mutable int			presentationClockGameTime;	// transient game-time anchor for render interpolation
+	mutable int			presentationClockRealTime;	// transient real-time anchor for render interpolation
 	int						autoExecAfterMapLoadStartTime;
 	bool					autoExecAfterMapLoadPending;
 	bool					autoExecAfterMapLoadWaitingLogged;
@@ -592,6 +594,7 @@ public:
 // RAVEN END
 	virtual void			RepeaterFrame( const userOrigin_t *clientOrigins, bool lastCatchupFrame, int spoolTime = 0 ) {};
 	virtual bool			Draw( int clientNum );
+	void					PreparePlayerSceneForRender( idPlayer *player );
 	void					CheckAutoExecAfterMapLoad( void );
 	void					CheckAutoMachinegunImpact( void );
 	void					CheckAutoScreenshot( void );
@@ -799,6 +802,9 @@ public:
 	int						GetPreviousTime() const { return previousTime; }
 // RAVEN END
 	int						GetSpawnId( const idEntity *ent ) const;
+	int						GetPresentationTimeMsec( void ) const;
+	float					GetPresentationInterpolationFraction( void ) const;
+	idMat3					InterpolatePresentationAxis( const idMat3 &from, const idMat3 &to, float fraction ) const;
 
 	const idDeclEntityDef *	FindEntityDef( const char *name, bool makeDefault = true ) const;
 	const idDict *			FindEntityDefDict( const char *name, bool makeDefault = true ) const;

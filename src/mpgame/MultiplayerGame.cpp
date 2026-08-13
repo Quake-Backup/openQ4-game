@@ -16002,6 +16002,7 @@ bool idMultiplayerGame::Draw( int clientNum ) {
 		}
 	}
 
+	gameLocal.PreparePlayerSceneForRender( viewPlayer );
 	if ( !viewPlayer->GetRenderView() ) {
 		return false;
 	}

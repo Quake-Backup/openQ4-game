@@ -366,6 +366,69 @@ void rvViewWeapon::PresentWeapon( bool showViewModel ) {
 
 /*
 ================
+rvViewWeapon::UpdatePresentationWeapon
+
+Resubmit the viewmodel from the interpolated camera pose without running
+weapon scripts, animation state, physics, or networking a second time.
+================
+*/
+void rvViewWeapon::UpdatePresentationWeapon( bool showViewModel ) {
+	if ( fl.networkStale || gameLocal.inCinematic || weapon == NULL || GetPhysics() == NULL ) {
+		return;
+	}
+
+	idPlayer *owner = weapon->GetOwner();
+	if ( owner == NULL ) {
+		return;
+	}
+
+	renderEntity.allowSurfaceInViewID = owner->entityNumber + 1;
+	renderEntity.weaponDepthHackInViewID = owner->entityNumber + 1;
+
+	const idVec3 authoritativeOrigin = GetPhysics()->GetOrigin();
+	const idMat3 authoritativeAxis = GetPhysics()->GetAxis();
+	weapon->ApplyPresentationViewModelTransform();
+
+	if ( showViewModel && !( weapon->wsfl.zoom && weapon->GetZoomGui() ) ) {
+		UpdatePresentationModel();
+	} else {
+		FreeModelDef();
+	}
+
+	GetPhysics()->SetOrigin( authoritativeOrigin );
+	GetPhysics()->SetAxis( authoritativeAxis );
+}
+
+/*
+================
+rvViewWeapon::UpdatePresentationModel
+================
+*/
+void rvViewWeapon::UpdatePresentationModel( void ) {
+	if ( weapon == NULL || !renderEntity.hModel || IsHidden() ) {
+		return;
+	}
+
+	renderEntity_t presentationRenderEntity = renderEntity;
+	idVec3 origin;
+	idMat3 axis;
+	if ( GetPhysicsToVisualTransform( origin, axis ) ) {
+		presentationRenderEntity.axis = axis * weapon->ForeshortenAxis( GetPhysics()->GetAxis() );
+		presentationRenderEntity.origin = GetPhysics()->GetOrigin() + origin * presentationRenderEntity.axis;
+	} else {
+		presentationRenderEntity.axis = weapon->ForeshortenAxis( GetPhysics()->GetAxis() );
+		presentationRenderEntity.origin = GetPhysics()->GetOrigin();
+	}
+
+	if ( modelDefHandle == -1 ) {
+		modelDefHandle = gameRenderWorld->AddEntityDef( &presentationRenderEntity );
+	} else {
+		gameRenderWorld->UpdateEntityDef( modelDefHandle, &presentationRenderEntity );
+	}
+}
+
+/*
+================
 rvViewWeapon::WriteToSnapshot
 ================
 */
@@ -513,6 +576,7 @@ rvWeapon::rvWeapon ( void ) {
 	hitscanAttackDef = -1;
 	
 	forceGUIReload = false;
+	ResetPresentationViewModelState();
 }
 
 /*
@@ -635,6 +699,7 @@ void rvWeapon::Spawn ( void ) {
 	playerViewOrigin.Zero();
 	viewModelAxis.Identity();
 	viewModelOrigin.Zero();
+	ResetPresentationViewModelState();
 
 	// View
 	viewModelForeshorten = spawnArgs.GetFloat ( "foreshorten", "1" );
@@ -1018,36 +1083,185 @@ void rvWeapon::InitDefs( void ) {
 
 /*
 ================
-rvWeapon::Think
+rvWeapon::CalculateViewModelTransform
 ================
 */
-void rvWeapon::Think ( void ) {
-	
-	// Cache the player origin and axis
-	playerViewOrigin = owner->firstPersonViewOrigin;
-	playerViewAxis   = owner->firstPersonViewAxis;
-
-	// calculate weapon position based on player movement bobbing
-	owner->CalculateViewWeaponPos( viewModelOrigin, viewModelAxis );
+void rvWeapon::CalculateViewModelTransform( const idVec3 &playerOrigin, const idMat3 &playerAxis, idVec3 &origin, idMat3 &axis ) {
+	owner->CalculateViewWeaponPos( origin, axis, &playerOrigin, &playerAxis );
 
 	// hide offset is for dropping the gun when approaching a GUI or NPC
-	// This is simpler to manage than doing the weapon put-away animation
- 	if ( gameLocal.time - hideStartTime < hideTime ) {		
- 		float frac = ( float )( gameLocal.time - hideStartTime ) / ( float )hideTime;
- 		if ( hideStart < hideEnd ) {
- 			frac = 1.0f - frac;
- 			frac = 1.0f - frac * frac;
- 		} else {
- 			frac = frac * frac;
- 		}
+	if ( gameLocal.time - hideStartTime < hideTime ) {
+		float frac = static_cast<float>( gameLocal.time - hideStartTime ) / static_cast<float>( hideTime );
+		if ( hideStart < hideEnd ) {
+			frac = 1.0f - frac;
+			frac = 1.0f - frac * frac;
+		} else {
+			frac = frac * frac;
+		}
 		hideOffset = hideStart + ( hideEnd - hideStart ) * frac;
 	} else {
 		hideOffset = hideEnd;
 	}
-	viewModelOrigin += hideOffset * viewModelAxis[ 2 ];
+	origin += hideOffset * axis[ 2 ];
 
-	// kick up based on repeat firing
-	MuzzleRise( viewModelOrigin, viewModelAxis );
+	MuzzleRise( origin, axis );
+}
+
+/*
+================
+rvWeapon::ResetPresentationViewModelState
+================
+*/
+void rvWeapon::ResetPresentationViewModelState( void ) {
+	presentationViewModelTime = -1;
+	presentationViewModelCanInterpolate = false;
+	presentationPrevPlayerViewOrigin.Zero();
+	presentationPrevPlayerViewAxis.Identity();
+	presentationCurPlayerViewOrigin.Zero();
+	presentationCurPlayerViewAxis.Identity();
+	presentationPrevViewModelOrigin.Zero();
+	presentationPrevViewModelAxis.Identity();
+	presentationCurViewModelOrigin.Zero();
+	presentationCurViewModelAxis.Identity();
+}
+
+/*
+================
+rvWeapon::UpdatePresentationViewModelState
+
+Capture the complete authoritative pose, including bob, landing, hide, and
+kick offsets.  The draw path interpolates these cached endpoints and never
+reruns weapon logic.
+================
+*/
+void rvWeapon::UpdatePresentationViewModelState( const idVec3 &playerOrigin, const idMat3 &playerAxis, const idVec3 &origin, const idMat3 &axis ) {
+	if ( presentationViewModelTime < 0 ) {
+		presentationViewModelTime = gameLocal.time;
+		presentationViewModelCanInterpolate = false;
+		presentationPrevPlayerViewOrigin = playerOrigin;
+		presentationPrevPlayerViewAxis = playerAxis;
+		presentationCurPlayerViewOrigin = playerOrigin;
+		presentationCurPlayerViewAxis = playerAxis;
+		presentationPrevViewModelOrigin = origin;
+		presentationPrevViewModelAxis = axis;
+		presentationCurViewModelOrigin = origin;
+		presentationCurViewModelAxis = axis;
+		return;
+	}
+
+	if ( presentationViewModelTime == gameLocal.time ) {
+		presentationCurPlayerViewOrigin = playerOrigin;
+		presentationCurPlayerViewAxis = playerAxis;
+		presentationCurViewModelOrigin = origin;
+		presentationCurViewModelAxis = axis;
+		if ( owner == NULL || !owner->CanInterpolatePresentationView() ) {
+			presentationViewModelCanInterpolate = false;
+			presentationPrevPlayerViewOrigin = presentationCurPlayerViewOrigin;
+			presentationPrevPlayerViewAxis = presentationCurPlayerViewAxis;
+			presentationPrevViewModelOrigin = presentationCurViewModelOrigin;
+			presentationPrevViewModelAxis = presentationCurViewModelAxis;
+		}
+		return;
+	}
+
+	const int deltaTime = gameLocal.time - presentationViewModelTime;
+	const int maxSequentialDelta = static_cast<int>( idMath::Ceil( common->GetUserCmdMsecFloat() ) );
+	const bool sequentialFrame = deltaTime > 0 && deltaTime <= maxSequentialDelta;
+	const idVec3 originDelta = origin - presentationCurViewModelOrigin;
+	idAngles angleDelta = axis.ToAngles() - presentationCurViewModelAxis.ToAngles();
+	angleDelta.Normalize180();
+	const bool continuousPose =
+		originDelta.LengthSqr() <= Square( 24.0f ) &&
+		angleDelta.Length() <= 70.0f;
+
+	presentationPrevPlayerViewOrigin = presentationCurPlayerViewOrigin;
+	presentationPrevPlayerViewAxis = presentationCurPlayerViewAxis;
+	presentationPrevViewModelOrigin = presentationCurViewModelOrigin;
+	presentationPrevViewModelAxis = presentationCurViewModelAxis;
+	presentationCurPlayerViewOrigin = playerOrigin;
+	presentationCurPlayerViewAxis = playerAxis;
+	presentationCurViewModelOrigin = origin;
+	presentationCurViewModelAxis = axis;
+	presentationViewModelTime = gameLocal.time;
+	presentationViewModelCanInterpolate =
+		gameLocal.GetMHz() == common->GetUserCmdHz() &&
+		sequentialFrame &&
+		owner != NULL &&
+		owner->CanInterpolatePresentationView() &&
+		continuousPose;
+
+	if ( !presentationViewModelCanInterpolate ) {
+		presentationPrevPlayerViewOrigin = presentationCurPlayerViewOrigin;
+		presentationPrevPlayerViewAxis = presentationCurPlayerViewAxis;
+		presentationPrevViewModelOrigin = presentationCurViewModelOrigin;
+		presentationPrevViewModelAxis = presentationCurViewModelAxis;
+	}
+}
+
+/*
+================
+rvWeapon::GetPresentationViewModelTransform
+================
+*/
+void rvWeapon::GetPresentationViewModelTransform( idVec3 &origin, idMat3 &axis ) const {
+	if ( presentationViewModelTime < 0 || !presentationViewModelCanInterpolate || owner == NULL ) {
+		origin = viewModelOrigin;
+		axis = viewModelAxis;
+		return;
+	}
+
+	const float fraction = owner->GetPresentationViewBlendFraction();
+	idVec3 playerOrigin;
+	idMat3 playerAxis;
+	owner->GetPresentationViewPos( playerOrigin, playerAxis );
+
+	const idVec3 prevLocalOrigin =
+		( presentationPrevViewModelOrigin - presentationPrevPlayerViewOrigin ) *
+		presentationPrevPlayerViewAxis.Transpose();
+	const idMat3 prevLocalAxis =
+		presentationPrevViewModelAxis * presentationPrevPlayerViewAxis.Transpose();
+	const idVec3 curLocalOrigin =
+		( presentationCurViewModelOrigin - presentationCurPlayerViewOrigin ) *
+		presentationCurPlayerViewAxis.Transpose();
+	const idMat3 curLocalAxis =
+		presentationCurViewModelAxis * presentationCurPlayerViewAxis.Transpose();
+
+	idVec3 localOrigin;
+	localOrigin.Lerp( prevLocalOrigin, curLocalOrigin, fraction );
+	const idMat3 localAxis = gameLocal.InterpolatePresentationAxis( prevLocalAxis, curLocalAxis, fraction );
+	origin = playerOrigin + localOrigin * playerAxis;
+	axis = localAxis * playerAxis;
+}
+
+/*
+================
+rvWeapon::ApplyPresentationViewModelTransform
+================
+*/
+void rvWeapon::ApplyPresentationViewModelTransform( void ) {
+	if ( owner == NULL || viewModel == NULL ) {
+		return;
+	}
+
+	idVec3 presentationWeaponOrigin;
+	idMat3 presentationWeaponAxis;
+	GetPresentationViewModelTransform( presentationWeaponOrigin, presentationWeaponAxis );
+	viewModel->GetPhysics()->SetOrigin( presentationWeaponOrigin );
+	viewModel->GetPhysics()->SetAxis( presentationWeaponAxis );
+}
+
+/*
+================
+rvWeapon::Think
+================
+*/
+void rvWeapon::Think ( void ) {
+
+	// Cache the authoritative player origin and axis.
+	playerViewOrigin = owner->firstPersonViewOrigin;
+	playerViewAxis   = owner->firstPersonViewAxis;
+	CalculateViewModelTransform( playerViewOrigin, playerViewAxis, viewModelOrigin, viewModelAxis );
+	UpdatePresentationViewModelState( playerViewOrigin, playerViewAxis, viewModelOrigin, viewModelAxis );
 
 	if ( viewModel ) {
 		// set the physics position and orientation
@@ -1660,6 +1874,7 @@ void rvWeapon::Restore ( idRestoreGame *savefile ) {
 	savefile->ReadMat3		( viewModelAxis );
 	savefile->ReadAngles	( viewModelAngles );
 	savefile->ReadVec3		( viewModelOffset );	// cnicholson: Added unrestored var
+	ResetPresentationViewModelState();
 
 	// Offsets
 	savefile->ReadInt		( weaponAngleOffsetAverages );

@@ -648,6 +648,8 @@ void idGameLocal::Clear( void ) {
 	framenum = 0;
 	previousTime = 0;
 	time = 0;
+	presentationClockGameTime = -1;
+	presentationClockRealTime = 0;
 	autoExecAfterMapLoadStartTime = 0;
 	autoExecAfterMapLoadPending = false;
 	autoExecAfterMapLoadWaitingLogged = false;
@@ -5119,6 +5121,26 @@ void DisplayClipProfile( void );
 
 /*
 ================
+idGameLocal::PreparePlayerSceneForRender
+
+This is a presentation-only pass.  It never advances player or weapon logic;
+it rebuilds the render view and resubmits the viewmodel for the current render
+sample between authoritative game tics.
+================
+*/
+void idGameLocal::PreparePlayerSceneForRender( idPlayer *player ) {
+	if ( player == NULL ) {
+		return;
+	}
+
+	player->CalculateRenderView();
+	if ( player->weaponViewModel.GetEntity() != NULL ) {
+		player->weaponViewModel->UpdatePresentationWeapon( player->CanShowWeaponViewmodel() );
+	}
+}
+
+/*
+================
 idGameLocal::Draw
 
 makes rendering and sound system calls
@@ -5141,6 +5163,8 @@ bool idGameLocal::Draw( int clientNum ) {
 	if ( !player ) {
 		return false;
 	}
+
+	PreparePlayerSceneForRender( player );
 
 // RAVEN BEGIN
 // mwhitlock: Xenon texture streaming.
@@ -8987,6 +9011,69 @@ idGameLocal::GetSpawnId
 */
 int idGameLocal::GetSpawnId( const idEntity* ent ) const {
 	return PackEntitySpawnId( gameLocal.spawnIds[ ent->entityNumber ], ent->entityNumber );
+}
+
+/*
+================
+idGameLocal::GetPresentationTimeMsec
+
+Maps the engine's presentation clock onto the current simulation snapshot.
+The anchors are transient: map loads and restores reseed them instead of
+changing save-game or network state.
+================
+*/
+int idGameLocal::GetPresentationTimeMsec( void ) const {
+	if ( GetDemoState() == DEMO_PLAYING || IsTimeDemo() ) {
+		return time;
+	}
+
+	const int realTime = Sys_Milliseconds();
+	if ( presentationClockGameTime != time || realTime < presentationClockRealTime ) {
+		presentationClockGameTime = time;
+		presentationClockRealTime = realTime;
+	}
+
+	return time + Max( 0, realTime - presentationClockRealTime );
+}
+
+/*
+================
+idGameLocal::GetPresentationInterpolationFraction
+================
+*/
+float idGameLocal::GetPresentationInterpolationFraction( void ) const {
+	if ( GetDemoState() == DEMO_PLAYING || IsTimeDemo() ) {
+		return 1.0f;
+	}
+
+	// A newly anchored tic starts at the previous authoritative pose and
+	// reaches the current pose over one usercmd interval.  That deliberate,
+	// bounded latency avoids extrapolating the camera through collisions.
+	const float ticMsec = common->GetUserCmdMsecFloat();
+	if ( ticMsec <= 0.0f ) {
+		return 1.0f;
+	}
+
+	return idMath::ClampFloat( 0.0f, 1.0f,
+		static_cast<float>( GetPresentationTimeMsec() - time ) / ticMsec );
+}
+
+/*
+================
+idGameLocal::InterpolatePresentationAxis
+================
+*/
+idMat3 idGameLocal::InterpolatePresentationAxis( const idMat3 &from, const idMat3 &to, float fraction ) const {
+	if ( fraction <= 0.0f ) {
+		return from;
+	}
+	if ( fraction >= 1.0f ) {
+		return to;
+	}
+
+	idQuat blended;
+	blended.Slerp( from.ToQuat(), to.ToQuat(), fraction );
+	return blended.ToMat3();
 }
 
 /*

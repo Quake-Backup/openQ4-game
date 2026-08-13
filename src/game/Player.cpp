@@ -1813,6 +1813,7 @@ idPlayer::idPlayer() {
 
 	firstPersonViewOrigin	= vec3_zero;
 	firstPersonViewAxis		= mat3_identity;
+	ResetPresentationViewState();
 
 	hipJoint				= INVALID_JOINT;
 	chestJoint				= INVALID_JOINT;
@@ -3287,6 +3288,7 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 
 	savefile->ReadVec3( firstPersonViewOrigin );
 	savefile->ReadMat3( firstPersonViewAxis );
+	ResetPresentationViewState();
 
 	// don't bother restoring dragEntity since it's a dev tool
  	dragEntity.Clear();
@@ -12728,15 +12730,15 @@ idPlayer::CalculateViewWeaponPos
 Calculate the bobbing position of the view weapon
 ==============
 */
-void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis ) {
+void idPlayer::CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis, const idVec3 *viewOriginOverride, const idMat3 *viewAxisOverride ) {
 	float		scale;
 	float		fracsin;
 	idAngles	angles;
 	int			delta;
 
 	// CalculateRenderView must have been called first
-	const idVec3 &viewOrigin = firstPersonViewOrigin;
-	const idMat3 &viewAxis = firstPersonViewAxis;
+	const idVec3 &viewOrigin = ( viewOriginOverride != NULL ) ? *viewOriginOverride : firstPersonViewOrigin;
+	const idMat3 &viewAxis = ( viewAxisOverride != NULL ) ? *viewAxisOverride : firstPersonViewAxis;
 
 	// these cvars are just for hand tweaking before moving a value to the weapon def
 	idVec3	gunpos( g_gun_x.GetFloat() + cl_gun_x.GetFloat(),
@@ -13067,6 +13069,120 @@ void idPlayer::CalculateFirstPersonView( void ) {
 }
 
 /*
+===============
+idPlayer::ResetPresentationViewState
+
+Presentation history is deliberately transient.  Saving it would make the
+save format depend on a render-only cache and could blend across a restore.
+===============
+*/
+void idPlayer::ResetPresentationViewState( void ) {
+	presentationViewTime = -1;
+	presentationCanInterpolate = false;
+	presentationPrevViewOrigin = firstPersonViewOrigin;
+	presentationPrevViewAxis = firstPersonViewAxis;
+	presentationPrevFov = 0.0f;
+	presentationCurViewOrigin = firstPersonViewOrigin;
+	presentationCurViewAxis = firstPersonViewAxis;
+	presentationCurFov = 0.0f;
+}
+
+/*
+===============
+idPlayer::UpdatePresentationViewState
+
+Capture only authoritative 60 Hz view snapshots.  Draw-time calls at the same
+game time leave the endpoints intact and only advance the sampling fraction.
+===============
+*/
+void idPlayer::UpdatePresentationViewState( void ) {
+	const idVec3 simViewOrigin = firstPersonViewOrigin;
+	const idMat3 simViewAxis = firstPersonViewAxis;
+	const float simFov = CalcFov( true );
+
+	if ( presentationViewTime < 0 ) {
+		presentationViewTime = gameLocal.time;
+		presentationCanInterpolate = false;
+		presentationPrevViewOrigin = simViewOrigin;
+		presentationPrevViewAxis = simViewAxis;
+		presentationPrevFov = simFov;
+		presentationCurViewOrigin = simViewOrigin;
+		presentationCurViewAxis = simViewAxis;
+		presentationCurFov = simFov;
+		return;
+	}
+
+	if ( presentationViewTime == gameLocal.time ) {
+		presentationCurViewOrigin = simViewOrigin;
+		presentationCurViewAxis = simViewAxis;
+		presentationCurFov = simFov;
+		return;
+	}
+
+	const int deltaTime = gameLocal.time - presentationViewTime;
+	const int maxSequentialDelta = static_cast<int>( idMath::Ceil( common->GetUserCmdMsecFloat() ) );
+	const bool sequentialFrame = deltaTime > 0 && deltaTime <= maxSequentialDelta;
+	const idVec3 originDelta = simViewOrigin - presentationCurViewOrigin;
+	idAngles angleDelta = simViewAxis.ToAngles() - presentationCurViewAxis.ToAngles();
+	angleDelta.Normalize180();
+	const bool continuousView =
+		originDelta.LengthSqr() <= Square( 32.0f ) &&
+		angleDelta.Length() <= 90.0f;
+
+	presentationPrevViewOrigin = presentationCurViewOrigin;
+	presentationPrevViewAxis = presentationCurViewAxis;
+	presentationPrevFov = presentationCurFov;
+	presentationCurViewOrigin = simViewOrigin;
+	presentationCurViewAxis = simViewAxis;
+	presentationCurFov = simFov;
+	presentationViewTime = gameLocal.time;
+	presentationCanInterpolate =
+		gameLocal.GetMHz() == common->GetUserCmdHz() &&
+		sequentialFrame &&
+		continuousView;
+
+	if ( !presentationCanInterpolate ) {
+		presentationPrevViewOrigin = presentationCurViewOrigin;
+		presentationPrevViewAxis = presentationCurViewAxis;
+		presentationPrevFov = presentationCurFov;
+	}
+}
+
+/*
+===============
+idPlayer::GetPresentationViewPos
+===============
+*/
+void idPlayer::GetPresentationViewPos( idVec3 &origin, idMat3 &axis ) const {
+	if ( presentationViewTime < 0 || !presentationCanInterpolate ) {
+		origin = ( presentationViewTime < 0 ) ? firstPersonViewOrigin : presentationCurViewOrigin;
+		axis = ( presentationViewTime < 0 ) ? firstPersonViewAxis : presentationCurViewAxis;
+	} else {
+		const float fraction = GetPresentationViewBlendFraction();
+		origin.Lerp( presentationPrevViewOrigin, presentationCurViewOrigin, fraction );
+		axis = gameLocal.InterpolatePresentationAxis( presentationPrevViewAxis, presentationCurViewAxis, fraction );
+	}
+}
+
+bool idPlayer::CanInterpolatePresentationView( void ) const {
+	return presentationViewTime >= 0 && presentationCanInterpolate;
+}
+
+float idPlayer::GetPresentationViewBlendFraction( void ) const {
+	return CanInterpolatePresentationView() ? gameLocal.GetPresentationInterpolationFraction() : 1.0f;
+}
+
+float idPlayer::GetPresentationFov( void ) {
+	if ( presentationViewTime < 0 ) {
+		return CalcFov( true );
+	}
+	if ( !presentationCanInterpolate ) {
+		return presentationCurFov;
+	}
+	return idMath::Lerp( presentationPrevFov, presentationCurFov, GetPresentationViewBlendFraction() );
+}
+
+/*
 ==================
 idPlayer::GetRenderView
 
@@ -13143,6 +13259,7 @@ create the renderView for the current tic
 void idPlayer::CalculateRenderView( void ) {
 	int i;
 	float range;
+	const int presentationTime = gameLocal.GetPresentationTimeMsec();
 
 	if ( !renderView ) {
 // RAVEN BEGIN
@@ -13152,6 +13269,7 @@ void idPlayer::CalculateRenderView( void ) {
 		renderView = new renderView_t;
 	}
 	memset( renderView, 0, sizeof( *renderView ) );
+	UpdatePresentationViewState();
 
 	// copy global shader parms
 	for( i = 0; i < MAX_GLOBAL_SHADER_PARMS; i++ ) {
@@ -13159,7 +13277,7 @@ void idPlayer::CalculateRenderView( void ) {
 	}
 	gameLocal.ApplySpecialEffectsToRenderView( renderView );
 	renderView->globalMaterial = gameLocal.GetGlobalMaterial();
-	renderView->time = gameLocal.time;
+	renderView->time = ( gameLocal.GetDemoState() != DEMO_NONE || gameLocal.IsTimeDemo() ) ? gameLocal.time : presentationTime;
 
 	// calculate size of 3D view
 	renderView->x = 0;
@@ -13182,8 +13300,7 @@ void idPlayer::CalculateRenderView( void ) {
 		// First try out any camera views that can possibly fail.
 		if( !cameraIsSet ){
 			if ( g_stopTime.GetBool() ) {
-	 			renderView->vieworg = firstPersonViewOrigin;
-	 			renderView->viewaxis = firstPersonViewAxis;
+				GetPresentationViewPos( renderView->vieworg, renderView->viewaxis );
 				SmoothenRenderView( true );
  
 	 			if ( !pm_thirdPerson.GetBool() ) {
@@ -13205,8 +13322,7 @@ void idPlayer::CalculateRenderView( void ) {
 	 			OffsetThirdPersonView( 0.0f, 20.0f + range, 0.0f, false );
 				SmoothenRenderView( false );
 			} else {
-				renderView->vieworg = firstPersonViewOrigin;
-				renderView->viewaxis = firstPersonViewAxis;
+				GetPresentationViewPos( renderView->vieworg, renderView->viewaxis );
 				SmoothenRenderView( true );
 				// set the viewID to the clientNum + 1, so we can suppress the right player bodies and
 				// allow the right player view weapons
@@ -13215,7 +13331,7 @@ void idPlayer::CalculateRenderView( void ) {
 		}
 
 		// field of view
- 		gameLocal.CalcFov( CalcFov( true ), renderView->fov_x, renderView->fov_y );
+		gameLocal.CalcFov( GetPresentationFov(), renderView->fov_x, renderView->fov_y );
 
 	}
 
