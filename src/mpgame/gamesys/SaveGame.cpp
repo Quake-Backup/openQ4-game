@@ -250,9 +250,9 @@ idSaveGame::~idSaveGame()
 ================
 */
 idSaveGame::~idSaveGame( void ) {
-	if ( objects.Num() ) {
-		Close();
-	}
+	// SaveGame callers close successful writes explicitly.  Never attempt to
+	// serialize from here: an error can unwind this object after the map has
+	// already released the objects kept in the save registry.
 }
 
 /*
@@ -262,6 +262,9 @@ idSaveGame::Close
 */
 void idSaveGame::Close( void ) {
 	int i;
+	if ( objects.Num() == 0 ) {
+		return;
+	}
 	const int numObjects = objects.Num() - 1;
 
 	WriteSoundCommands();
@@ -591,8 +594,10 @@ void idSaveGame::WriteObject( const idClass *obj ) {
 
 	index = SaveGame_FindObjectIndex( objects, objectHash, obj );
 	if ( index < 0 ) {
-		gameLocal.Error( "idSaveGame::WriteObject: non-NULL object of type '%s' is not registered in the savegame object list",
-			obj->GetClassname() );
+		// Match the retail serializer: transient references which are not part of
+		// the saved object graph are restored as NULL.
+		gameLocal.DPrintf( "idSaveGame::WriteObject - WriteObject FindIndex failed; writing NULL reference\n" );
+		index = 0;
 	}
 
 	WriteInt( index );

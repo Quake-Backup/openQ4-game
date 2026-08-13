@@ -515,6 +515,7 @@ def validate_object_reference_guards(tree: str) -> None:
     source = read(f"src/{tree}/gamesys/SaveGame.cpp")
     header = read(f"src/{tree}/gamesys/SaveGame.h")
     event_source = read(f"src/{tree}/gamesys/Event.cpp")
+    game_local = read(f"src/{tree}/Game_local.cpp")
 
     for token in (
         "ReadObject( idClass *&obj, const idTypeInfo &expectedType, const char *detail )",
@@ -530,7 +531,8 @@ def validate_object_reference_guards(tree: str) -> None:
         "SaveGame_DeleteUnrestoredObjects( objects );",
         "idScopedUnrestoredObjectCleanup cleanup( objects );",
         "cleanup.Release();",
-        "non-NULL object of type '%s' is not registered in the savegame object list",
+        "WriteObject FindIndex failed; writing NULL reference",
+        "if ( objects.Num() == 0 )",
         "if ( index != 0 && obj == NULL )",
         "unresolved object index",
         "if ( obj != NULL && !obj->IsType( expectedType ) )",
@@ -538,11 +540,32 @@ def validate_object_reference_guards(tree: str) -> None:
     ):
         require(source, token, f"{tree} restored-object integrity guard")
 
+    destructor_start = source.index("idSaveGame::~idSaveGame( void )")
+    destructor_end = source.index("/*", destructor_start)
+    destructor_block = source[destructor_start:destructor_end]
     reject_regex(
-        source,
-        r"idSaveGame::WriteObject\s*-\s*WriteObject FindIndex failed",
-        f"{tree} missing saved objects must not silently serialize as NULL",
+        destructor_block,
+        r"Close\s*\(\s*\)\s*;",
+        f"{tree} save writer destructor must not serialize during error unwinding",
     )
+
+    write_object_start = source.index("void idSaveGame::WriteObject( const idClass *obj )")
+    write_object_end = source.index("/*", write_object_start)
+    write_object_block = source[write_object_start:write_object_end]
+    for token in (
+        "SaveGame_FindObjectIndex( objects, objectHash, obj )",
+        "WriteObject FindIndex failed; writing NULL reference",
+        "index = 0;",
+        "WriteInt( index );",
+    ):
+        require(write_object_block, token, f"{tree} transient saved-object fallback")
+    reject_regex(
+        write_object_block,
+        r"gameLocal\.Error|obj->GetClassname\s*\(",
+        f"{tree} transient saved-object fallback must not abort or dereference the object",
+    )
+    require(game_local, "savegame.Close();", f"{tree} primary save explicitly closes its writer")
+    require(source, "sg.Close();", f"{tree} checkSave explicitly closes its writer")
     require_regex(
         source,
         r"objectTypes\.SetNum\s*\(\s*num\s*\+\s*1\s*\)\s*;.*?"
