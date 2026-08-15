@@ -361,6 +361,17 @@ jobs:
             }
           }
 
+      - name: Publish Windows x64 preview modules
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v6
+        with:
+          name: openq4-gamelibs-windows-x64-${{ github.sha }}
+          path: |
+            builddir/src/game-sp_x64.dll
+            builddir/src/game-mp_x64.dll
+          if-no-files-found: error
+          retention-days: 30
+
   macos:
     name: macOS ${{ matrix.arch_label }} GameLibs
     runs-on: ${{ matrix.runner }}
