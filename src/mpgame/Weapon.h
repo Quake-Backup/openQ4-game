@@ -64,6 +64,8 @@ public:
 
 	// Visual presentation
 	void					PresentWeapon				( bool showViewModel );
+	void					UpdatePresentationWeapon	( bool showViewModel );
+	void					UpdatePresentationModel		( void );
 
 	// Networking
 	virtual void			WriteToSnapshot				( idBitMsgDelta &msg ) const;
@@ -255,9 +257,14 @@ protected:
 	void				DisableViewEffectWeaponDepthHack	( rvClientEffect* effect );
 
 	void				FindViewModelPositionStyle	( idVec3& viewOffset, idAngles& viewAngles ) const;
+	void				CalculateViewModelTransform	( const idVec3 &playerOrigin, const idMat3 &playerAxis, idVec3 &origin, idMat3 &axis );
+	void				ResetPresentationViewModelState( void );
+	void				UpdatePresentationViewModelState( const idVec3 &playerOrigin, const idMat3 &playerAxis, const idVec3 &origin, const idMat3 &axis );
+	void				GetPresentationViewModelTransform( idVec3 &origin, idMat3 &axis ) const;
 
 public:
 
+	void				ApplyPresentationViewModelTransform( void );
 	void				InitLights					( void );
 	void				InitWorldModel				( void );
 	void				InitViewModel				( void );
@@ -379,6 +386,16 @@ public:
 	// these are the player render view parms, which include bobbing
 	idVec3							playerViewOrigin;
 	idMat3							playerViewAxis;
+	int								presentationViewModelTime;
+	bool							presentationViewModelCanInterpolate;
+	idVec3							presentationPrevPlayerViewOrigin;
+	idMat3							presentationPrevPlayerViewAxis;
+	idVec3							presentationCurPlayerViewOrigin;
+	idMat3							presentationCurPlayerViewAxis;
+	idVec3							presentationPrevViewModelOrigin;
+	idMat3							presentationPrevViewModelAxis;
+	idVec3							presentationCurViewModelOrigin;
+	idMat3							presentationCurViewModelAxis;
 
 
 	// View Model

@@ -122,6 +122,22 @@ endif"""
     require(workflow, "Windows x64 GameLibs", "Windows GameLibs CI job")
     require(workflow, "tools/build/meson_setup.ps1 setup --wipe builddir", "Windows GameLibs CI configure")
     require(workflow, "tools/build/meson_setup.ps1 compile -C builddir", "Windows GameLibs CI compile")
+    windows_job_start = workflow.index("\n  windows-x64:")
+    windows_job_end = workflow.index("\n  macos:", windows_job_start)
+    windows_job = workflow[windows_job_start:windows_job_end]
+    preview_step_start = windows_job.index("      - name: Publish Windows x64 preview modules")
+    preview_step = windows_job[preview_step_start:]
+    if windows_job.count("      - name: Publish Windows x64 preview modules") != 1:
+        raise AssertionError("Windows GameLib preview artifact step must occur exactly once")
+    if windows_job.index("      - name: Validate Windows outputs") >= preview_step_start:
+        raise AssertionError("Windows outputs must be validated before publishing the preview artifact")
+    require(preview_step, "if: github.event_name == 'pull_request'", "Windows preview PR-only policy")
+    require(preview_step, "uses: actions/upload-artifact@v6", "Windows preview artifact action")
+    require(preview_step, "name: openq4-gamelibs-windows-x64-${{ github.sha }}", "Windows preview artifact identity")
+    require(preview_step, "builddir/src/game-sp_x64.dll", "Windows preview SP module")
+    require(preview_step, "builddir/src/game-mp_x64.dll", "Windows preview MP module")
+    require(preview_step, "if-no-files-found: error", "Windows preview missing-output policy")
+    require(preview_step, "retention-days: 30", "Windows preview retention policy")
     require(readme, "experimental macOS ARM64 and Intel x64 coverage", "README macOS CI architecture scope")
     require(readme, "Standalone Intel CI is build evidence only", "README Intel support boundary")
 

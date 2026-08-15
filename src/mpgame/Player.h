@@ -412,6 +412,14 @@ public:
 	// if a third person view is used
 	idVec3					firstPersonViewOrigin;
 	idMat3					firstPersonViewAxis;
+	int						presentationViewTime;
+	bool					presentationCanInterpolate;
+	idVec3					presentationPrevViewOrigin;
+	idMat3					presentationPrevViewAxis;
+	float					presentationPrevFov;
+	idVec3					presentationCurViewOrigin;
+	idMat3					presentationCurViewAxis;
+	float					presentationCurFov;
 
 	idDragEntity			dragEntity;
 	idVec3					intentDir;
@@ -503,6 +511,12 @@ public:
 	void					SmoothenRenderView( bool firstPerson );
 	void					CalculateRenderView( void );	// called every tic by player code
 	void					CalculateFirstPersonView( void );
+	void					ResetPresentationViewState( void );
+	void					UpdatePresentationViewState( void );
+	void					GetPresentationViewPos( idVec3 &origin, idMat3 &axis ) const;
+	bool					CanInterpolatePresentationView( void ) const;
+	float					GetPresentationViewBlendFraction( void ) const;
+	float					GetPresentationFov( void );
 	
 	void					DrawShadow( renderEntity_t *headRenderEnt );
 	void					UpdateMultiplayerVisibilityEffects( renderEntity_t *headRenderEnt );
@@ -516,7 +530,7 @@ public:
 
  	float					DefaultFov( void ) const;
  	float					CalcFov( bool honorZoom );
-	void					CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis );
+	void					CalculateViewWeaponPos( idVec3 &origin, idMat3 &axis, const idVec3 *viewOriginOverride = NULL, const idMat3 *viewAxisOverride = NULL );
 	void					GetViewPos( idVec3 &origin, idMat3 &axis ) const;
  	void					OffsetThirdPersonView( float angle, float range, float height, bool clip );
 	void					OffsetThirdPersonVehicleView( bool clip );
