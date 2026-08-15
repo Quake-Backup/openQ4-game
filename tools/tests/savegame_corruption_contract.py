@@ -100,6 +100,28 @@ def reject_regex(haystack: str, pattern: str, context: str) -> None:
         raise AssertionError(f"Unexpected pattern {pattern!r} in {context}: {match.group(0)!r}")
 
 
+def extract_function(source: str, signature: str, context: str) -> str:
+    signature_start = source.find(signature)
+    if signature_start < 0:
+        raise AssertionError(f"Missing function signature {signature!r} in {context}")
+
+    body_start = source.find("{", signature_start + len(signature))
+    if body_start < 0:
+        raise AssertionError(f"Missing function body for {signature!r} in {context}")
+
+    depth = 0
+    for index in range(body_start, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[body_start + 1 : index]
+
+    raise AssertionError(f"Unterminated function body for {signature!r} in {context}")
+
+
 def parse_last_define_int(relative_path: str, name: str) -> int:
     values = re.findall(rf"^\s*#define\s+{re.escape(name)}\s+(\d+)\b", read(relative_path), re.MULTILINE)
     if not values:
@@ -664,6 +686,40 @@ def validate_entity_restore_guards(tree: str) -> None:
     )
 
 
+def validate_attachment_partial_restore_cleanup(tree: str) -> None:
+    attachment_source = read(f"src/{tree}/AFEntity.cpp")
+    clear_body = extract_function(
+        attachment_source,
+        "void idAFAttachment::ClearBody( void )",
+        f"{tree} attachment cleanup",
+    )
+
+    require_regex(
+        clear_body,
+        r"body\s*=\s*NULL\s*;\s*"
+        r"damageJoint\s*=\s*INVALID_JOINT\s*;\s*"
+        r".*?if\s*\(\s*GetPhysics\s*\(\s*\)\s*==\s*NULL\s*\)\s*\{\s*"
+        r"fl\.hidden\s*=\s*true\s*;\s*"
+        r"FreeModelDef\s*\(\s*\)\s*;\s*"
+        r"UnlinkCombat\s*\(\s*\)\s*;\s*"
+        r"return\s*;\s*\}\s*"
+        r"Hide\s*\(\s*\)\s*;",
+        f"{tree} partially restored attachment cleanup",
+    )
+
+    entity_source = read(f"src/{tree}/Entity.cpp")
+    update_transform = extract_function(
+        entity_source,
+        "void idEntity::UpdateModelTransform( void )",
+        f"{tree} entity visual transform",
+    )
+    reject_regex(
+        update_transform,
+        r"GetPhysics\s*\(\s*\)\s*(?:==|!=)\s*NULL",
+        f"{tree} generic model-transform physics guard",
+    )
+
+
 def validate_brittle_fracture_guards(tree: str) -> None:
     source = read(f"src/{tree}/BrittleFracture.cpp")
 
@@ -1078,6 +1134,7 @@ def main() -> None:
         validate_object_reference_guards(tree)
         validate_game_local_restore_guards(tree)
         validate_entity_restore_guards(tree)
+        validate_attachment_partial_restore_cleanup(tree)
         validate_brittle_fracture_guards(tree)
         validate_ai_manager_restore_guards(tree)
         validate_state_restore_guards(tree)
