@@ -133,6 +133,25 @@ def static_contracts(header: str, source: str) -> None:
         "repeater fail-closed branch",
     )
 
+    recipient_shape = function_body(
+        source, "static bool RecipientShapeIsValid"
+    )
+    for token in (
+        "const bool activePlayerSideValid",
+        "player && !captain && recipient.side == MP_MATCH_SIDE_NONE",
+        "!activePlayerSideValid",
+    ):
+        require(token=token, text=recipient_shape, context="active FFA recipient shape")
+
+    grant = function_body(source, "bool MPMatchDisclosureBuildGrant")
+    require(
+        grant,
+        "if ( IsSide( recipient.side ) ) {\n"
+        "\t\t\tAddObserverKind( MP_MATCH_VIEW_OBSERVER_TEAM_VITAL, grant );\n"
+        "\t\t}",
+        "team-only active-player tactical disclosure",
+    )
+
 
 def integration_contract(multiplayer: str, player: str, game_state: str) -> None:
     require(
@@ -712,6 +731,79 @@ static int RoleAndWireMatrix() {
     return 0;
 }
 
+static int PlayerRecipientShapeMatrix() {
+    const mpMatchDisclosurePolicy_t policy = FullPolicy();
+    const mpMatchViewAudienceMask_t ownSideAudience =
+        MPMatchViewAudienceBit(MP_MATCH_VIEW_AUDIENCE_OWN_SIDE);
+    const mpMatchViewObserverKindMask_t teamVitalKind =
+        MPMatchViewObserverKindBit(MP_MATCH_VIEW_OBSERVER_TEAM_VITAL);
+    mpMatchDisclosureGrant_t grant;
+    mpMatchDisclosureReason_t reason;
+    mpMatchViewError_t viewError;
+    mpSessionView view;
+
+    // Active FFA humans are authoritative players without a team side. They
+    // must receive a valid public projection, never synthetic team telemetry.
+    mpMatchDisclosureRecipient_t ffaPlayer = Recipient(
+        Role(MP_MATCH_ROLE_PLAYER), MP_MATCH_SIDE_NONE, true);
+    CHECK(MPMatchDisclosureBuildGrant(policy, ffaPlayer, grant));
+    CHECK(grant.valid && grant.principal == MP_MATCH_DISCLOSURE_PRINCIPAL_PLAYER &&
+        grant.reason == MP_MATCH_DISCLOSURE_REASON_NONE);
+    CHECK(grant.viewPolicy.ownSide == MP_MATCH_VIEW_SIDE_NONE);
+    CHECK((grant.viewPolicy.audiences & ownSideAudience) == 0);
+    CHECK((grant.viewPolicy.observerKinds & teamVitalKind) == 0);
+    CHECK(grant.followSideMask == 0 && !grant.itemTimingAllowed);
+    mpMatchViewSource_t source = SourceFor(ffaPlayer);
+    CHECK(AddSafeObservers(source, policy));
+    CHECK(MPMatchDisclosureBuildView(policy, ffaPlayer, source, view,
+        &reason, &viewError));
+    CHECK(view.teamVitalCount == 0 && view.followTargetCount == 0 &&
+        view.itemTimingCount == 0);
+    CHECK(CheckWireCounts(view, 0, 0, 0, false) == 0);
+
+    // A captain remains a team role and cannot use the neutral-player shape.
+    mpMatchDisclosureRecipient_t neutralCaptain = Recipient(
+        Role(MP_MATCH_ROLE_PLAYER) | Role(MP_MATCH_ROLE_CAPTAIN),
+        MP_MATCH_SIDE_NONE, true);
+    CHECK(!MPMatchDisclosureBuildGrant(policy, neutralCaptain, grant));
+    CHECK(grant.reason == MP_MATCH_DISCLOSURE_REASON_ROLE_CONFLICT);
+
+    // A team player retains the existing own-side tactical projection.
+    mpMatchDisclosureRecipient_t teamPlayer = Recipient(
+        Role(MP_MATCH_ROLE_PLAYER), 1, true);
+    CHECK(MPMatchDisclosureBuildGrant(policy, teamPlayer, grant));
+    CHECK(grant.valid && grant.principal == MP_MATCH_DISCLOSURE_PRINCIPAL_PLAYER &&
+        grant.reason == MP_MATCH_DISCLOSURE_REASON_NONE);
+    CHECK(grant.viewPolicy.ownSide == 1);
+    CHECK((grant.viewPolicy.audiences & ownSideAudience) != 0);
+    CHECK((grant.viewPolicy.observerKinds & teamVitalKind) != 0);
+    source = SourceFor(teamPlayer);
+    CHECK(AddSafeObservers(source, policy));
+    CHECK(MPMatchDisclosureBuildView(policy, teamPlayer, source, view,
+        &reason, &viewError));
+    CHECK(view.teamVitalCount == 1 && view.teamVitals[0].participantSide == 1);
+    CHECK(CheckWireCounts(view, 1, 0, 0, false) == 0);
+
+    // An inactive neutral observer stays a spectator and does not gain a
+    // player principal or own-side audience from the FFA exception.
+    mpMatchDisclosureRecipient_t spectator = Recipient(
+        0, MP_MATCH_SIDE_NONE, false);
+    CHECK(MPMatchDisclosureBuildGrant(policy, spectator, grant));
+    CHECK(grant.valid &&
+        grant.principal == MP_MATCH_DISCLOSURE_PRINCIPAL_SPECTATOR);
+    CHECK(grant.reason == MP_MATCH_DISCLOSURE_REASON_SPECTATOR_LOCKED);
+    CHECK(grant.viewPolicy.ownSide == MP_MATCH_VIEW_SIDE_NONE);
+    CHECK((grant.viewPolicy.audiences & ownSideAudience) == 0);
+    source = SourceFor(spectator);
+    CHECK(AddSafeObservers(source, policy));
+    CHECK(MPMatchDisclosureBuildView(policy, spectator, source, view,
+        &reason, &viewError));
+    CHECK(view.teamVitalCount == 0 && view.followTargetCount == 0 &&
+        view.itemTimingCount == 0);
+    CHECK(CheckWireCounts(view, 0, 0, 0, false) == 0);
+    return 0;
+}
+
 static int SpectatorLockMatrix() {
     mpMatchDisclosurePolicy_t policy = FullPolicy();
     mpMatchDisclosureGrant_t grant;
@@ -894,6 +986,8 @@ int main() {
     CHECK(defaults.lockedSpectatorSideMask == MPMatchDisclosureAllSideBits());
     int failure = RoleAndWireMatrix();
     if (failure != 0) { fprintf(stderr, "RoleAndWireMatrix:%d\n", failure); return failure; }
+    failure = PlayerRecipientShapeMatrix();
+    if (failure != 0) { fprintf(stderr, "PlayerRecipientShapeMatrix:%d\n", failure); return failure; }
     failure = SpectatorLockMatrix();
     if (failure != 0) { fprintf(stderr, "SpectatorLockMatrix:%d\n", failure); return failure; }
     failure = DisabledAndHostileMatrix();

@@ -84,6 +84,8 @@ typedef struct mpMatchDisclosureRecipient_s {
 	mpMatchProtocolParticipantId_t participantId;
 	int					slot;
 	uint32_t			bindingGeneration;
+	// Active non-team players remain SIDE_NONE and receive only the public
+	// projection; team-affiliated active players use their authoritative side.
 	int					side;
 	mpMatchRoleMask_t	roles;
 	bool					active;

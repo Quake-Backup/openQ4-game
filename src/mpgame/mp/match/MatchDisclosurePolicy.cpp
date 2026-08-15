@@ -83,10 +83,15 @@ static bool RecipientShapeIsValid( const mpMatchDisclosureRecipient_t &recipient
 	const bool coach = HasRole( recipient.roles, MP_MATCH_ROLE_COACH );
 	const bool broadcaster = HasRole( recipient.roles, MP_MATCH_ROLE_BROADCASTER );
 	const bool referee = HasRole( recipient.roles, MP_MATCH_ROLE_REFEREE );
+	// FFA, Duel and Tourney participants are intentionally unsided in the match
+	// session.  An active ordinary player is therefore valid with SIDE_NONE;
+	// captains and every team-observation role still require a real side.
+	const bool activePlayerSideValid = IsSide( recipient.side ) ||
+		( player && !captain && recipient.side == MP_MATCH_SIDE_NONE );
 	const int observerRoleCount = ObserverRoleCount( recipient.roles );
 	if ( ( captain && !player ) || observerRoleCount > 1 ||
 		( observerRoleCount != 0 && ( player || captain ) ) ||
-		( recipient.active && ( !player || !IsSide( recipient.side ) ||
+		( recipient.active && ( !player || !activePlayerSideValid ||
 			coach || broadcaster || referee ) ) ||
 		( coach && !IsSide( recipient.side ) ) ||
 		( ( broadcaster || referee ) && recipient.side != MP_MATCH_SIDE_NONE ) ||
@@ -327,7 +332,12 @@ bool MPMatchDisclosureBuildGrant( const mpMatchDisclosurePolicy_t &policy,
 			MP_MATCH_DISCLOSURE_PRINCIPAL_CAPTAIN :
 			MP_MATCH_DISCLOSURE_PRINCIPAL_PLAYER;
 		grant.reason = MP_MATCH_DISCLOSURE_REASON_NONE;
-		AddObserverKind( MP_MATCH_VIEW_OBSERVER_TEAM_VITAL, grant );
+		// An unsided FFA player gets the public match projection only.  Giving it
+		// OWN_SIDE/TEAM_VITAL through a synthetic side would classify every FFA
+		// opponent as a teammate and disclose their tactical health information.
+		if ( IsSide( recipient.side ) ) {
+			AddObserverKind( MP_MATCH_VIEW_OBSERVER_TEAM_VITAL, grant );
+		}
 		return true;
 	}
 
