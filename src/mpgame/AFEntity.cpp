@@ -453,6 +453,18 @@ idAFAttachment::ClearBody
 void idAFAttachment::ClearBody( void ) {
 	body = NULL;
 	damageJoint = INVALID_JOINT;
+
+	// A failed save restore can tear the object graph down before idEntity::Restore
+	// installs this attachment's physics pointer.  The normal Hide path updates
+	// the render transform and therefore requires physics; perform only its
+	// teardown work for that partially restored state.
+	if ( GetPhysics() == NULL ) {
+		fl.hidden = true;
+		FreeModelDef();
+		UnlinkCombat();
+		return;
+	}
+
 	Hide();
 }
 
