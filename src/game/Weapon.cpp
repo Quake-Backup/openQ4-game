@@ -429,6 +429,30 @@ void rvViewWeapon::UpdatePresentationModel( void ) {
 	} else {
 		gameRenderWorld->UpdateEntityDef( modelDefHandle, &presentationRenderEntity );
 	}
+
+	UpdatePresentationClientEntities();
+}
+
+/*
+================
+rvViewWeapon::UpdatePresentationClientEntities
+
+Muzzle flashes, beams and attached models are client entities bound to view
+model joints, and rvViewWeapon::ConvertLocalToWorldTransform resolves those
+joints through this entity's physics pose.  The caller is holding the
+interpolated pose, so re-anchoring them here is what keeps them fixed to the
+muzzle; without it they sit on the last 60 Hz pose while the view model is
+drawn interpolated, and visibly unstick whenever the view is turning.
+================
+*/
+void rvViewWeapon::UpdatePresentationClientEntities( void ) {
+	rvClientEntity *cent;
+	rvClientEntity *next;
+
+	for ( cent = clientEntities.Next(); cent != NULL; cent = next ) {
+		next = cent->bindNode.Next();
+		cent->UpdatePresentationTransform();
+	}
 }
 
 /*

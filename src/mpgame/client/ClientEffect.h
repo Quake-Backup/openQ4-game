@@ -17,6 +17,7 @@ public:
 	virtual ~rvClientEffect( void );
 
 	virtual void		Think			( void );
+	virtual void		UpdatePresentationTransform	( void );
 	virtual void		DrawDebugInfo	( void ) const;
 	virtual void		FreeEntityDef	( void );
 	virtual void		UpdateBind		( void );

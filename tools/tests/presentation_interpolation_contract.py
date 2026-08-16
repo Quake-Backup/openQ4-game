@@ -78,6 +78,8 @@ def check_source_root(source_root: str) -> dict[str, str]:
     player_cpp = read(f"{source_root}/Player.cpp")
     weapon_h = read(f"{source_root}/Weapon.h")
     weapon_cpp = read(f"{source_root}/Weapon.cpp")
+    client_entity_cpp = read(f"{source_root}/client/ClientEntity.cpp")
+    client_effect_cpp = read(f"{source_root}/client/ClientEffect.cpp")
 
     require(game_local_h, "mutable int\t\t\tpresentationClockGameTime", f"{context} transient clock")
     require(game_local_h, "presentationClockLastTime", f"{context} monotonic clock state")
@@ -244,6 +246,38 @@ def check_source_root(source_root: str) -> dict[str, str]:
     )
     require(update_model, "renderEntity_t presentationRenderEntity = renderEntity;", f"{context} transient render copy")
     require(update_model, "UpdateEntityDef", f"{context} viewmodel render resubmission")
+    require(update_model, "UpdatePresentationClientEntities();", f"{context} attached client entities follow the drawn pose")
+
+    update_client_entities = function(
+        weapon_cpp,
+        "void rvViewWeapon::UpdatePresentationClientEntities( void )",
+        context,
+    )
+    require(update_client_entities, "clientEntities.Next()", f"{context} bound client entity walk")
+    require(update_client_entities, "next = cent->bindNode.Next();", f"{context} removal-safe client entity walk")
+    require(update_client_entities, "cent->UpdatePresentationTransform();", f"{context} client entity re-anchor")
+
+    cent_transform = function(
+        client_entity_cpp,
+        "void rvClientEntity::UpdatePresentationTransform ( void )",
+        context,
+    )
+    require(cent_transform, "if ( !bindMaster )", f"{context} bound-only re-anchor")
+    require(cent_transform, "UpdateBind();", f"{context} bind transform refresh")
+    require(cent_transform, "Present();", f"{context} client entity render resubmission")
+    reject(cent_transform, "UpdateSound", f"{context} no duplicate sound update")
+    reject(cent_transform, "RunPhysics", f"{context} presentation-only client entity pass")
+
+    effect_transform = function(
+        client_effect_cpp,
+        "void rvClientEffect::UpdatePresentationTransform ( void )",
+        context,
+    )
+    require(effect_transform, "effectDefHandle < 0", f"{context} live effect def only")
+    require(effect_transform, "UpdateBind();", f"{context} effect bind transform refresh")
+    require(effect_transform, "UpdateEffectDef( effectDefHandle, &renderEffect, gameLocal.time )", f"{context} authoritative effect clock")
+    reject(effect_transform, "FreeEffectDef", f"{context} effect lifetime stays in Think")
+    reject(effect_transform, "PostEventMS", f"{context} effect lifetime stays in Think")
 
     apply_transform = function(
         weapon_cpp,
@@ -267,6 +301,9 @@ def check_source_root(source_root: str) -> dict[str, str]:
         "get_viewmodel": normalized(get_viewmodel),
         "update_weapon": normalized(update_weapon),
         "update_model": normalized(update_model),
+        "update_client_entities": normalized(update_client_entities),
+        "cent_transform": normalized(cent_transform),
+        "effect_transform": normalized(effect_transform),
         "apply_transform": normalized(apply_transform),
     }
 

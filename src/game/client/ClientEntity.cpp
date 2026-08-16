@@ -96,6 +96,26 @@ void rvClientEntity::Think ( void ) {
 
 /*
 ================
+rvClientEntity::UpdatePresentationTransform
+
+Presentation-only re-anchor.  The caller has already moved the bind master to
+the interpolated pose it is about to be drawn at, so re-deriving the bind
+transform here keeps attached client entities locked to what is actually on
+screen instead of to the last authoritative tic.  Lifetime, sound and
+simulation deliberately stay in Think() on the game clock.
+================
+*/
+void rvClientEntity::UpdatePresentationTransform ( void ) {
+	if ( !bindMaster ) {
+		return;
+	}
+
+	UpdateBind();
+	Present();
+}
+
+/*
+================
 rvClientEntity::Bind
 ================
 */
