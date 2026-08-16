@@ -1430,6 +1430,16 @@ void rvWeapon::InitWorldModel( void ) {
 		return;
 	}
 
+	// openQ4: the world model entity outlives the rvWeapon - idPlayer::SetWeapon frees
+	// the weapon and builds a new one against the same idAnimatedEntity - so anything the
+	// previous weapon left bound to it survives onto this one.  InitViewModel starts with
+	// rvViewWeapon::Clear(), which stops every effect and sound on the view model; there
+	// was no equivalent here.  A weapon freed part way through its fire cycle never runs
+	// its own teardown, so a looping muzzle effect from the outgoing weapon keeps playing
+	// on top of the new one.
+	ent->StopAllEffects();
+	ent->StopSound( SND_CHANNEL_ANY, false );
+
 	const char *model = spawnArgs.GetString( "model_world" );
 	const char *attach = spawnArgs.GetString( "joint_attach" );
 
@@ -2289,6 +2299,11 @@ void rvWeapon::OwnerDied( void ) {
 		viewModel->Hide();
 	}
 	if ( worldModel ) {
+		// openQ4: Hide() only drops the model def - bound client effects and sounds keep
+		// running, and the world model is shown again on respawn with the dead weapon's
+		// effects still attached.
+		worldModel->StopSound( SND_CHANNEL_ANY, false );
+		worldModel->StopAllEffects( );
 		worldModel->Hide();
 	}
 }

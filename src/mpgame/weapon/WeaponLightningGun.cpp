@@ -46,9 +46,9 @@ public:
 	void					Save		( idSaveGame* savefile ) const;
 	void					Restore		( idRestoreGame* savefile );
 
-	bool			NoFireWhileSwitching( void ) const { return true; }
-
 protected:
+
+	void					StopFireEffects	( void );
 
 	void					UpdateTubes	( void );
 
@@ -115,17 +115,45 @@ rvWeaponLightningGun::~rvWeaponLightningGun
 */
 rvWeaponLightningGun::~rvWeaponLightningGun( void ) {
 	int i;
-	
+
 	if ( trailEffectView ) {
 		trailEffectView->Stop( );
-	}	
+	}
 	currentPath.StopEffects( );
 	StopChainLightning( );
-	
-	for ( i = 0; i < LIGHTNINGGUN_NUM_TUBES; i ++ ) {	
+
+	// The weapon can be freed part way through State_Fire - idPlayer::SetWeapon( -1 )
+	// out of ReadFromSnapshot, the weaponCatchup branch of Weapon_Combat, a pickup
+	// auto-switch with the trigger held - in which case STAGE_DONE never ran and the
+	// looping fire state is still on the two models the *next* weapon inherits.
+	StopFireEffects( );
+
+	for ( i = 0; i < LIGHTNINGGUN_NUM_TUBES; i ++ ) {
 		if ( tubeEffects[i] ) {
 			tubeEffects[i]->Stop( );
 		}
+	}
+}
+
+/*
+================
+rvWeaponLightningGun::StopFireEffects
+
+Tear down everything State_Fire's STAGE_INIT started.  The view model is cleared
+wholesale by rvViewWeapon::Clear() when the next weapon spawns, but the world
+model - the one every other player sees - is not, so its looping muzzle effect
+has to be stopped explicitly or it plays on over the new weapon.
+================
+*/
+void rvWeaponLightningGun::StopFireEffects( void ) {
+	if ( viewModel ) {
+		viewModel->StopSound( SND_CHANNEL_BODY2, false );
+		viewModel->StopEffect( "fx_spire" );
+		viewModel->StopEffect( "fx_flash" );
+		viewModel->SetShaderParm( 6, 1 );
+	}
+	if ( worldModel && weaponDef ) {
+		worldModel->StopEffect( gameLocal.GetEffect( weaponDef->dict, "fx_flash_world" ) );
 	}
 }
 
@@ -639,8 +667,14 @@ void rvWeaponLightningGun::ClientStale( void ) {
 		trailEffectView->Event_Remove();
 		trailEffectView = NULL;
 	}
-	
+
 	currentPath.StopEffects( );
+
+	// Think() is what normally retires these and it stops being called while the
+	// entity is stale, so a player who leaves the PVS mid-burst would keep the beam,
+	// its chain arcs and the world muzzle effect running until they came back.
+	StopChainLightning( );
+	StopFireEffects( );
 }
 
 /*
@@ -906,14 +940,7 @@ stateResult_t rvWeaponLightningGun::State_Fire( const stateParms_t& parms ) {
 			return SRESULT_WAIT;
 						
 		case STAGE_DONE:
-			StopSound( SND_CHANNEL_BODY2, false );
-
-			viewModel->StopEffect( "fx_spire" );
-			viewModel->StopEffect( "fx_flash" );
- 			if ( worldModel ) {
-  				worldModel->StopEffect( gameLocal.GetEffect( weaponDef->dict, "fx_flash_world" ) );
-  			}
-			viewModel->SetShaderParm( 6, 1 );
+			StopFireEffects( );
 
 			PlayAnim( ANIMCHANNEL_ALL, "shoot_end", 0 );
 			return SRESULT_STAGE( STAGE_DONEWAIT );

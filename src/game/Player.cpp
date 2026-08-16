@@ -5095,23 +5095,28 @@ void idPlayer::FireWeapon( void ) {
 		return;
 	}
 
-	if ( !hiddenWeapon && weapon->IsReady() ) {
-		// cheap hack so in MP the LG isn't allowed to fire in the short lapse while it goes from Fire -> Idle before changing to another weapon
-		// this gimps the weapon a lil bit but is consistent with the visual feedback clients are getting since 1.0
-		bool noFireWhileSwitching = false;
-		noFireWhileSwitching = ( gameLocal.isMultiplayer && idealWeapon != currentWeapon && weapon->NoFireWhileSwitching() );
-		if ( !noFireWhileSwitching ) {
-			if ( weapon->AmmoInClip() || weapon->AmmoAvailable() ) {
-				pfl.attackHeld = true;
-				weapon->BeginAttack();
-			} else {
-				pfl.attackHeld = false;
-				pfl.weaponFired = false;
-				StopFiring();
-				NextBestWeapon();
-			}
+	// openQ4: a weapon may not start an attack while it is being swapped out.  Kept in
+	// step with the multiplayer tree (src/mpgame/Player.cpp), where this matters: a
+	// client strips BUTTON_ATTACK for the whole of a weapon change, so a weapon that
+	// still fires server-side during that window spends ammo and spawns shots nobody
+	// rendered.  Inert here - gameLocal.isMultiplayer is never true in this tree.
+	const bool noFireWhileSwitching =
+		( gameLocal.isMultiplayer && idealWeapon != currentWeapon && weapon->NoFireWhileSwitching() );
+
+	if ( noFireWhileSwitching ) {
+		// Answered before the IsReloading() branch below on purpose: CancelReload()
+		// raises wsfl.attack, which would restart the fire cycle of a weapon that is
+		// already lowering.
+		StopFiring();
+	} else if ( !hiddenWeapon && weapon->IsReady() ) {
+		if ( weapon->AmmoInClip() || weapon->AmmoAvailable() ) {
+			pfl.attackHeld = true;
+			weapon->BeginAttack();
 		} else {
+			pfl.attackHeld = false;
+			pfl.weaponFired = false;
 			StopFiring();
+			NextBestWeapon();
 		}
 	}
 	// If reloading when fire is hit cancel the reload

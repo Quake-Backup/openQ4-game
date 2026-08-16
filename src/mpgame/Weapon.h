@@ -146,7 +146,10 @@ public:
 	virtual void		Attack						( bool altFire, int num_attacks, float spread, float fuseOffset, float power );
 	virtual void		GetDebugInfo				( debugInfoProc_t proc, void* userData );
 	virtual void		SpectatorCycle				( void ) { }
-	virtual bool		NoFireWhileSwitching		( void ) const { return false; }
+	// openQ4: true for every weapon now.  A multiplayer client drops BUTTON_ATTACK for
+	// the whole of a weapon change, so a weapon that still fires server-side during that
+	// window spends ammo and spawns shots nobody rendered.  See idPlayer::FireWeapon.
+	virtual bool		NoFireWhileSwitching		( void ) const { return true; }
 
 	void				Save						( idSaveGame *savefile ) const;
 	void				Restore						( idRestoreGame *savefile );

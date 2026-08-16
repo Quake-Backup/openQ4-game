@@ -5020,23 +5020,41 @@ void idPlayer::FireWeapon( void ) {
 		return;
 	}
 
-	if ( !hiddenWeapon && weapon->IsReady() ) {
-		// cheap hack so in MP the LG isn't allowed to fire in the short lapse while it goes from Fire -> Idle before changing to another weapon
-		// this gimps the weapon a lil bit but is consistent with the visual feedback clients are getting since 1.0
-		bool noFireWhileSwitching = false;
-		noFireWhileSwitching = ( gameLocal.isMultiplayer && idealWeapon != currentWeapon && weapon->NoFireWhileSwitching() );
-		if ( !noFireWhileSwitching ) {
-			if ( weapon->AmmoInClip() || weapon->AmmoAvailable() ) {
-				pfl.attackHeld = true;
-				weapon->BeginAttack();
-			} else {
-				pfl.attackHeld = false;
-				pfl.weaponFired = false;
-				StopFiring();
-				NextBestWeapon();
-			}
+	// openQ4: a weapon may not start an attack while it is being swapped out.
+	//
+	// Both client think paths strip BUTTON_ATTACK for the whole of a weapon change
+	// (idPlayer::LocalClientPredictionThink and idPlayer::NonLocalClientPredictionThink),
+	// so no client ever animates a shot during that window.  idPlayer::Think does not,
+	// which left the authoritative simulation firing the outgoing weapon while every
+	// client showed it holstering.  Weapon_Combat calls PutAway() and then FireWeapon()
+	// in the same frame, so the outgoing weapon could even be told to begin a fresh
+	// attack after it had been told to lower - the shotgun re-enters "Fire" from its own
+	// fire loop without re-testing wsfl.lowerWeapon, and spends another shell nobody saw.
+	// This is unmissable with the pickup auto-switch, which opens the window with no
+	// input from the player at all: run over a weapon with the trigger held and the
+	// server fires shots the shooter never sees.
+	//
+	// Raven patched exactly this for the lightning gun only (NoFireWhileSwitching), and
+	// their comment - "consistent with the visual feedback clients are getting" - is the
+	// argument for applying it to every weapon.  It is also what Q3/QL do: no firing
+	// during a weapon change.
+	const bool noFireWhileSwitching =
+		( gameLocal.isMultiplayer && idealWeapon != currentWeapon && weapon->NoFireWhileSwitching() );
+
+	if ( noFireWhileSwitching ) {
+		// Answered before the IsReloading() branch below on purpose: CancelReload()
+		// raises wsfl.attack, which would restart the fire cycle of a weapon that is
+		// already lowering.
+		StopFiring();
+	} else if ( !hiddenWeapon && weapon->IsReady() ) {
+		if ( weapon->AmmoInClip() || weapon->AmmoAvailable() ) {
+			pfl.attackHeld = true;
+			weapon->BeginAttack();
 		} else {
+			pfl.attackHeld = false;
+			pfl.weaponFired = false;
 			StopFiring();
+			NextBestWeapon();
 		}
 	}
 	// If reloading when fire is hit cancel the reload

@@ -836,6 +836,12 @@ bool idItem::GiveToPlayer( idPlayer *player, bool updateHud ) {
 	
 	// Handle the special ammo pickup that gives ammo for the weapon the player currently has
 	if ( spawnArgs.GetBool( "item_currentWeaponAmmo" ) ) {
+		// openQ4: there is no weapon object for the frames between idPlayer::SetWeapon
+		// freeing the old one and the new one being built, and running over an item is
+		// exactly how that window gets opened.
+		if ( player->weapon == NULL ) {
+			return false;
+		}
 		const char *ammoName = player->weapon->GetAmmoNameForIndex(player->weapon->GetAmmoType());
 		if ( player->weapon->TotalAmmoCount() != player->weapon->maxAmmo && player->weapon->AmmoRequired() ) {
 			player->GiveItem(ammoName);
