@@ -51,6 +51,8 @@ protected:
 
 	void					UpdateTubes	( void );
 
+	virtual void			UpdatePresentationEffects	( void );
+
 	// Tube effects
 	rvClientEntityPtr<rvClientEffect>	tubeEffects[LIGHTNINGGUN_NUM_TUBES];
 	idInterpolate<float>				tubeOffsets[LIGHTNINGGUN_NUM_TUBES];
@@ -523,13 +525,51 @@ void rvWeaponLightningGun::UpdateEffects( const idVec3& origin ) {
 	if ( !currentPath.target ) {
 		return;
 	}
-	
+
 	// Chain lightning effects
 	parent = &currentPath;
 	for ( i = 0; i < chainLightning.Num(); i ++ ) {
 		chainLightning[i].UpdateEffects( parent->origin, weaponDef->dict );
 		parent = &chainLightning[i];
 	}
+}
+
+/*
+================
+rvWeaponLightningGun::UpdatePresentationEffects
+
+The in-view trail is not bound to the view model -- Think() drives it from an
+explicit barrel-joint origin -- so the generic bound-client-entity re-anchor
+cannot reach it, and the beam would start from the last authoritative barrel
+position while the gun is drawn interpolated.
+
+Only the near end moves.  currentPath.origin is the authoritative trace
+endpoint and re-tracing here would be gameplay work on a draw frame, so the
+far end deliberately stays where the simulation put it.
+================
+*/
+void rvWeaponLightningGun::UpdatePresentationEffects( void ) {
+	if ( !trailEffectView ) {
+		return;
+	}
+
+	idVec3 origin;
+	idMat3 axis;
+
+	//fire from chest if show gun models is off.
+	if( !cvarSystem->GetCVarBool("ui_showGun") )	{
+		GetGlobalJointTransform( true, chestJointView, origin, axis );
+	} else {
+		GetGlobalJointTransform( true, barrelJointView, origin, axis );
+	}
+
+	idVec3 dir = currentPath.origin - origin;
+	dir.Normalize();
+
+	trailEffectView->SetOrigin( origin );
+	trailEffectView->SetAxis( dir.ToMat3() );
+	trailEffectView->SetEndOrigin( currentPath.origin );
+	trailEffectView->UpdatePresentationTransform();
 }
 
 /*

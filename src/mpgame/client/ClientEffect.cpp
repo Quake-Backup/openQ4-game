@@ -215,15 +215,18 @@ void rvClientEffect::Think ( void ) {
 rvClientEffect::UpdatePresentationTransform
 
 rvClientEntity::Present() does nothing for effects, so push the re-anchored
-bind transform straight at the effect def.  gameLocal.time is deliberate: BSE
-only spawns and ages when the def's game time advances past its service time,
-so repeating the authoritative time moves the effect without respawning or
-ageing particles a second time.  The completion result is ignored for the same
-reason -- Think() owns the effect's lifetime.
+transform straight at the effect def.  Unbound effects are accepted too:
+UpdateBind() still copies worldOrigin into the render effect for them, which is
+what lets a weapon reposition a beam it drives from an explicit origin.
+
+gameLocal.time is deliberate: BSE only spawns and ages when the def's game time
+advances past its service time, so repeating the authoritative time moves the
+effect without respawning or ageing particles a second time.  The completion
+result is ignored for the same reason -- Think() owns the effect's lifetime.
 ================
 */
 void rvClientEffect::UpdatePresentationTransform ( void ) {
-	if( !bindMaster || effectDefHandle < 0 || !renderEffect.declEffect ) {
+	if( effectDefHandle < 0 || !renderEffect.declEffect ) {
 		return;
 	}
 

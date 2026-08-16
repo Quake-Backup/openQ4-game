@@ -29,6 +29,8 @@ PRESENTATION_WEAPON_STATE = (
     "presentationPrevViewModelAxis",
     "presentationCurViewModelOrigin",
     "presentationCurViewModelAxis",
+    "presentationRestoreViewModelOrigin",
+    "presentationRestoreViewModelAxis",
 )
 
 
@@ -80,6 +82,7 @@ def check_source_root(source_root: str) -> dict[str, str]:
     weapon_cpp = read(f"{source_root}/Weapon.cpp")
     client_entity_cpp = read(f"{source_root}/client/ClientEntity.cpp")
     client_effect_cpp = read(f"{source_root}/client/ClientEffect.cpp")
+    lightning_gun_cpp = read(f"{source_root}/weapon/WeaponLightningGun.cpp")
 
     require(game_local_h, "mutable int\t\t\tpresentationClockGameTime", f"{context} transient clock")
     require(game_local_h, "presentationClockLastTime", f"{context} monotonic clock state")
@@ -236,6 +239,7 @@ def check_source_root(source_root: str) -> dict[str, str]:
     require(update_weapon, "ApplyPresentationViewModelTransform();", f"{context} interpolated viewmodel pose")
     require(update_weapon, "SetOrigin( authoritativeOrigin );", f"{context} authoritative pose restore")
     require(update_weapon, "SetAxis( authoritativeAxis );", f"{context} authoritative pose restore")
+    require(update_weapon, "RestoreAuthoritativeViewModelTransform();", f"{context} cached viewmodel pose restore")
     reject(update_weapon, "weapon->Think", f"{context} no duplicate weapon logic")
     reject(update_weapon, "UpdateSound", f"{context} no duplicate sound update")
 
@@ -247,6 +251,7 @@ def check_source_root(source_root: str) -> dict[str, str]:
     require(update_model, "renderEntity_t presentationRenderEntity = renderEntity;", f"{context} transient render copy")
     require(update_model, "UpdateEntityDef", f"{context} viewmodel render resubmission")
     require(update_model, "UpdatePresentationClientEntities();", f"{context} attached client entities follow the drawn pose")
+    require(update_model, "weapon->UpdatePresentationEffects();", f"{context} weapon-driven view effects follow the drawn pose")
 
     update_client_entities = function(
         weapon_cpp,
@@ -285,6 +290,30 @@ def check_source_root(source_root: str) -> dict[str, str]:
         context,
     )
     require(apply_transform, "GetPresentationViewModelTransform", f"{context} cached viewmodel sample")
+    require(apply_transform, "presentationRestoreViewModelOrigin = viewModelOrigin;", f"{context} authoritative cached pose stashed")
+    require(apply_transform, "viewModelOrigin = presentationWeaponOrigin;", f"{context} joint queries see the drawn pose")
+    require(apply_transform, "viewModelAxis = presentationWeaponAxis;", f"{context} joint queries see the drawn pose")
+
+    restore_transform = function(
+        weapon_cpp,
+        "void rvWeapon::RestoreAuthoritativeViewModelTransform( void )",
+        context,
+    )
+    require(restore_transform, "viewModelOrigin = presentationRestoreViewModelOrigin;", f"{context} cached pose restore")
+    require(restore_transform, "viewModelAxis = presentationRestoreViewModelAxis;", f"{context} cached pose restore")
+
+    lightning_effects = function(
+        lightning_gun_cpp,
+        "void rvWeaponLightningGun::UpdatePresentationEffects( void )",
+        context,
+    )
+    require(lightning_effects, "if ( !trailEffectView )", f"{context} never creates an effect on a draw frame")
+    require(lightning_effects, "GetGlobalJointTransform( true, barrelJointView", f"{context} beam origin from the drawn barrel joint")
+    require(lightning_effects, "SetEndOrigin( currentPath.origin );", f"{context} authoritative beam endpoint retained")
+    require(lightning_effects, "UpdatePresentationTransform();", f"{context} beam re-push")
+    reject(lightning_effects, "TracePoint", f"{context} no draw-frame tracing")
+    reject(lightning_effects, "UseAmmo", f"{context} no draw-frame gameplay")
+    reject(lightning_effects, "PlayEffect", f"{context} no draw-frame effect creation")
 
     think = function(weapon_cpp, "void rvWeapon::Think ( void )", context)
     require(think, "CalculateViewModelTransform", f"{context} authoritative viewmodel calculation")
@@ -305,6 +334,8 @@ def check_source_root(source_root: str) -> dict[str, str]:
         "cent_transform": normalized(cent_transform),
         "effect_transform": normalized(effect_transform),
         "apply_transform": normalized(apply_transform),
+        "restore_transform": normalized(restore_transform),
+        "lightning_effects": normalized(lightning_effects),
     }
 
 

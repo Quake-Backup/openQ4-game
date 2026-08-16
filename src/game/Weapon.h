@@ -265,6 +265,8 @@ protected:
 public:
 
 	void				ApplyPresentationViewModelTransform( void );
+	void				RestoreAuthoritativeViewModelTransform( void );
+	virtual void		UpdatePresentationEffects	( void );
 	void				InitLights					( void );
 	void				InitWorldModel				( void );
 	void				InitViewModel				( void );
@@ -396,6 +398,8 @@ public:
 	idMat3							presentationPrevViewModelAxis;
 	idVec3							presentationCurViewModelOrigin;
 	idMat3							presentationCurViewModelAxis;
+	idVec3							presentationRestoreViewModelOrigin;
+	idMat3							presentationRestoreViewModelAxis;
 
 
 	// View Model

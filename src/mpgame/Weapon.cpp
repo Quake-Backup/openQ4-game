@@ -395,6 +395,7 @@ void rvViewWeapon::UpdatePresentationWeapon( bool showViewModel ) {
 		FreeModelDef();
 	}
 
+	weapon->RestoreAuthoritativeViewModelTransform();
 	GetPhysics()->SetOrigin( authoritativeOrigin );
 	GetPhysics()->SetAxis( authoritativeAxis );
 }
@@ -427,6 +428,7 @@ void rvViewWeapon::UpdatePresentationModel( void ) {
 	}
 
 	UpdatePresentationClientEntities();
+	weapon->UpdatePresentationEffects();
 }
 
 /*
@@ -1147,6 +1149,8 @@ void rvWeapon::ResetPresentationViewModelState( void ) {
 	presentationPrevViewModelAxis.Identity();
 	presentationCurViewModelOrigin.Zero();
 	presentationCurViewModelAxis.Identity();
+	presentationRestoreViewModelOrigin.Zero();
+	presentationRestoreViewModelAxis.Identity();
 }
 
 /*
@@ -1278,6 +1282,44 @@ void rvWeapon::ApplyPresentationViewModelTransform( void ) {
 	GetPresentationViewModelTransform( presentationWeaponOrigin, presentationWeaponAxis );
 	viewModel->GetPhysics()->SetOrigin( presentationWeaponOrigin );
 	viewModel->GetPhysics()->SetAxis( presentationWeaponAxis );
+
+	// GetGlobalJointTransform( view ) resolves through these cached members and
+	// not through the view model's physics, so weapons that source an effect
+	// from a view model joint would still read the authoritative pose.  Held
+	// only for the draw pass; RestoreAuthoritativeViewModelTransform() puts the
+	// simulation values back before anything gameplay-facing can observe them.
+	presentationRestoreViewModelOrigin = viewModelOrigin;
+	presentationRestoreViewModelAxis = viewModelAxis;
+	viewModelOrigin = presentationWeaponOrigin;
+	viewModelAxis = presentationWeaponAxis;
+}
+
+/*
+================
+rvWeapon::RestoreAuthoritativeViewModelTransform
+================
+*/
+void rvWeapon::RestoreAuthoritativeViewModelTransform( void ) {
+	if ( owner == NULL || viewModel == NULL ) {
+		return;
+	}
+
+	viewModelOrigin = presentationRestoreViewModelOrigin;
+	viewModelAxis = presentationRestoreViewModelAxis;
+}
+
+/*
+================
+rvWeapon::UpdatePresentationEffects
+
+Draw-pass hook for weapons that drive a view effect from an explicit origin
+rather than from a bind, so the effect cannot be re-anchored by walking the
+view model's bound client entities.  Overrides may only recompute and re-push
+an existing effect's transform: no tracing, no ammo, no state, and never
+creating an effect, because this runs several times per authoritative tic.
+================
+*/
+void rvWeapon::UpdatePresentationEffects( void ) {
 }
 
 /*
