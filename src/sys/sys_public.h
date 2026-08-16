@@ -431,6 +431,12 @@ typedef struct engineWindowState_s {
 
 extern engineWindowState_t engineWindowState;
 
+// NULL-terminated list of the sys_lang values the engine knows, in the order
+// the cvar offers them. Framework code matches string-table and pak names
+// against it so a stray file cannot invent a language with no font or codepage
+// policy behind it.
+extern const char *	sysLanguageNames[];
+
 // window/context teardown owned by the platform layer; declared here so
 // framework code does not need renderer-internal headers to reach them
 void			GLimp_Shutdown( void );
