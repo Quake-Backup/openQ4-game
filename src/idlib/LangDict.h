@@ -54,6 +54,11 @@ int						LangDict_GetCodePageGeneration( void );
 						// for the handful of slots the codepage leaves unassigned.
 unsigned int			LangDict_UnicodeForByte( int byte );
 
+						// The reverse: which byte of the active codepage draws a code
+						// point, for the byte-indexed retail atlases. False when the
+						// codepage has no such byte.
+bool					LangDict_ByteForCodePoint( unsigned int codePoint, unsigned char &out );
+
 class idLangKeyValue {
 public:
 	idStr					key;

@@ -234,7 +234,7 @@ static int LangDict_DecodeUtf8( const unsigned char *p, int available, unsigned 
 	return extra + 1;
 }
 
-static bool LangDict_ByteForCodePoint( unsigned int codePoint, unsigned char &out ) {
+bool LangDict_ByteForCodePoint( unsigned int codePoint, unsigned char &out ) {
 	if ( codePoint < 0x80 ) {
 		out = (unsigned char)codePoint;
 		return true;
