@@ -171,6 +171,10 @@ def check_source_root(source_root: str) -> dict[str, str]:
 
     sample_pose = function(entity_cpp, "bool idEntity::SamplePresentationPose( void )", context)
     require(sample_pose, "presentationPoseTime == gameLocal.time", f"{context} one sample per authoritative tic")
+    require(sample_pose, "const idVec3 simOrigin = renderEntity.origin;", f"{context} samples the composed visual transform")
+    require(sample_pose, "const idMat3 simAxis = renderEntity.axis;", f"{context} samples the composed visual transform")
+    reject(sample_pose, "GetPhysics()->GetOrigin()", f"{context} physics sampling drops viewAxis and modelOffset")
+    reject(sample_pose, "GetPhysics()->GetAxis()", f"{context} physics sampling drops viewAxis and modelOffset")
     require(sample_pose, "common->GetUserCmdMsecFloat()", f"{context} sequential-tic guard")
     require(sample_pose, "gameLocal.GetMHz() == common->GetUserCmdHz()", f"{context} exact cadence guard")
     require(sample_pose, "PRESENTATION_POSE_STEP_TOLERANCE", f"{context} teleport guard scales with motion in flight")
@@ -191,6 +195,7 @@ def check_source_root(source_root: str) -> dict[str, str]:
     require(update_pose, "presentationPoseHeld = false;", f"{context} drawn pose is released before the restore")
     require(update_pose, "renderEntity.origin = authoritativeOrigin;", f"{context} authoritative render pose restore")
     require(update_pose, "renderEntity.axis = authoritativeAxis;", f"{context} authoritative render pose restore")
+    reject(update_pose, "GetPhysicsToVisualTransform", f"{context} visual transform must not be applied twice")
     reject(update_pose, "AddEntityDef", f"{context} never creates a render def on a draw frame")
     reject(update_pose, "Think(", f"{context} presentation-only entity pass")
     reject(update_pose, "RunPhysics", f"{context} presentation-only entity pass")
@@ -244,6 +249,7 @@ def check_source_root(source_root: str) -> dict[str, str]:
     require(clear_sweep, "presentationNode.Remove();", f"{context} list teardown")
 
     carrier = function(player_cpp, "const idEntity *idPlayer::GetPresentationCarrier( void ) const", context)
+    require(carrier, "vehicleController.IsDriving()", f"{context} driven vehicle carrier")
     require(carrier, "GetBindMaster()", f"{context} bound carrier")
     require(carrier, "physicsObj.GetGroundEntity()", f"{context} ridden carrier")
 
