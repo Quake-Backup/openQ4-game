@@ -1887,8 +1887,13 @@ bool idEntity::SamplePresentationPose( void ) {
 		return CanInterpolatePresentationPose();
 	}
 
-	const idVec3 simOrigin = GetPhysics()->GetOrigin();
-	const idMat3 simAxis = GetPhysics()->GetAxis();
+	// Sample what the renderer was actually told, not the physics pose.  An
+	// animated vehicle keeps its whole heading in idActor::viewAxis through
+	// GetPhysicsToVisualTransform() while its physics axis barely turns, and
+	// every actor carries a modelOffset the same way.  Interpolating physics
+	// left those bodies snapping once a tic under a smoothly turning camera.
+	const idVec3 simOrigin = renderEntity.origin;
+	const idMat3 simAxis = renderEntity.axis;
 
 	if ( presentationPoseTime < 0 ) {
 		presentationPoseTime			= gameLocal.time;
@@ -1975,8 +1980,8 @@ bool idEntity::GetPresentationPose( idVec3 &origin, idMat3 &axis ) const {
 ================
 idEntity::UpdatePresentationPose
 
-Re-push the render entity from the interpolated pose.  Only the transform
-changes, so the renderer keeps the model-space snapshot it already built.
+Re-push the render entity from the interpolated visual transform.  Only the
+transform changes, so the renderer keeps the model-space snapshot it built.
 ================
 */
 void idEntity::UpdatePresentationPose( void ) {
@@ -1990,15 +1995,10 @@ void idEntity::UpdatePresentationPose( void ) {
 	const idVec3 authoritativeOrigin = renderEntity.origin;
 	const idMat3 authoritativeAxis = renderEntity.axis;
 
-	idVec3 visualOffset;
-	idMat3 visualAxis;
-	if ( GetPhysicsToVisualTransform( visualOffset, visualAxis ) ) {
-		renderEntity.axis = visualAxis * interpolatedAxis;
-		renderEntity.origin = interpolatedOrigin + visualOffset * renderEntity.axis;
-	} else {
-		renderEntity.axis = interpolatedAxis;
-		renderEntity.origin = interpolatedOrigin;
-	}
+	// The samples are already the composed visual transform, so the
+	// physics-to-visual step must not be applied a second time here.
+	renderEntity.origin = interpolatedOrigin;
+	renderEntity.axis = interpolatedAxis;
 
 	presentationPoseHeld = true;
 	if ( modelDefHandle != -1 && renderEntity.hModel && !IsHidden() ) {

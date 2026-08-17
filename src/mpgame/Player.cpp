@@ -12601,11 +12601,15 @@ void idPlayer::GetPresentationViewPos( idVec3 &origin, idMat3 &axis ) const {
 ===============
 idPlayer::GetPresentationCarrier
 
-The entity currently carrying the eye: a lift or tram under the player's feet,
-or whatever the player is bound to such as a vehicle seat.
+The entity currently carrying the eye: the vehicle being driven, a lift or tram
+under the player's feet, or whatever the player is bound to.
 ===============
 */
 const idEntity *idPlayer::GetPresentationCarrier( void ) const {
+	if ( vehicleController.IsDriving() ) {
+		return vehicleController.GetVehicle();
+	}
+
 	const idEntity *master = GetBindMaster();
 	if ( master != NULL ) {
 		return master;

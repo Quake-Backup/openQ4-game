@@ -923,7 +923,9 @@ idLight::UpdatePresentationPose
 
 Move the light with the drawn pose of whatever it is bound to; a light left on
 the authoritative pose slides across the mover it belongs to for the whole
-presentation frame.
+presentation frame.  idLight has no GetPhysicsToVisualTransform() override,
+so its sampled visual transform is its physics transform and the local light
+offsets compose against it exactly as they do in Present().
 ================
 */
 void idLight::UpdatePresentationPose( void ) {
