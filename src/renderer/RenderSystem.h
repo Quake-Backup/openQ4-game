@@ -165,7 +165,7 @@ typedef struct lightGridBakeOptions_s {
 } lightGridBakeOptions_t;
 
 
-// font support 
+// font support
 const int GLYPH_START = 0;
 const int GLYPH_END = 255;
 const int GLYPH_CHARSTART = 32;
@@ -184,6 +184,48 @@ typedef struct {
 	float				t2;
 } glyphInfo_t;
 
+/*
+===============================================================================
+
+	What the 256 base glyph slots of a fontInfo_t are indexed by.
+
+	The retail .fontdat atlases are art for one 8-bit codepage, so slot 0xE9 is
+	whichever character that byte meant in the language the atlas shipped for.
+	The scalable path rasterises from Unicode-mapped .ttf files and fills the
+	same 256 slots with Latin-1, so slot 0xE9 is U+00E9 no matter what language
+	is selected, and everything above U+00FF lives in the extended pages below.
+
+	Engine text is UTF-8, so the text layer works in code points and asks the
+	font which of the two it is holding.
+
+===============================================================================
+*/
+typedef enum {
+	GLYPH_INDEX_CODEPAGE = 0,	// slot i is byte i of the font's 8-bit codepage
+	GLYPH_INDEX_UNICODE			// slot i is code point U+00<i>
+} glyphIndexing_t;
+
+// Code points above U+00FF live in sparse 256-entry pages hung off the font, so
+// a face can carry any script it has art for without every fontInfo_t paying
+// for 64K glyph slots. Pages stop at the Basic Multilingual Plane: no script
+// the GUI draws lives above it, and stopping there keeps the page directory to
+// 256 pointers.
+const int GLYPH_PAGE_SHIFT = 8;
+const int GLYPH_PAGE_SIZE = 1 << GLYPH_PAGE_SHIFT;
+const int GLYPH_MAX_PAGES = 0x10000 >> GLYPH_PAGE_SHIFT;
+const unsigned int GLYPH_MAX_CODEPOINT = 0xFFFF;
+
+typedef struct fontGlyphPage_s {
+	// Extended glyphs are packed into their own atlas, so one found here draws
+	// with this material rather than the font's base one.
+	const idMaterial *	material;
+	glyphInfo_t			glyphs[GLYPH_PAGE_SIZE];
+	// A page is built for a whole Unicode block but a face rarely covers all of
+	// it. Without this a hole would be indistinguishable from a real glyph that
+	// happens to be zero width.
+	bool				covered[GLYPH_PAGE_SIZE];
+} fontGlyphPage_t;
+
 typedef struct {
 	glyphInfo_t			glyphs[GLYPHS_PER_FONT];
 	float				pointSize;
@@ -192,7 +234,73 @@ typedef struct {
 	float				descender;
 	const idMaterial *	material;
 	char				name[64];
+	int					glyphIndexing;		// glyphIndexing_t
+	// Code points above U+00FF, indexed by ( code point >> GLYPH_PAGE_SHIFT ),
+	// or NULL for a font that carries none. Owned by whoever registered the
+	// font and valid until the renderer shuts down; a fontInfo_t is copied by
+	// value throughout the GUI and every copy shares these pages.
+	fontGlyphPage_t * const *extendedPages;
 } fontInfo_t;
+
+// Declared by ../idlib/LangDict.h, which precompiled.h includes ahead of this
+// header. Repeated here so the glyph lookup below stays self-contained rather
+// than depending on that ordering; LangDict.h itself cannot be included from
+// here, because it is built on idStr and idList.
+bool LangDict_ByteForCodePoint( unsigned int codePoint, unsigned char &out );
+
+/*
+================
+R_GlyphForCodePoint
+
+The single place that knows how a fontInfo_t is indexed. Returns NULL when the
+font has no art for the code point - which the text layer has to handle, not
+paper over, because it is the difference between drawing a substitute and
+drawing a zero-advance blank that swallows the character.
+
+*material receives the atlas the returned glyph lives in. It is not always the
+font's own: extended pages are packed separately, so a page glyph and a base
+glyph in the same string come from two different images.
+================
+*/
+ID_INLINE const glyphInfo_t *R_GlyphForCodePoint( const fontInfo_t *font, unsigned int codePoint, const idMaterial **material ) {
+	if ( font == NULL ) {
+		return NULL;
+	}
+	if ( material != NULL ) {
+		*material = font->material;
+	}
+
+	if ( font->glyphIndexing == GLYPH_INDEX_CODEPAGE ) {
+		// 256 slots of retail art for one 8-bit codepage: map the code point back
+		// onto a byte of it. Anything that codepage cannot express has no glyph,
+		// which is exactly why a Cyrillic language cannot use these atlases.
+		unsigned char byte = 0;
+		if ( !LangDict_ByteForCodePoint( codePoint, byte ) ) {
+			return NULL;
+		}
+		return &font->glyphs[byte];
+	}
+
+	if ( codePoint < (unsigned int)GLYPHS_PER_FONT ) {
+		return &font->glyphs[codePoint];
+	}
+	if ( codePoint > GLYPH_MAX_CODEPOINT || font->extendedPages == NULL ) {
+		return NULL;
+	}
+
+	const fontGlyphPage_t *page = font->extendedPages[codePoint >> GLYPH_PAGE_SHIFT];
+	if ( page == NULL ) {
+		return NULL;
+	}
+	const int slot = (int)( codePoint & ( GLYPH_PAGE_SIZE - 1 ) );
+	if ( !page->covered[slot] ) {
+		return NULL;
+	}
+	if ( material != NULL ) {
+		*material = page->material;
+	}
+	return &page->glyphs[slot];
+}
 
 typedef struct {
 	fontInfo_t			fontInfoSmall;
