@@ -16,11 +16,15 @@
 #define PROJECT_COMPANY				"DarkMatter Productions"
 #define PROJECT_VERSION				OPENQ4_VERSION_SHORT
 #define PROJECT_VERSION_FULL			OPENQ4_VERSION
+#define PROJECT_VERSION_DATE			OPENQ4_VERSION_DATE
 #define PROJECT_WEBSITE				"www.darkmatter-quake.com"
 #define PROJECT_REPO					"https://github.com/themuffinator/openQ4"
 
-#define GAME_NAME						PROJECT_NAME			// appears on window titles and errors
+#define GAME_NAME						PROJECT_NAME			// appears on errors and secondary windows
 #define GAME_ICON						"q4icon.bmp"
+
+// caption of the main game window: "openQ4 - Version: 0.11.0-dev (2026-08-16)"
+#define GAME_WINDOW_TITLE				PROJECT_NAME " - Version: " PROJECT_VERSION " (" PROJECT_VERSION_DATE ")"
 
 #define ENGINE_VERSION					PROJECT_NAME " " PROJECT_VERSION
 

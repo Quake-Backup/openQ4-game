@@ -70,7 +70,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/presentation_interpolation_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py tools/tests/string_allocation_contract.py
+          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/presentation_interpolation_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py tools/tests/string_allocation_contract.py tools/tests/vehicle_sound_contract.py
           python tools/tests/arm64_abi_contract.py
           python tools/tests/cmdargs_append_contract.py
           python tools/tests/competitive_match_contracts.py
@@ -81,6 +81,7 @@ jobs:
           python tools/tests/presentation_interpolation_contract.py
           python tools/tests/savegame_corruption_contract.py
           python tools/tests/source_input_contract.py
+          python tools/tests/vehicle_sound_contract.py
           python src/buildscripts/list_sources.py src idlib idlib/math/Simd_AltiVec.cpp >/dev/null
 
       - name: Run native Linux portability probe
@@ -218,7 +219,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/presentation_interpolation_contract.py tools/tests/string_allocation_contract.py
+          python -m py_compile tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/presentation_interpolation_contract.py tools/tests/string_allocation_contract.py tools/tests/vehicle_sound_contract.py
           python tools/tests/arm64_abi_contract.py
           python tools/tests/cmdargs_append_contract.py
           python tools/tests/competitive_match_contracts.py
@@ -226,6 +227,7 @@ jobs:
           python tools/tests/string_allocation_contract.py
           python tools/tests/linux_portability_contract.py
           python tools/tests/presentation_interpolation_contract.py
+          python tools/tests/vehicle_sound_contract.py
 
       - name: Run native Linux ARM64 portability probe
         shell: bash
@@ -331,7 +333,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/presentation_interpolation_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py tools/tests/string_allocation_contract.py
+          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/presentation_interpolation_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py tools/tests/string_allocation_contract.py tools/tests/vehicle_sound_contract.py
           python tools/tests/arm64_abi_contract.py
           python tools/tests/cmdargs_append_contract.py
           python tools/tests/competitive_match_contracts.py
@@ -342,6 +344,7 @@ jobs:
           python tools/tests/presentation_interpolation_contract.py
           python tools/tests/savegame_corruption_contract.py
           python tools/tests/source_input_contract.py
+          python tools/tests/vehicle_sound_contract.py
 
       - name: Build game libraries
         shell: pwsh
@@ -410,7 +413,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/presentation_interpolation_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py tools/tests/string_allocation_contract.py
+          python -m py_compile src/buildscripts/list_sources.py tools/tests/arm64_abi_contract.py tools/tests/cmdargs_append_contract.py tools/tests/competitive_match_contracts.py tools/tests/lexer_peek_contract.py tools/tests/linux_portability_contract.py tools/tests/macos_meson_contract.py tools/tests/presentation_interpolation_contract.py tools/tests/savegame_corruption_contract.py tools/tests/source_input_contract.py tools/tests/string_allocation_contract.py tools/tests/vehicle_sound_contract.py
           python tools/tests/arm64_abi_contract.py
           python tools/tests/cmdargs_append_contract.py
           python tools/tests/competitive_match_contracts.py
@@ -421,6 +424,7 @@ jobs:
           python tools/tests/presentation_interpolation_contract.py
           python tools/tests/savegame_corruption_contract.py
           python tools/tests/source_input_contract.py
+          python tools/tests/vehicle_sound_contract.py
 
       - name: Build game libraries
         shell: bash
