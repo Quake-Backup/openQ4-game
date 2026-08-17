@@ -197,7 +197,7 @@ rvVehicleSound::RunPostPhysics
 =====================
 */
 void rvVehicleSound::RunPostPhysics ( void ) {
-	//Update ( );
+	Update ( );
 }
 
 /*
