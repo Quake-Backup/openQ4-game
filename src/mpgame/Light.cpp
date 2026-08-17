@@ -904,6 +904,71 @@ void idLight::Present( void ) {
 
 /*
 ================
+idLight::AllowsPresentationInterpolation
+
+A light riding a mover usually has no model of its own, so the base class test
+on modelDefHandle is not enough to decide it is worth re-anchoring.
+================
+*/
+bool idLight::AllowsPresentationInterpolation( void ) const {
+	if ( fl.networkStale || IsHidden() ) {
+		return false;
+	}
+	return lightDefHandle != -1 || idEntity::AllowsPresentationInterpolation();
+}
+
+/*
+================
+idLight::UpdatePresentationPose
+
+Move the light with the drawn pose of whatever it is bound to; a light left on
+the authoritative pose slides across the mover it belongs to for the whole
+presentation frame.
+================
+*/
+void idLight::UpdatePresentationPose( void ) {
+	idVec3 interpolatedOrigin;
+	idMat3 interpolatedAxis;
+
+	if ( !GetPresentationPose( interpolatedOrigin, interpolatedAxis ) ) {
+		return;
+	}
+
+	idEntity::UpdatePresentationPose();
+
+	if ( lightDefHandle == -1 ) {
+		return;
+	}
+
+	const idVec3 authoritativeOrigin = renderLight.origin;
+	const idMat3 authoritativeAxis = renderLight.axis;
+
+	renderLight.axis = localLightAxis * interpolatedAxis;
+	renderLight.origin = interpolatedOrigin + interpolatedAxis * localLightOrigin;
+	gameRenderWorld->UpdateLightDef( lightDefHandle, &renderLight );
+	presentationPosePushed = true;
+
+	renderLight.origin = authoritativeOrigin;
+	renderLight.axis = authoritativeAxis;
+}
+
+/*
+================
+idLight::RestoreAuthoritativePresentationPose
+================
+*/
+void idLight::RestoreAuthoritativePresentationPose( void ) {
+	const bool wasPushed = presentationPosePushed;
+
+	idEntity::RestoreAuthoritativePresentationPose();
+
+	if ( wasPushed && lightDefHandle != -1 ) {
+		gameRenderWorld->UpdateLightDef( lightDefHandle, &renderLight );
+	}
+}
+
+/*
+================
 idLight::Think
 ================
 */

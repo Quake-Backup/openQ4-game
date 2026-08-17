@@ -64,6 +64,7 @@ public:
 
 	// Visual presentation
 	void					PresentWeapon				( bool showViewModel );
+	virtual bool			AllowsPresentationInterpolation( void ) const;
 	void					UpdatePresentationWeapon	( bool showViewModel );
 	void					UpdatePresentationModel		( void );
 	void					UpdatePresentationClientEntities( void );

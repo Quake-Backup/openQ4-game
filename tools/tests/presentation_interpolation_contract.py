@@ -32,6 +32,17 @@ PRESENTATION_WEAPON_STATE = (
     "presentationRestoreViewModelOrigin",
     "presentationRestoreViewModelAxis",
 )
+PRESENTATION_ENTITY_STATE = (
+    "presentationPoseTime",
+    "presentationPoseCanInterpolate",
+    "presentationPoseMoved",
+    "presentationPosePushed",
+    "presentationPoseHeld",
+    "presentationPrevOrigin",
+    "presentationPrevAxis",
+    "presentationCurOrigin",
+    "presentationCurAxis",
+)
 
 
 def read(relative_path: str) -> str:
@@ -83,6 +94,10 @@ def check_source_root(source_root: str) -> dict[str, str]:
     client_entity_cpp = read(f"{source_root}/client/ClientEntity.cpp")
     client_effect_cpp = read(f"{source_root}/client/ClientEffect.cpp")
     lightning_gun_cpp = read(f"{source_root}/weapon/WeaponLightningGun.cpp")
+    entity_h = read(f"{source_root}/Entity.h")
+    entity_cpp = read(f"{source_root}/Entity.cpp")
+    actor_cpp = read(f"{source_root}/Actor.cpp")
+    light_cpp = read(f"{source_root}/Light.cpp")
 
     require(game_local_h, "mutable int\t\t\tpresentationClockGameTime", f"{context} transient clock")
     require(game_local_h, "presentationClockLastTime", f"{context} monotonic clock state")
@@ -134,8 +149,120 @@ def check_source_root(source_root: str) -> dict[str, str]:
     require(prepare, "player->CalculateRenderView();", f"{context} draw-time camera refresh")
     require(prepare, "UpdatePresentationWeapon", f"{context} draw-time viewmodel refresh")
     require(prepare, "GetDemoState() == DEMO_PLAYING || IsTimeDemo()", f"{context} demo presentation bypass")
+    require(prepare, "player->IsPresentationViewInterpolated()", f"{context} one-clock scene gate")
+    require(prepare, "UpdatePresentationEntityPoses();", f"{context} movers follow the camera clock")
+    require(prepare, "ClearPresentationEntityPoses();", f"{context} authoritative-camera fallback")
     reject(prepare, "Think(", f"{context} presentation-only draw pass")
     reject(prepare, "RunFrame(", f"{context} presentation-only draw pass")
+
+    # A mover drawn on the authoritative pose under an interpolated eye separates
+    # by one tic of its own travel and snaps back every tic.  Everything visible
+    # has to share the camera's presentation time or it beats against it.
+    for field in PRESENTATION_ENTITY_STATE:
+        require(entity_h, field, f"{context} entity presentation state")
+    require(entity_h, "idLinkList<idEntity>	presentationNode;", f"{context} presentation list membership")
+
+    model_transform = function(entity_cpp, "void idEntity::UpdateModelTransform( void )", context)
+    require(model_transform, "presentationPoseHeld", f"{context} held pose survives bind resolution")
+
+    entity_save = function(entity_cpp, "void idEntity::Save( idSaveGame *savefile ) const", context)
+    for field in PRESENTATION_ENTITY_STATE:
+        reject(entity_save, field, f"{context} entity save-format isolation")
+
+    sample_pose = function(entity_cpp, "bool idEntity::SamplePresentationPose( void )", context)
+    require(sample_pose, "presentationPoseTime == gameLocal.time", f"{context} one sample per authoritative tic")
+    require(sample_pose, "common->GetUserCmdMsecFloat()", f"{context} sequential-tic guard")
+    require(sample_pose, "gameLocal.GetMHz() == common->GetUserCmdHz()", f"{context} exact cadence guard")
+    require(sample_pose, "PRESENTATION_POSE_STEP_TOLERANCE", f"{context} teleport guard scales with motion in flight")
+    require(sample_pose, "RestoreAuthoritativePresentationPose();", f"{context} nothing interpolated left behind at rest")
+    reject(sample_pose, "Think(", f"{context} sampling runs no gameplay")
+    reject(sample_pose, "RunPhysics", f"{context} sampling runs no gameplay")
+
+    get_pose = function(entity_cpp, "bool idEntity::GetPresentationPose( idVec3 &origin, idMat3 &axis ) const", context)
+    require(get_pose, "origin.Lerp", f"{context} entity position interpolation")
+    require(get_pose, "InterpolatePresentationAxis", f"{context} entity axis interpolation")
+    require(get_pose, "GetPresentationInterpolationFraction", f"{context} shared camera fraction")
+
+    update_pose = function(entity_cpp, "void idEntity::UpdatePresentationPose( void )", context)
+    require(update_pose, "GetPresentationPose(", f"{context} interpolated entity pose")
+    require(update_pose, "UpdateEntityDef", f"{context} entity render resubmission")
+    require(update_pose, "UpdatePresentationClientEntities();", f"{context} attached client entities follow the drawn pose")
+    require(update_pose, "presentationPoseHeld = true;", f"{context} attached visuals resolve against the drawn pose")
+    require(update_pose, "presentationPoseHeld = false;", f"{context} drawn pose is released before the restore")
+    require(update_pose, "renderEntity.origin = authoritativeOrigin;", f"{context} authoritative render pose restore")
+    require(update_pose, "renderEntity.axis = authoritativeAxis;", f"{context} authoritative render pose restore")
+    reject(update_pose, "AddEntityDef", f"{context} never creates a render def on a draw frame")
+    reject(update_pose, "Think(", f"{context} presentation-only entity pass")
+    reject(update_pose, "RunPhysics", f"{context} presentation-only entity pass")
+    reject(update_pose, "UpdateSound", f"{context} presentation-only entity pass")
+    reject(update_pose, "SetOrigin", f"{context} physics and clip models stay authoritative")
+
+    light_pose = function(light_cpp, "void idLight::UpdatePresentationPose( void )", context)
+    require(light_pose, "UpdateLightDef", f"{context} lights follow the drawn mover pose")
+    require(light_pose, "localLightAxis * interpolatedAxis", f"{context} light axis from the drawn pose")
+    require(light_pose, "renderLight.origin = authoritativeOrigin;", f"{context} authoritative light pose restore")
+
+    view_weapon_optout = function(
+        weapon_cpp,
+        "bool rvViewWeapon::AllowsPresentationInterpolation( void ) const",
+        context,
+    )
+    require(view_weapon_optout, "return false;", f"{context} viewmodel keeps its own presentation path")
+
+    actor_policy = function(
+        actor_cpp,
+        "bool idActor::AllowsPresentationInterpolation( void ) const",
+        context,
+    )
+    require(actor_policy, "gameLocal.isMultiplayer", f"{context} competitive actors stay on the simulation clock")
+
+    sample_sweep = function(
+        game_local_cpp,
+        "void idGameLocal::SamplePresentationEntityPoses( void )",
+        context,
+    )
+    require(sample_sweep, "spawnedEntities.Next()", f"{context} complete candidate sweep")
+    require(sample_sweep, "g_presentationInterpolation", f"{context} user control")
+    require(sample_sweep, "DisablePresentationPose();", f"{context} disabled path forgets its samples")
+    require(sample_sweep, "presentationNode.AddToEnd( presentationEntities );", f"{context} moving entities are listed")
+    reject(sample_sweep, "Think(", f"{context} sampling runs no gameplay")
+
+    update_sweep = function(
+        game_local_cpp,
+        "void idGameLocal::UpdatePresentationEntityPoses( void )",
+        context,
+    )
+    require(update_sweep, "presentationNode.Next()", f"{context} removal-safe presentation walk")
+    require(update_sweep, "UpdatePresentationPose();", f"{context} entity re-anchor")
+
+    clear_sweep = function(
+        game_local_cpp,
+        "void idGameLocal::ClearPresentationEntityPoses( void )",
+        context,
+    )
+    require(clear_sweep, "RestoreAuthoritativePresentationPose();", f"{context} authoritative handback")
+    require(clear_sweep, "presentationNode.Remove();", f"{context} list teardown")
+
+    carrier = function(player_cpp, "const idEntity *idPlayer::GetPresentationCarrier( void ) const", context)
+    require(carrier, "GetBindMaster()", f"{context} bound carrier")
+    require(carrier, "physicsObj.GetGroundEntity()", f"{context} ridden carrier")
+
+    can_interpolate_view = function(
+        player_cpp,
+        "bool idPlayer::CanInterpolatePresentationView( void ) const",
+        context,
+    )
+    require(can_interpolate_view, "GetPresentationCarrier()", f"{context} carrier consistency")
+    require(can_interpolate_view, "carrier->CanInterpolatePresentationPose()", f"{context} eye rides the carrier's clock")
+
+    view_interpolated = function(
+        player_cpp,
+        "bool idPlayer::IsPresentationViewInterpolated( void ) const",
+        context,
+    )
+    require(view_interpolated, "gameLocal.GetCamera()", f"{context} cinematic camera is authoritative")
+    require(view_interpolated, "privateCameraView", f"{context} private camera is authoritative")
+    require(view_interpolated, "pm_thirdPerson", f"{context} third person is authoritative")
 
     draw = function(game_local_cpp, "bool idGameLocal::Draw( int clientNum )", context)
     require(draw, "PreparePlayerSceneForRender( player );", f"{context} single-player draw path")
@@ -336,7 +463,71 @@ def check_source_root(source_root: str) -> dict[str, str]:
         "apply_transform": normalized(apply_transform),
         "restore_transform": normalized(restore_transform),
         "lightning_effects": normalized(lightning_effects),
+        "sample_pose": normalized(sample_pose),
+        "get_pose": normalized(get_pose),
+        "update_pose": normalized(update_pose),
+        "model_transform": normalized(model_transform),
+        "light_pose": normalized(light_pose),
+        "sample_sweep": normalized(sample_sweep),
+        "update_sweep": normalized(update_sweep),
+        "clear_sweep": normalized(clear_sweep),
+        "carrier": normalized(carrier),
+        "view_interpolated": normalized(view_interpolated),
     }
+
+
+def check_mover_vibration_model() -> None:
+    """The eye and whatever carries it must be drawn at the same presentation time.
+
+    The camera reaches the current authoritative pose one tic late.  A mover drawn
+    at its authoritative pose therefore separates from the rider's eye by a whole
+    tic of the mover's own travel and snaps back at the next tic.  That sawtooth is
+    the vibration reported on lifts and trams; it is a relative-motion artifact, so
+    it is invisible against static world geometry no matter how fast the player
+    moves, and it fills the whole view inside a tram car.
+    """
+
+    def lerp(a: float, b: float, f: float) -> float:
+        return a + (b - a) * f
+
+    tic_msec = 1000.0 / 60.0
+    mover_speed = 200.0                                 # units/second, an unremarkable lift
+    step = mover_speed * tic_msec / 1000.0              # authoritative travel per tic
+    eye_offset = 32.0                                   # rider standing still on the platform
+    fractions = [index / 8.0 for index in range(9)]
+
+    def carried_offsets(interpolate_mover: bool) -> list[float]:
+        offsets = []
+        for tic_index in range(1, 6):
+            mover_prev = (tic_index - 1) * step
+            mover_cur = tic_index * step
+            for fraction in fractions:
+                eye = lerp(mover_prev + eye_offset, mover_cur + eye_offset, fraction)
+                mover = lerp(mover_prev, mover_cur, fraction) if interpolate_mover else mover_cur
+                offsets.append(mover - eye)
+        return offsets
+
+    before = carried_offsets(False)
+    after = carried_offsets(True)
+
+    # Before: the platform swings a full tic of its own travel under the player,
+    # once per tic, for as long as the ride lasts.
+    assert abs((max(before) - min(before)) - step) < 1e-6
+    # After: the platform is rigid under the rider at every presentation fraction.
+    assert max(after) - min(after) < 1e-6
+    assert all(abs(offset + eye_offset) < 1e-6 for offset in after)
+
+    # And the reason walking never showed this: previous-to-current interpolation
+    # reconstructs the eye's own path as a straight line, so static geometry is
+    # already drawn at a uniform rate.  Only a second, uninterpolated moving
+    # reference frame can beat against it.
+    eye_path = [
+        lerp(tic_index * step, (tic_index + 1) * step, fraction)
+        for tic_index in range(4)
+        for fraction in fractions[:-1]
+    ]
+    deltas = [later - earlier for earlier, later in zip(eye_path, eye_path[1:])]
+    assert max(deltas) - min(deltas) < 1e-6
 
 
 def check_fraction_examples() -> None:
@@ -393,6 +584,7 @@ def main() -> None:
             raise AssertionError(f"SP/MP presentation method drift: {method}")
     check_fraction_examples()
     check_bounded_clock_examples()
+    check_mover_vibration_model()
     print("presentation_interpolation_contract: ok")
 
 

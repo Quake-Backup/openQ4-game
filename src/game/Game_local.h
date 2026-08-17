@@ -435,6 +435,7 @@ public:
 	idWorldspawn *			world;					// world entity
 	idLinkList<idEntity>	spawnedEntities;		// all spawned entities
 	idLinkList<idEntity>	activeEntities;			// all thinking entities (idEntity::thinkFlags != 0)
+	idLinkList<idEntity>	presentationEntities;	// entities re-anchored on presentation frames (render-only)
 	int						numEntitiesToDeactivate;// number of entities that became inactive in current frame
 	bool					sortPushers;			// true if active lists needs to be reordered to place pushers at the front
 	bool					sortTeamMasters;		// true if active lists needs to be reordered to place physics team masters before their slaves
@@ -806,6 +807,9 @@ public:
 	int						GetPresentationTimeMsec( void ) const;
 	float					GetPresentationInterpolationFraction( void ) const;
 	idMat3					InterpolatePresentationAxis( const idMat3 &from, const idMat3 &to, float fraction ) const;
+	void					SamplePresentationEntityPoses( void );
+	void					UpdatePresentationEntityPoses( void );
+	void					ClearPresentationEntityPoses( void );
 
 	const idDeclEntityDef *	FindEntityDef( const char *name, bool makeDefault = true ) const;
 	const idDict *			FindEntityDefDict( const char *name, bool makeDefault = true ) const;

@@ -366,6 +366,19 @@ void rvViewWeapon::PresentWeapon( bool showViewModel ) {
 
 /*
 ================
+rvViewWeapon::AllowsPresentationInterpolation
+
+The view model is re-anchored by UpdatePresentationWeapon(), which knows about
+the camera-local pose, foreshortening and the bound client entities.  Keep the
+generic world-entity pass off it so the two never fight over the same handle.
+================
+*/
+bool rvViewWeapon::AllowsPresentationInterpolation( void ) const {
+	return false;
+}
+
+/*
+================
 rvViewWeapon::UpdatePresentationWeapon
 
 Resubmit the viewmodel from the interpolated camera pose without running

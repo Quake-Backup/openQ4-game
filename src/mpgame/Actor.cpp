@@ -1270,6 +1270,24 @@ bool idActor::GetPhysicsToVisualTransform( idVec3 &origin, idMat3 &axis ) {
 
 /*
 ================
+idActor::AllowsPresentationInterpolation
+
+Movers and the geometry riding them are drawn on the camera's presentation time
+so nothing beats against the interpolated eye.  Actors are deliberately left out
+in multiplayer: remote players are already smoothed from snapshots, and drawing
+them up to one tic behind the authoritative pose would change where a shot has
+to be led relative to what the server rewinds to.
+================
+*/
+bool idActor::AllowsPresentationInterpolation( void ) const {
+	if ( gameLocal.isMultiplayer ) {
+		return false;
+	}
+	return idAFEntity_Gibbable::AllowsPresentationInterpolation();
+}
+
+/*
+================
 idActor::GetPhysicsToSoundTransform
 ================
 */

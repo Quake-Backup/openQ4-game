@@ -31,6 +31,9 @@ public:
 	virtual void	FreeLightDef( void );
 	virtual bool	GetPhysicsToSoundTransform( idVec3 &origin, idMat3 &axis );
 	void			Present( void );
+	virtual bool	AllowsPresentationInterpolation( void ) const;
+	virtual void	UpdatePresentationPose( void );
+	virtual void	RestoreAuthoritativePresentationPose( void );
 
 	void			SaveState( idDict *args );
 	virtual void	SetColor( float red, float green, float blue );

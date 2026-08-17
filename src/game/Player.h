@@ -522,7 +522,9 @@ public:
 	void					ResetPresentationViewState( void );
 	void					UpdatePresentationViewState( void );
 	void					GetPresentationViewPos( idVec3 &origin, idMat3 &axis ) const;
+	const idEntity *		GetPresentationCarrier( void ) const;
 	bool					CanInterpolatePresentationView( void ) const;
+	bool					IsPresentationViewInterpolated( void ) const;
 	float					GetPresentationViewBlendFraction( void ) const;
 	float					GetPresentationFov( void );
 	

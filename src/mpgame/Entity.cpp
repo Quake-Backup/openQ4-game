@@ -480,6 +480,7 @@ idEntity::idEntity() {
 
 	spawnNode.SetOwner( this );
 	activeNode.SetOwner( this );
+	presentationNode.SetOwner( this );
 
 	snapshotNode.SetOwner( this );
 	snapshotSequence = -1;
@@ -508,6 +509,7 @@ idEntity::idEntity() {
 
 	memset( &renderEntity, 0, sizeof( renderEntity ) );
 	modelDefHandle	= -1;
+	ResetPresentationPose();
 	memset( &refSound, 0, sizeof( refSound ) );
 	refSound.referenceSoundHandle = -1;
 
@@ -694,6 +696,7 @@ idEntity::~idEntity( void ) {
 		BecomeInactive( thinkFlags );
 	}
 	activeNode.Remove();
+	presentationNode.Remove();
 
 	Signal( SIG_REMOVED );
 
@@ -1478,6 +1481,14 @@ void idEntity::UpdateModelTransform( void ) {
 	idVec3 origin;
 	idMat3 axis;
 
+	if ( presentationPoseHeld ) {
+		// The presentation pass is holding the drawn transform in the render
+		// entity.  Attached visuals resolve their bind through here, so
+		// recomputing from physics would drop them back onto the last
+		// authoritative tic while their owner is drawn interpolated.
+		return;
+	}
+
 	if ( GetPhysicsToVisualTransform( origin, axis ) ) {
 		renderEntity.axis = axis * GetPhysics()->GetAxis();
 		renderEntity.origin = GetPhysics()->GetOrigin() + origin * renderEntity.axis;
@@ -1740,6 +1751,281 @@ void idEntity::Present( void ) {
 	} else {
 		gameRenderWorld->UpdateEntityDef( modelDefHandle, &renderEntity );
 	}	
+}
+
+/*
+===============================================================================
+
+	Presentation interpolation.
+
+	The first-person camera is drawn at a pose interpolated between the last two
+	authoritative 60 Hz tics, so it reaches the current pose one tic late.  A
+	mover drawn at its authoritative pose therefore slides away from the eye by
+	one tic of its own travel and snaps back every tic, which reads as a 60 Hz
+	vibration of everything the player is riding.  Sampling movers the same way
+	and re-anchoring them on each draw frame puts the whole scene on one
+	presentation time again.
+
+	This only ever changes what is handed to the renderer.  No physics, script,
+	animation, sound or network state is touched, and the authoritative render
+	entity is put back before anything gameplay-facing can read it.
+
+===============================================================================
+*/
+
+// Continuity limits for one authoritative tic.  The distance limit scales with
+// the motion already in flight so a genuinely fast tram keeps interpolating
+// while a teleport still snaps.
+static const float PRESENTATION_POSE_MAX_STEP		= 32.0f;
+static const float PRESENTATION_POSE_STEP_TOLERANCE	= 4.0f;
+static const float PRESENTATION_POSE_MAX_ANGLE		= 90.0f;
+
+/*
+================
+idEntity::ResetPresentationPose
+
+Presentation history is deliberately transient.  Saving it would make the save
+format depend on a render-only cache and could blend across a restore.
+================
+*/
+void idEntity::ResetPresentationPose( void ) {
+	presentationPoseTime			= -1;
+	presentationPoseCanInterpolate	= false;
+	presentationPoseMoved			= false;
+	presentationPosePushed			= false;
+	presentationPoseHeld			= false;
+	presentationPrevOrigin.Zero();
+	presentationPrevAxis.Identity();
+	presentationCurOrigin.Zero();
+	presentationCurAxis.Identity();
+}
+
+/*
+================
+idEntity::DisablePresentationPose
+
+Hand any interpolated pose back and forget the samples, so nothing keeps
+claiming it can be interpolated after the feature is switched off.
+================
+*/
+void idEntity::DisablePresentationPose( void ) {
+	if ( presentationPoseTime < 0 && !presentationPosePushed ) {
+		return;
+	}
+	RestoreAuthoritativePresentationPose();
+	ResetPresentationPose();
+}
+
+/*
+================
+idEntity::AllowsPresentationInterpolation
+================
+*/
+bool idEntity::AllowsPresentationInterpolation( void ) const {
+	if ( fl.networkStale || IsHidden() ) {
+		return false;
+	}
+	// A model-less owner still counts when it carries attached visuals: a
+	// func_fx bolted to a tram has no model of its own, and its effects would
+	// otherwise sit on the last authoritative tic while the tram is drawn
+	// interpolated.
+	return modelDefHandle != -1 || !clientEntities.IsListEmpty();
+}
+
+/*
+================
+idEntity::CanInterpolatePresentationPose
+================
+*/
+bool idEntity::CanInterpolatePresentationPose( void ) const {
+	return presentationPoseTime >= 0 && presentationPoseCanInterpolate && presentationPoseMoved;
+}
+
+/*
+================
+idEntity::SamplePresentationPose
+
+Capture one authoritative 60 Hz sample.  Returns true when this entity should be
+re-anchored on presentation frames, which requires that it actually moved and
+that the two samples are a single continuous tic apart.
+================
+*/
+bool idEntity::SamplePresentationPose( void ) {
+	if ( !AllowsPresentationInterpolation() ) {
+		RestoreAuthoritativePresentationPose();
+		presentationPoseTime			= -1;
+		presentationPoseCanInterpolate	= false;
+		presentationPoseMoved			= false;
+		return false;
+	}
+
+	if ( presentationPoseTime == gameLocal.time ) {
+		return CanInterpolatePresentationPose();
+	}
+
+	const idVec3 simOrigin = GetPhysics()->GetOrigin();
+	const idMat3 simAxis = GetPhysics()->GetAxis();
+
+	if ( presentationPoseTime < 0 ) {
+		presentationPoseTime			= gameLocal.time;
+		presentationPoseCanInterpolate	= false;
+		presentationPoseMoved			= false;
+		presentationPrevOrigin			= simOrigin;
+		presentationPrevAxis			= simAxis;
+		presentationCurOrigin			= simOrigin;
+		presentationCurAxis				= simAxis;
+		RestoreAuthoritativePresentationPose();
+		return false;
+	}
+
+	if ( simOrigin == presentationCurOrigin && simAxis == presentationCurAxis ) {
+		// At rest.  Most of a map is in this branch every tic, so it stays ahead of
+		// the angle math below, and an entity that has just come to rest hands its
+		// last interpolated pose back here.
+		presentationPrevOrigin	= presentationCurOrigin;
+		presentationPrevAxis	= presentationCurAxis;
+		presentationPoseTime	= gameLocal.time;
+		presentationPoseMoved	= false;
+		presentationPoseCanInterpolate = false;
+		RestoreAuthoritativePresentationPose();
+		return false;
+	}
+
+	const int deltaTime = gameLocal.time - presentationPoseTime;
+	const int maxSequentialDelta = static_cast<int>( idMath::Ceil( common->GetUserCmdMsecFloat() ) );
+	const bool sequentialFrame = deltaTime > 0 && deltaTime <= maxSequentialDelta;
+
+	const idVec3 lastStep = presentationCurOrigin - presentationPrevOrigin;
+	const idVec3 originDelta = simOrigin - presentationCurOrigin;
+	idAngles angleDelta = simAxis.ToAngles() - presentationCurAxis.ToAngles();
+	angleDelta.Normalize180();
+	const float maxStep = PRESENTATION_POSE_MAX_STEP + lastStep.Length() * PRESENTATION_POSE_STEP_TOLERANCE;
+	const bool continuousPose =
+		originDelta.LengthSqr() <= Square( maxStep ) &&
+		angleDelta.Length() <= PRESENTATION_POSE_MAX_ANGLE;
+
+	presentationPrevOrigin	= presentationCurOrigin;
+	presentationPrevAxis	= presentationCurAxis;
+	presentationCurOrigin	= simOrigin;
+	presentationCurAxis		= simAxis;
+	presentationPoseTime	= gameLocal.time;
+	presentationPoseMoved	= ( presentationCurOrigin != presentationPrevOrigin ) || ( presentationCurAxis != presentationPrevAxis );
+	presentationPoseCanInterpolate =
+		gameLocal.GetMHz() == common->GetUserCmdHz() &&
+		sequentialFrame &&
+		continuousPose;
+
+	if ( !presentationPoseCanInterpolate ) {
+		presentationPrevOrigin	= presentationCurOrigin;
+		presentationPrevAxis	= presentationCurAxis;
+		presentationPoseMoved	= false;
+	}
+
+	if ( !CanInterpolatePresentationPose() ) {
+		// an entity that comes to rest may never set TH_UPDATEVISUALS again, so
+		// the last interpolated pose has to be handed back explicitly or it
+		// stays in the renderer a fraction of a tic behind where it belongs
+		RestoreAuthoritativePresentationPose();
+	}
+
+	return CanInterpolatePresentationPose();
+}
+
+/*
+================
+idEntity::GetPresentationPose
+================
+*/
+bool idEntity::GetPresentationPose( idVec3 &origin, idMat3 &axis ) const {
+	if ( !CanInterpolatePresentationPose() ) {
+		return false;
+	}
+
+	const float fraction = gameLocal.GetPresentationInterpolationFraction();
+	origin.Lerp( presentationPrevOrigin, presentationCurOrigin, fraction );
+	axis = gameLocal.InterpolatePresentationAxis( presentationPrevAxis, presentationCurAxis, fraction );
+	return true;
+}
+
+/*
+================
+idEntity::UpdatePresentationPose
+
+Re-push the render entity from the interpolated pose.  Only the transform
+changes, so the renderer keeps the model-space snapshot it already built.
+================
+*/
+void idEntity::UpdatePresentationPose( void ) {
+	idVec3 interpolatedOrigin;
+	idMat3 interpolatedAxis;
+
+	if ( !GetPresentationPose( interpolatedOrigin, interpolatedAxis ) ) {
+		return;
+	}
+
+	const idVec3 authoritativeOrigin = renderEntity.origin;
+	const idMat3 authoritativeAxis = renderEntity.axis;
+
+	idVec3 visualOffset;
+	idMat3 visualAxis;
+	if ( GetPhysicsToVisualTransform( visualOffset, visualAxis ) ) {
+		renderEntity.axis = visualAxis * interpolatedAxis;
+		renderEntity.origin = interpolatedOrigin + visualOffset * renderEntity.axis;
+	} else {
+		renderEntity.axis = interpolatedAxis;
+		renderEntity.origin = interpolatedOrigin;
+	}
+
+	presentationPoseHeld = true;
+	if ( modelDefHandle != -1 && renderEntity.hModel && !IsHidden() ) {
+		gameRenderWorld->UpdateEntityDef( modelDefHandle, &renderEntity );
+		presentationPosePushed = true;
+	}
+	if ( !clientEntities.IsListEmpty() ) {
+		UpdatePresentationClientEntities();
+		presentationPosePushed = true;
+	}
+	presentationPoseHeld = false;
+
+	renderEntity.origin = authoritativeOrigin;
+	renderEntity.axis = authoritativeAxis;
+}
+
+/*
+================
+idEntity::RestoreAuthoritativePresentationPose
+================
+*/
+void idEntity::RestoreAuthoritativePresentationPose( void ) {
+	if ( !presentationPosePushed ) {
+		return;
+	}
+	presentationPosePushed = false;
+
+	if ( modelDefHandle != -1 && renderEntity.hModel && !IsHidden() ) {
+		gameRenderWorld->UpdateEntityDef( modelDefHandle, &renderEntity );
+	}
+	UpdatePresentationClientEntities();
+}
+
+/*
+================
+idEntity::UpdatePresentationClientEntities
+
+Attached effects and models resolve their bind through GetPosition(), which
+reads the render entity.  The caller is holding the drawn transform there, so
+re-anchoring them here keeps them locked to what is on screen instead of to the
+last authoritative tic.
+================
+*/
+void idEntity::UpdatePresentationClientEntities( void ) {
+	rvClientEntity *cent;
+	rvClientEntity *next;
+
+	for ( cent = clientEntities.Next(); cent != NULL; cent = next ) {
+		next = cent->bindNode.Next();
+		cent->UpdatePresentationTransform();
+	}
 }
 
 /*

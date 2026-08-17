@@ -338,6 +338,7 @@ void idGameLocal::Clear( void ) {
 	num_entities = 0;
 	spawnedEntities.Clear();
 	activeEntities.Clear();
+	presentationEntities.Clear();
 	numEntitiesToDeactivate = 0;
 	sortPushers = false;
 	sortTeamMasters = false;
@@ -1667,6 +1668,7 @@ void idGameLocal::LoadMap( const char *mapName, int randseed ) {
 	
 	spawnedEntities.Clear();
 	activeEntities.Clear();
+	presentationEntities.Clear();
 	numEntitiesToDeactivate = 0;
 	sortTeamMasters = false;
 	sortPushers = false;
@@ -2755,6 +2757,7 @@ void idGameLocal::MapClear( bool clearClients, int instance ) {
 		spawnedEntities.Clear();
 	}
 // RAVEN END
+	presentationEntities.Clear();
 
 	if ( !clearClients ) {
 		// add back the hashes of the clients/stuff in other instances
@@ -4452,6 +4455,12 @@ TIME_THIS_SCOPE("idGameLocal::RunFrame - gameDebug.BeginFrame()");
 			bse->EndFrame();
 		}
 
+		if ( isLastPredictFrame ) {
+			// authoritative transforms are final for this tic; snapshot them so
+			// presentation frames can draw movers at the camera's presentation time
+			SamplePresentationEntityPoses();
+		}
+
 		// do multiplayer related stuff
 		if ( isMultiplayer ) {
 			mpGame.Run();
@@ -4673,6 +4682,18 @@ sample between authoritative game tics.
 void idGameLocal::PreparePlayerSceneForRender( idPlayer *player ) {
 	if ( player == NULL || GetDemoState() == DEMO_PLAYING || IsTimeDemo() ) {
 		return;
+	}
+
+	// Movers and everything riding them share the camera's presentation time.
+	// Without this the eye is drawn interpolated while the lift under it is
+	// drawn a whole tic ahead, and the two beat against each other at 60 Hz.
+	// When the drawn camera is not the interpolated first-person pose -- a
+	// cinematic, a private camera, third person, or any frame the camera had to
+	// snap on -- the whole scene goes back on the authoritative clock together.
+	if ( player->IsPresentationViewInterpolated() ) {
+		UpdatePresentationEntityPoses();
+	} else {
+		ClearPresentationEntityPoses();
 	}
 
 	player->CalculateRenderView();
@@ -8275,6 +8296,75 @@ float idGameLocal::GetPresentationInterpolationFraction( void ) const {
 
 	return idMath::ClampFloat( 0.0f, 1.0f,
 		static_cast<float>( GetPresentationTimeMsec() - time ) / ticMsec );
+}
+
+/*
+================
+idGameLocal::ClearPresentationEntityPoses
+
+Drop every entity out of the presentation list, handing any interpolated pose
+still in the renderer back to its authoritative value first.
+================
+*/
+void idGameLocal::ClearPresentationEntityPoses( void ) {
+	idEntity *ent;
+	idEntity *next;
+
+	for ( ent = presentationEntities.Next(); ent != NULL; ent = next ) {
+		next = ent->presentationNode.Next();
+		ent->RestoreAuthoritativePresentationPose();
+		ent->presentationNode.Remove();
+	}
+}
+
+/*
+================
+idGameLocal::SamplePresentationEntityPoses
+
+Take the authoritative 60 Hz transform sample for everything the renderer can
+see, and rebuild the list of entities that moved this tic.  Run once per game
+frame, after all thinking and pushing is finished.
+================
+*/
+void idGameLocal::SamplePresentationEntityPoses( void ) {
+	idEntity *ent;
+	idEntity *next;
+
+	for ( ent = presentationEntities.Next(); ent != NULL; ent = next ) {
+		next = ent->presentationNode.Next();
+		ent->presentationNode.Remove();
+	}
+
+	if ( !g_presentationInterpolation.GetBool() || GetDemoState() == DEMO_PLAYING || IsTimeDemo() ) {
+		for ( ent = spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next() ) {
+			ent->DisablePresentationPose();
+		}
+		return;
+	}
+
+	for ( ent = spawnedEntities.Next(); ent != NULL; ent = ent->spawnNode.Next() ) {
+		if ( ent->SamplePresentationPose() ) {
+			ent->presentationNode.AddToEnd( presentationEntities );
+		}
+	}
+}
+
+/*
+================
+idGameLocal::UpdatePresentationEntityPoses
+
+Presentation-only pass.  Re-anchors everything that moved this tic onto the same
+interpolated presentation time the first-person camera is drawn at.
+================
+*/
+void idGameLocal::UpdatePresentationEntityPoses( void ) {
+	idEntity *ent;
+	idEntity *next;
+
+	for ( ent = presentationEntities.Next(); ent != NULL; ent = next ) {
+		next = ent->presentationNode.Next();
+		ent->UpdatePresentationPose();
+	}
 }
 
 /*

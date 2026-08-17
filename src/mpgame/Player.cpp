@@ -12587,7 +12587,7 @@ idPlayer::GetPresentationViewPos
 ===============
 */
 void idPlayer::GetPresentationViewPos( idVec3 &origin, idMat3 &axis ) const {
-	if ( presentationViewTime < 0 || !presentationCanInterpolate ) {
+	if ( !CanInterpolatePresentationView() ) {
 		origin = ( presentationViewTime < 0 ) ? firstPersonViewOrigin : presentationCurViewOrigin;
 		axis = ( presentationViewTime < 0 ) ? firstPersonViewAxis : presentationCurViewAxis;
 	} else {
@@ -12597,8 +12597,68 @@ void idPlayer::GetPresentationViewPos( idVec3 &origin, idMat3 &axis ) const {
 	}
 }
 
+/*
+===============
+idPlayer::GetPresentationCarrier
+
+The entity currently carrying the eye: a lift or tram under the player's feet,
+or whatever the player is bound to such as a vehicle seat.
+===============
+*/
+const idEntity *idPlayer::GetPresentationCarrier( void ) const {
+	const idEntity *master = GetBindMaster();
+	if ( master != NULL ) {
+		return master;
+	}
+
+	const idEntity *ground = physicsObj.GetGroundEntity();
+	if ( ground != NULL && ground != static_cast<const idEntity *>( gameLocal.world ) ) {
+		return ground;
+	}
+
+	return NULL;
+}
+
 bool idPlayer::CanInterpolatePresentationView( void ) const {
-	return presentationViewTime >= 0 && presentationCanInterpolate;
+	if ( presentationViewTime < 0 || !presentationCanInterpolate ) {
+		return false;
+	}
+
+	// The eye must never be drawn on a different presentation time than what is
+	// carrying it.  A moving lift drawn on the authoritative pose while the eye
+	// is drawn interpolated drifts by one tic of the lift's own travel and snaps
+	// back every tic, which is what riding one used to look like.  If the
+	// carrier cannot be interpolated this frame, ride its clock instead.
+	const idEntity *carrier = GetPresentationCarrier();
+	if ( carrier != NULL && carrier->PresentationPoseMoved() && !carrier->CanInterpolatePresentationPose() ) {
+		return false;
+	}
+
+	return true;
+}
+
+/*
+===============
+idPlayer::IsPresentationViewInterpolated
+
+True only when the camera actually drawn this frame is the interpolated
+first-person pose.  The cinematic, private-camera and third-person paths are
+all built from the authoritative pose instead, and every visual in the scene
+has to stay on whichever clock the camera is using or it beats against it once
+per tic.
+===============
+*/
+bool idPlayer::IsPresentationViewInterpolated( void ) const {
+	if ( !CanInterpolatePresentationView() ) {
+		return false;
+	}
+	if ( !noclip && ( gameLocal.GetCamera() != NULL || privateCameraView != NULL ) ) {
+		return false;
+	}
+	if ( pm_thirdPerson.GetBool() || pm_thirdPersonDeath.GetBool() ) {
+		return false;
+	}
+	return true;
 }
 
 float idPlayer::GetPresentationViewBlendFraction( void ) const {
@@ -12609,7 +12669,7 @@ float idPlayer::GetPresentationFov( void ) {
 	if ( presentationViewTime < 0 ) {
 		return CalcFov( true );
 	}
-	if ( !presentationCanInterpolate ) {
+	if ( !CanInterpolatePresentationView() ) {
 		return presentationCurFov;
 	}
 	return idMath::Lerp( presentationPrevFov, presentationCurFov, GetPresentationViewBlendFraction() );

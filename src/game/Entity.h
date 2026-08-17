@@ -116,6 +116,7 @@ public:
 
 	idLinkList<idEntity>	spawnNode;				// for being linked into spawnedEntities list
 	idLinkList<idEntity>	activeNode;				// for being linked into activeEntities list
+	idLinkList<idEntity>	presentationNode;		// for being linked into presentationEntities list
 
 	idLinkList<idEntity>	snapshotNode;			// for being linked into snapshotEntities list
 	int						snapshotSequence;		// last snapshot this entity was in
@@ -237,6 +238,17 @@ public:
 
 	// visuals
 	virtual void			Present( void );
+	// presentation interpolation; render-only, never saved, never read by game code
+	void					ResetPresentationPose( void );
+	void					DisablePresentationPose( void );
+	bool					SamplePresentationPose( void );
+	bool					GetPresentationPose( idVec3 &origin, idMat3 &axis ) const;
+	bool					CanInterpolatePresentationPose( void ) const;
+	bool					PresentationPoseMoved( void ) const { return presentationPoseMoved; }
+	virtual bool			AllowsPresentationInterpolation( void ) const;
+	virtual void			UpdatePresentationPose( void );
+	virtual void			RestoreAuthoritativePresentationPose( void );
+	void					UpdatePresentationClientEntities( void );
 	// instance visuals
 	virtual void			InstanceJoin( void );
 	virtual void			InstanceLeave( void );
@@ -535,6 +547,17 @@ public:
 protected:
 	renderEntity_t			renderEntity;						// used to present a model to the renderer
 	int						modelDefHandle;						// handle to static renderer model
+	// transient presentation-interpolation samples.  Deliberately not saved: they
+	// are a render-only cache and restoring them could blend across a load.
+	int						presentationPoseTime;				// game time of the newest authoritative sample
+	bool					presentationPoseCanInterpolate;		// samples are one sequential tic apart and continuous
+	bool					presentationPoseMoved;				// the two samples differ
+	bool					presentationPosePushed;				// an interpolated pose is currently in the renderer
+	bool					presentationPoseHeld;				// render entity is holding the drawn pose right now
+	idVec3					presentationPrevOrigin;
+	idMat3					presentationPrevAxis;
+	idVec3					presentationCurOrigin;
+	idMat3					presentationCurAxis;
 	refSound_t				refSound;							// used to present sound to the audio engine
 	idEntityPtr< idEntity >	forwardDamageEnt;					// damage applied to the invoking object will be forwarded to this entity
 	idEntityPtr< idEntity > bindMaster;							// entity bound to if unequal NULL

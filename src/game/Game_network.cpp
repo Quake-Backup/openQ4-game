@@ -2457,6 +2457,12 @@ gameReturn_t idGameLocal::ClientPrediction( int clientNum, const usercmd_t *clie
 	// service any pending events
 	idEvent::ServiceEvents();
 
+	if ( isNewFrame && lastPredictFrame ) {
+		// authoritative transforms are final for this tic; snapshot them so
+		// presentation frames can draw movers at the camera's presentation time
+		SamplePresentationEntityPoses();
+	}
+
 	if ( gameRenderWorld && !mpInteractionsGenerated ) {
 		if ( developer.GetBool() ) {
 			common->Printf( "Deferred GenerateAllInteractions (ClientPrediction)\n" );

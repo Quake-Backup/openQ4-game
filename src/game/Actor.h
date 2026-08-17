@@ -150,6 +150,8 @@ public:
 	virtual bool			GetPhysicsToVisualTransform( idVec3 &origin, idMat3 &axis );
 	virtual bool			GetPhysicsToSoundTransform( idVec3 &origin, idMat3 &axis );
 
+	virtual bool			AllowsPresentationInterpolation( void ) const;
+
 							// script state management
 	void					ShutdownThreads		( void );
 	void					UpdateState			( void );
