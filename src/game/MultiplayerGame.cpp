@@ -1472,8 +1472,19 @@ void idMultiplayerGame::ReceiveDeathMessage( idPlayer *attacker, int attackerSco
 		gameLocal.GetLocalPlayer()->hud->HandleNamedEvent ( "addDeathLine" );
 	}
 
-	// echo to console
-	gameLocal.Printf( gameLocal.GetLocalPlayer()->spawnArgs.GetString( va( "%s_text", icon ), "%s killed %s" ), 
+	// echo to console. Liquid methods live in a shared def rather than every player def.
+	idPlayer *localPlayer = gameLocal.GetLocalPlayer();
+	idStr deathText = localPlayer ? localPlayer->spawnArgs.GetString( va( "%s_text", icon ), "" ) : "";
+	if ( deathText.IsEmpty() ) {
+		const idDict *liquidDef = gameLocal.FindEntityDefDict( "liquid_openq4", false );
+		if ( liquidDef ) {
+			deathText = liquidDef->GetString( va( "%s_text", icon ), "" );
+		}
+	}
+	if ( deathText.IsEmpty() ) {
+		deathText = localPlayer ? localPlayer->spawnArgs.GetString( "dm0_text", "%s was killed by %s" ) : "%s was killed by %s";
+	}
+	gameLocal.Printf( common->GetLocalizedString( deathText.c_str() ),
 					(victim ? gameLocal.userInfo[ victim->entityNumber ].GetString( "ui_name" ) : "world"),
 					(attacker ? gameLocal.userInfo[ attacker->entityNumber ].GetString( "ui_name" ) : "world") );
 	gameLocal.Printf( "\n" );

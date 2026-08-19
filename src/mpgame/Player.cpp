@@ -1526,6 +1526,7 @@ idPlayer::idPlayer() {
 // openQ4 BEGIN
 	previousWaterLevel		= WATERLEVEL_NONE;
 	previousWaterType		= 0;
+	nextLiquidSurfaceSoundTime = 0;
 	nextLiquidDamageTime	= 0;
 	drownDamage				= 1;
 // openQ4 END
@@ -2004,6 +2005,7 @@ void idPlayer::Init( void ) {
 // openQ4 BEGIN
 	previousWaterLevel = WATERLEVEL_NONE;
 	previousWaterType = 0;
+	nextLiquidSurfaceSoundTime = 0;
 	// A short grace period: the settle frames at the end of a map load run the player's think, and
 	// hurting the player there happens before the level is really playable.
 	nextLiquidDamageTime = gameLocal.time + 1000;
@@ -2726,6 +2728,7 @@ void idPlayer::Save( idSaveGame *savefile ) const {
 // openQ4 BEGIN
 	savefile->WriteInt( (int)previousWaterLevel );
 	savefile->WriteInt( previousWaterType );
+	savefile->WriteInt( nextLiquidSurfaceSoundTime );
 	savefile->WriteInt( nextLiquidDamageTime );
 	savefile->WriteInt( drownDamage );
 // openQ4 END
@@ -3042,6 +3045,7 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 // openQ4 BEGIN
 	savefile->ReadInt( (int &)previousWaterLevel );
 	savefile->ReadInt( previousWaterType );
+	savefile->ReadInt( nextLiquidSurfaceSoundTime );
 	savefile->ReadInt( nextLiquidDamageTime );
 	savefile->ReadInt( drownDamage );
 // openQ4 END
@@ -8924,6 +8928,7 @@ void idPlayer::UpdateLiquid( void ) {
 		}
 		previousWaterLevel = WATERLEVEL_NONE;
 		previousWaterType = 0;
+		nextLiquidSurfaceSoundTime = 0;
 		return;
 	}
 
@@ -8957,11 +8962,18 @@ void idPlayer::UpdateLiquid( void ) {
 	idVec3 splashOrigin = GetPhysics()->GetOrigin();
 	splashOrigin.z += ( bounds[1].z - bounds[0].z ) * 0.5f;
 
+	static const int LIQUID_SURFACE_SOUND_DEBOUNCE_MSEC = 600;
 	if ( previousWaterLevel == WATERLEVEL_NONE && waterLevel != WATERLEVEL_NONE ) {
-		PlayLiquidSound( va( "snd_enter_%s", enteredLiquid ), SND_CHANNEL_BODY );
+		if ( gameLocal.time >= nextLiquidSurfaceSoundTime ) {
+			PlayLiquidSound( va( "snd_enter_%s", enteredLiquid ), SND_CHANNEL_BODY );
+			nextLiquidSurfaceSoundTime = gameLocal.time + LIQUID_SURFACE_SOUND_DEBOUNCE_MSEC;
+		}
 		PlayLiquidEffect( va( "fx_splash_%s", enteredLiquid ), splashOrigin );
 	} else if ( previousWaterLevel != WATERLEVEL_NONE && waterLevel == WATERLEVEL_NONE ) {
-		PlayLiquidSound( va( "snd_leave_%s", leftLiquid ), SND_CHANNEL_BODY );
+		if ( gameLocal.time >= nextLiquidSurfaceSoundTime ) {
+			PlayLiquidSound( va( "snd_leave_%s", leftLiquid ), SND_CHANNEL_BODY );
+			nextLiquidSurfaceSoundTime = gameLocal.time + LIQUID_SURFACE_SOUND_DEBOUNCE_MSEC;
+		}
 		PlayLiquidEffect( va( "fx_splash_%s", leftLiquid ), splashOrigin );
 	}
 
@@ -11343,6 +11355,13 @@ void idPlayer::Killed( idEntity *inflictor, idEntity *attacker, int damage, cons
 	if ( gameLocal.isMultiplayer || g_testDeath.GetBool() ) {
 		idPlayer *killer = NULL;
 		int methodOfDeath = MAX_WEAPONS + isTelefragged;
+		if ( !isTelefragged ) {
+			const idDeclEntityDef *lastDamageDecl = static_cast<const idDeclEntityDef *>(
+				declManager->DeclByIndex( DECL_ENTITYDEF, lastDamageDef, false ) );
+			if ( lastDamageDecl ) {
+				lastDamageDecl->dict.GetInt( "methodOfDeath", va( "%d", methodOfDeath ), methodOfDeath );
+			}
+		}
 		
 		if ( attacker->IsType( idPlayer::Type ) ) {
 			killer = static_cast<idPlayer*>(attacker);
@@ -11615,9 +11634,12 @@ void idPlayer::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &di
 		return;
 	}
 
- 	if ( damageDef->dict.GetBool( "ignore_player" ) ) {
- 		return;
- 	}
+	if ( damageDef->dict.GetBool( "ignore_player" ) ) {
+		return;
+	}
+	// Killed() runs synchronously below, so publish the current cause before lethal damage can
+	// enter it. Previously environmental deaths inherited the prior hit and became generic dm0.
+	lastDamageDef = damageDef->Index();
 
 	if ( damageDef->dict.GetBool( "lightning_damage_effect" ) ) {
 		lightningEffects = 0;
@@ -11838,8 +11860,7 @@ void idPlayer::Damage( idEntity *inflictor, idEntity *attacker, const idVec3 &di
 	}
 
 	lastDamageDir = dir;
-  	lastDamageDir.Normalize();
-	lastDamageDef = damageDef->Index();
+	lastDamageDir.Normalize();
 	lastDamageLocation = location;
 
 	// Give server-side bots the same concrete information a player gets from

@@ -541,11 +541,9 @@ void idPhysics_Player::WaterJumpMove( void ) {
 	// waterjump has no control, but falls
 	idPhysics_Player::SlideMove( true, true, false, false );
 
-	// add gravity
-	// openQ4: this used gravityNormal, which is a unit vector, so the water jump barely fell at
-	// all and the 2000ms timer had to expire before control came back. Quake 3 applies full
-	// gravity here, which is what gravityVector is.
-	current.velocity += gravityVector * frametime;
+	// SlideMove with gravity enabled has already integrated gravity for this frame. Applying it a
+	// second time here cuts the launch arc roughly in half and makes an otherwise valid pool lip
+	// impossible to clear.
 	// if falling down
 	if ( current.velocity * gravityNormal > 0.0f ) {
 		// cancel as soon as we are falling down again
@@ -1332,21 +1330,29 @@ bool idPhysics_Player::CheckWaterJump( void ) {
 	idVec3	spot;
 	int		cont;
 	idVec3	flatforward;
+	const idBounds &bounds = clipModel->GetBounds();
+	const float height = bounds[1][2] - bounds[0][2];
 
 	if ( current.movementTime ) {
 		return false;
 	}
 
-	// check for water jump
+	// Water jumping is a surface transition. Keeping this at waist depth prevents an underwater
+	// obstacle with clear space above it from automatically launching a fully submerged swimmer.
 	if ( waterLevel != WATERLEVEL_WAIST ) {
 		return false;
 	}
 
 	flatforward = viewForward - (viewForward * gravityNormal) * gravityNormal;
-	flatforward.Normalize();
+	if ( flatforward.Normalize() == 0.0f ) {
+		return false;
+	}
 
+	// The Quake 4 player origin is at the feet. The inherited Quake 3 +4/+20 probes assumed an
+	// origin partway up the body, so their "clear above" sample remained inside every deck-height
+	// pool wall. Probe the obstacle at the player's waist and the clearance just above their head.
 	spot = current.origin + 30.0f * flatforward;
-	spot -= 4.0f * gravityNormal;
+	spot -= ( bounds[0][2] + height * 0.5f ) * gravityNormal;
 // RAVEN BEGIN
 // ddynerman: multiple collision worlds
 	cont = gameLocal.Contents( self, spot, NULL, mat3_identity, -1, self );
@@ -1355,17 +1361,21 @@ bool idPhysics_Player::CheckWaterJump( void ) {
 		return false;
 	}
 
-	spot -= 16.0f * gravityNormal;
+	spot = current.origin + 30.0f * flatforward;
+	spot -= ( bounds[1][2] + 1.0f ) * gravityNormal;
 // RAVEN BEGIN
 // ddynerman: multiple collision worlds
-	cont = gameLocal.Contents( self, spot, NULL, mat3_identity, -1, self );
+	cont = gameLocal.Contents( self, spot, NULL, mat3_identity, MASK_PLAYERSOLID, self );
 // RAVEN END
-	if ( cont ) {
+	if ( cont & MASK_PLAYERSOLID ) {
 		return false;
 	}
 
-	// jump out of water
-	current.velocity = 200.0f * viewForward - 350.0f * gravityNormal;
+	// Give the feet enough rise to clear a full standing body plus the step allowance. This keeps
+	// the jump usable under non-default gravity and avoids looking up or down changing its height.
+	const float requiredRise = height + maxStepHeight;
+	const float upSpeed = Max( 350.0f, idMath::Sqrt( 2.0f * gravityVector.Length() * requiredRise ) );
+	current.velocity = 200.0f * flatforward - upSpeed * gravityNormal;
 	current.movementFlags |= PMF_TIME_WATERJUMP;
 	current.movementTime = 2000;
 

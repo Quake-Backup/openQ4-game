@@ -977,12 +977,14 @@ public:
 	// Liquid volumes. Shared by projectiles, moveables and anything else that can break a surface.
 	int						LiquidContentsAtCollision( const idEntity *hitEnt, const trace_t &collision ) const;
 	int						LiquidContentsAtPoint	( const idVec3 &point, const idEntity *passEntity );
+	idVec3					LiquidBoundaryBetween	( const idVec3 &inside, const idVec3 &outside, int liquidContents, const idEntity *passEntity );
 	const char *			LiquidTypeName			( int liquidContents ) const;
 	void					PlayLiquidImpact		( int liquidContents, const idVec3 &point, const idVec3 &normal, idEntity *ent, const idDict *callerArgs );
 	int						LiquidLevelForEntity	( idEntity *ent, int &liquidType );
 	void					PlayLiquidSoundOn		( idEntity *ent, const char *key, const s_channelType channel );
 	void					PlayLiquidEffectAt		( const char *key, const idVec3 &origin );
 	bool					PlayLiquidTrail			( int liquidContents, const idVec3 &start, const idVec3 &end );
+	bool					PlayLiquidTrailToExit	( int liquidContents, const idVec3 &start, const idVec3 &end, const idEntity *passEntity );
 // openQ4 END
 
 	idList<idEntity*>		ambientLights; // lights that cast ambient
