@@ -471,7 +471,10 @@ void idProjectile::Launch( const idVec3 &start, const idVec3 &dir, const idVec3 
 	physicsObj.SetBouncyness( bounce, !projectileFlags.detonate_on_bounce );
 	physicsObj.SetGravity( gravVec );
 	physicsObj.SetContents( contents );
- 	physicsObj.SetClipMask( clipMask | MASK_WATER );
+	// Liquid surfaces are presentation boundaries, not physical blockers. Surface crossings are
+	// detected from the travelled segment in Think so the projectile can splash without being
+	// repeatedly clipped back onto the same contents plane.
+	physicsObj.SetClipMask( clipMask );
 	physicsObj.SetLinearVelocity( dir * speed.GetCurrentValue(gameLocal.time) + pushVelocity );
 	physicsObj.SetOrigin( start );
 	physicsObj.SetAxis( dir.ToMat3() );
@@ -566,6 +569,8 @@ idProjectile::Think
 void idProjectile::Think( void ) {
 	// run physics
 	if ( thinkFlags & TH_PHYSICS ) {
+		const idVec3 previousOrigin = physicsObj.GetOrigin();
+		const int previousLiquid = gameLocal.LiquidContentsAtPoint( previousOrigin, this );
 
 		// Update the velocity to match the changing speed
 		if ( updateVelocity ) {
@@ -579,6 +584,29 @@ void idProjectile::Think( void ) {
 		}
 		
 		RunPhysics();
+
+// openQ4 BEGIN
+		// The physics mask deliberately excludes liquids. Compare the endpoints of this frame's
+		// movement to find entry and exit crossings, place a splash on the actual boundary, and
+		// leave the projectile's velocity untouched.
+		const idVec3 currentOrigin = physicsObj.GetOrigin();
+		const int currentLiquid = gameLocal.LiquidContentsAtPoint( currentOrigin, this );
+		if ( previousLiquid != currentLiquid ) {
+			const int crossedLiquid = previousLiquid ? previousLiquid : currentLiquid;
+			const idVec3 insidePoint = currentLiquid ? currentOrigin : previousOrigin;
+			const idVec3 outsidePoint = currentLiquid ? previousOrigin : currentOrigin;
+			const idVec3 surfacePoint = gameLocal.LiquidBoundaryBetween( insidePoint, outsidePoint, crossedLiquid, this );
+			idVec3 surfaceNormal = currentOrigin - previousOrigin;
+			if ( surfaceNormal.Normalize() <= 0.0f ) {
+				surfaceNormal.Set( 0.0f, 0.0f, 1.0f );
+			} else if ( currentLiquid ) {
+				surfaceNormal = -surfaceNormal;
+			}
+			// A volume crossing always uses the shared splash and its explicit reliable sound. Caller
+			// impact effects are collision-only; choosing one here suppresses the dedicated sound.
+			gameLocal.PlayLiquidImpact( crossedLiquid, surfacePoint, surfaceNormal, this, NULL );
+		}
+// openQ4 END
 		
 		// If we werent at rest and are now then start the atrest fuse
 		if ( physicsObj.IsAtRest( ) ) {
@@ -610,7 +638,7 @@ void idProjectile::Think( void ) {
 				if ( wantLiquidTrail ) {
 					const idDict *liquidDict = gameLocal.FindEntityDefDict( "liquid_openq4", false );
 					const idDecl *bubbles = liquidDict
-						? gameLocal.GetEffect( *liquidDict, va( "fx_trail_%s", gameLocal.LiquidTypeName( trailLiquid ) ) )
+						? gameLocal.GetEffect( *liquidDict, va( "fx_projectile_trail_%s", gameLocal.LiquidTypeName( trailLiquid ) ) )
 						: NULL;
 					if ( bubbles ) {
 						flyEffect = PlayEffect( bubbles, renderEntity.origin, renderEntity.axis, true );

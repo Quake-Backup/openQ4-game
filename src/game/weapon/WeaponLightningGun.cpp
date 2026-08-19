@@ -313,7 +313,7 @@ void rvWeaponLightningGun::Think ( void ) {
 	gameLocal.TracePoint(	owner, tr, 
 							playerViewOrigin, 
 							playerViewOrigin + playerViewAxis[0] * range, 
-							(MASK_SHOT_RENDERMODEL|MASK_WATER|CONTENTS_PROJECTILE), owner );
+							(MASK_SHOT_RENDERMODEL|CONTENTS_PROJECTILE), owner );
 // RAVEN END
 	// Calculate the direction of the lightning effect using the barrel joint of the weapon
 	// and the end point of the trace

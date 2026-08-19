@@ -901,6 +901,7 @@ private:
 // openQ4 BEGIN
 	waterLevel_t			previousWaterLevel;		// water level last think, for entry and exit events
 	int						previousWaterType;		// so leaving lava sounds like lava, not water
+	int						nextLiquidSurfaceSoundTime; // shared entry/exit sound debounce
 	int						nextLiquidDamageTime;	// pain debounce for lava and slime
 	int						drownDamage;			// climbs the longer the player stays under
 // openQ4 END

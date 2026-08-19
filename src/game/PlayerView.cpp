@@ -864,8 +864,8 @@ void idPlayerView::LiquidOverlay( int liquidContents ) {
 	// The tint is what the liquid still lets through after fogDistance units of it, so the two
 	// numbers together describe the water rather than just colouring it: clear water carries a
 	// long way and loses red, lava carries almost nothing.
-	idVec3 filterTint( 0.35f, 0.65f, 0.85f );
-	float fogDistance = 1400.0f;
+	idVec3 filterTint( 0.72f, 0.90f, 1.0f );
+	float fogDistance = 2200.0f;
 	if ( liquidViewContents & CONTENTS_LAVA ) {
 		filterTint.Set( 1.0f, 0.42f, 0.18f );
 		fogDistance = 110.0f;
@@ -891,7 +891,7 @@ void idPlayerView::LiquidOverlay( int liquidContents ) {
 	} else if ( liquidViewContents & CONTENTS_SLIME ) {
 		wash.Set( 0.16f, 0.36f, 0.06f, 0.55f );
 	} else {
-		wash.Set( 0.03f, 0.26f, 0.44f, 0.45f );
+		wash.Set( 0.08f, 0.34f, 0.52f, 0.22f );
 	}
 	wash[3] *= amount;
 

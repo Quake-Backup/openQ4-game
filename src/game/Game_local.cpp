@@ -9349,6 +9349,31 @@ int idGameLocal::LiquidContentsAtPoint( const idVec3 &point, const idEntity *pas
 
 /*
 ================
+idGameLocal::LiquidBoundaryBetween
+
+Finds the surface between a point known to be inside a liquid and one known to be outside. Point
+contents is used instead of a collision trace because a trace that begins inside a contents brush
+is start-solid and cannot report the exit face.
+================
+*/
+idVec3 idGameLocal::LiquidBoundaryBetween( const idVec3 &inside, const idVec3 &outside, int liquidContents, const idEntity *passEntity ) {
+	idVec3 insidePoint = inside;
+	idVec3 outsidePoint = outside;
+
+	for ( int i = 0; i < 12; i++ ) {
+		const idVec3 middle = ( insidePoint + outsidePoint ) * 0.5f;
+		if ( LiquidContentsAtPoint( middle, passEntity ) & liquidContents ) {
+			insidePoint = middle;
+		} else {
+			outsidePoint = middle;
+		}
+	}
+
+	return ( insidePoint + outsidePoint ) * 0.5f;
+}
+
+/*
+================
 idGameLocal::LiquidTypeName
 
 The name used to build presentation keys, e.g. "fx_impact_lava". Lava wins over slime if a mapper
@@ -9382,9 +9407,11 @@ void idGameLocal::PlayLiquidImpact( int liquidContents, const idVec3 &point, con
 	const char *liquid = LiquidTypeName( liquidContents );
 	const idDict *liquidDict = FindEntityDefDict( "liquid_openq4", false );
 	const idDecl *effect = NULL;
+	bool callerEffect = false;
 
 	if ( callerArgs ) {
 		effect = GetEffect( *callerArgs, va( "fx_impact_%s", liquid ) );
+		callerEffect = ( effect != NULL );
 	}
 	if ( !effect && liquidDict ) {
 		effect = GetEffect( *liquidDict, va( "fx_impact_%s", liquid ) );
@@ -9393,7 +9420,9 @@ void idGameLocal::PlayLiquidImpact( int liquidContents, const idVec3 &point, con
 		PlayEffect( effect, point, normal.ToMat3(), false, vec3_origin, true );
 	}
 
-	if ( ent && liquidDict ) {
+	// Stock weapon splash effects already carry their own sound. The shared openQ4 effects do not,
+	// so give those one positional impact shader without doubling a weapon-authored splash.
+	if ( ent && liquidDict && !callerEffect ) {
 		const char *shaderName = liquidDict->GetString( va( "snd_impact_%s", liquid ), "" );
 		if ( shaderName && shaderName[0] ) {
 			const idSoundShader *shader = declManager->FindSound( shaderName, false );
@@ -9526,7 +9555,7 @@ bool idGameLocal::PlayLiquidTrail( int liquidContents, const idVec3 &start, cons
 		return false;
 	}
 
-	const idDecl *effect = GetEffect( *liquidDict, va( "fx_trail_%s", LiquidTypeName( liquidContents ) ) );
+	const idDecl *effect = GetEffect( *liquidDict, va( "fx_trace_trail_%s", LiquidTypeName( liquidContents ) ) );
 	if ( !effect ) {
 		return false;
 	}
@@ -9538,6 +9567,31 @@ bool idGameLocal::PlayLiquidTrail( int liquidContents, const idVec3 &start, cons
 
 	PlayEffect( effect, start, dir.ToMat3(), false, end, true );
 	return true;
+}
+
+/*
+================
+idGameLocal::PlayLiquidTrailToExit
+
+Draws only the part of a weapon trace that is inside liquid. The final weapon hit can be far beyond
+the pool, so locate the exit face instead of stretching bubbles through the air after it.
+================
+*/
+bool idGameLocal::PlayLiquidTrailToExit( int liquidContents, const idVec3 &start, const idVec3 &end, const idEntity *passEntity ) {
+	if ( !liquidContents ) {
+		return false;
+	}
+
+	idVec3 trailEnd = end;
+	idVec3 direction = end - start;
+	if ( direction.Normalize() > 0.0f ) {
+		const idVec3 endProbe = end - direction * 0.5f;
+		if ( !( LiquidContentsAtPoint( endProbe, passEntity ) & liquidContents ) ) {
+			trailEnd = LiquidBoundaryBetween( start, endProbe, liquidContents, passEntity );
+		}
+	}
+
+	return PlayLiquidTrail( liquidContents, start, trailEnd );
 }
 
 /*
@@ -9963,6 +10017,9 @@ idEntity* idGameLocal::HitScan(
 		int			collisionArea;
 		idVec3		collisionPoint;
 		bool		tracer;
+		int			trailLiquidContents;
+		idVec3		trailLiquidStart;
+		bool		crossedLiquid;
 		
 		// Calculate the end point of the trace
 		start    = origin;
@@ -9975,6 +10032,15 @@ idEntity* idGameLocal::HitScan(
 			contents = MASK_SHOT_BOUNDINGBOX|CONTENTS_PROJECTILE;
 		} else {
 			contents = MASK_SHOT_RENDERMODEL|MASK_WATER|CONTENTS_PROJECTILE;
+		}
+
+		trailLiquidContents = LiquidContentsAtPoint( start, owner );
+		trailLiquidStart = start;
+		crossedLiquid = ( trailLiquidContents != 0 );
+		if ( crossedLiquid ) {
+			// A trace beginning underwater is already through the surface; do not let the contents
+			// brush report start-solid or play a false entry splash at the muzzle.
+			contents &= ~MASK_WATER;
 		}
 		
 		// Loop the traces to handle cases where something can be shot through
@@ -10015,10 +10081,11 @@ idEntity* idGameLocal::HitScan(
 			//assert( tr.c.material );
 			if ( tr.fraction >= 1.0f || (tr.c.material && tr.c.material->GetSurfaceFlags() & SURF_NOIMPACT) ) {					
 				PlayEffect( hitscanDict, "fx_path", fxOrigin, dir.ToMat3(), false, tr.endpos, false, EC_IGNORE, hitscanTint );	
+				const bool liquidTracer = crossedLiquid && PlayLiquidTrailToExit( trailLiquidContents, trailLiquidStart, tr.endpos, owner );
 				if ( random.RandomFloat( ) < tracerChance ) {
 // openQ4 BEGIN
-					// a tracer drawn underwater is a line of bubbles, not a streak of smoke
-					if ( !PlayLiquidTrail( LiquidContentsAtPoint( fxOrigin, owner ), fxOrigin, tr.endpos ) ) {
+					// Never lay an air tracer over the underwater bubbles drawn above.
+					if ( !liquidTracer ) {
 						PlayEffect( hitscanDict, "fx_tracer", fxOrigin, dir.ToMat3(), false, tr.endpos );
 					}
 // openQ4 END
@@ -10056,7 +10123,15 @@ idEntity* idGameLocal::HitScan(
 			if ( hitLiquidContents ) {
 				// Apply force to the liquid entity that was hit
 				ent->ApplyImpulse( owner, tr.c.id, tr.c.point, -(hitscanDict.GetFloat( "push", "5000" )) * tr.c.normal );
-				// Continue on excluding liquids
+				if ( !crossedLiquid ) {
+					trailLiquidContents = hitLiquidContents;
+					trailLiquidStart = collisionPoint + dir * 0.5f;
+					crossedLiquid = true;
+				}
+
+				// Continue just beyond the contents plane with liquids excluded. Starting at the exact
+				// collision point can make the next trace rediscover the same numerical boundary.
+				start = collisionPoint + dir * 0.5f;
 				contents &= (~MASK_WATER);
 
 				if ( !g_perfTest_weaponNoFX.GetBool() && !GetEffect( hitscanDict, "fx_impact", tr.c.materialType ) ) {
@@ -10177,8 +10252,11 @@ idEntity* idGameLocal::HitScan(
 		fxDir = collisionPoint - fxOrigin;
 		fxDir.Normalize( );
 		PlayEffect( hitscanDict, "fx_path", fxOrigin, fxDir.ToMat3(), false, collisionPoint, false, EC_IGNORE, hitscanTint );	
+		const bool liquidTracer = crossedLiquid && PlayLiquidTrailToExit( trailLiquidContents, trailLiquidStart, collisionPoint, owner );
 		if ( !ent->fl.takedamage && random.RandomFloat ( ) < tracerChance ) {
-			PlayEffect( hitscanDict, "fx_tracer", fxOrigin, fxDir.ToMat3(), false, collisionPoint );
+			if ( !liquidTracer ) {
+				PlayEffect( hitscanDict, "fx_tracer", fxOrigin, fxDir.ToMat3(), false, collisionPoint );
+			}
 			tracer = true;
 		} else {
 			tracer = false;
