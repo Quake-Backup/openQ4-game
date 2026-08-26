@@ -92,6 +92,17 @@ ARM64 ABI static checks also run in CI. They guard idClass allocation alignment,
 - On Linux, standalone builds provide direct compiler/ABI validation while openQ4's staged engine build provides integrated runtime modules and gameplay validation.
 - openQ4 build wrappers can invoke this repository's standalone build as an optional developer convenience.
 
+## Save Compatibility
+
+The versioned openQ4 save stream keeps released layouts readable through explicit,
+source-stamped decoders. In particular, version 3 saves from openQ4 v0.10 predate
+the player `swimSpeed` and liquid-surface sound timer fields; both are restored
+with safe defaults. The class serializer also records source-level Save/Restore
+ownership so optimized linkers cannot silently change the stream by folding empty
+functions. Current version 3 saves retain the newer fields, while the reader still
+recognizes the empty physics frame omitted by affected release builds. Unknown
+source revisions are never guessed to use the older player-field layout.
+
 ## Project Goals
 - Preserve original Quake 4 gameplay behavior.
 - Maintain expected single-player and multiplayer parity.

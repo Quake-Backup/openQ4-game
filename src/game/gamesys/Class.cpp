@@ -40,7 +40,8 @@ idTypeInfo::idTypeInfo( const char *classname, const char *superclass, idEventFu
 // bdube: added states
 	void ( idClass::*Spawn )( void ), 
 	rvStateFunc<idClass>* stateCallbacks,
-	void ( idClass::*Save )( idSaveGame *savefile ) const, void ( idClass::*Restore )( idRestoreGame *savefile ) ) {									
+	void ( idClass::*Save )( idSaveGame *savefile ) const, void ( idClass::*Restore )( idRestoreGame *savefile ),
+	bool saveDeclaredHere, bool restoreDeclaredHere ) {
 // RAVEN END
 
 	idTypeInfo *type;
@@ -53,6 +54,8 @@ idTypeInfo::idTypeInfo( const char *classname, const char *superclass, idEventFu
 	this->Spawn				= Spawn;
 	this->Save				= Save;
 	this->Restore			= Restore;
+	this->saveDeclaredHere	= saveDeclaredHere;
+	this->restoreDeclaredHere = restoreDeclaredHere;
 	this->CreateInstance	= CreateInstance;
 	this->super				= idClass::GetClass( superclass );
 	this->freeEventMap		= false;

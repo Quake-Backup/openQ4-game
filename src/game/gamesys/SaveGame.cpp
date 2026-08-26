@@ -76,14 +76,14 @@ const char *OpenQ4SaveGameWireABI( void ) {
 #undef OPENQ4_SAVEGAME_ABI_OS
 }
 
-struct openQ4SaveGameV2Snapshot_t {
+struct openQ4SaveGameSnapshot_t {
 	int build;
 	const char *sourceHash;
 	int sourceFileCount;
 	const char *wireABI;
 };
 
-static const openQ4SaveGameV2Snapshot_t OPENQ4_SAVEGAME_V2_SNAPSHOTS[] = {
+static const openQ4SaveGameSnapshot_t OPENQ4_SAVEGAME_V2_SNAPSHOTS[] = {
 	{ 639, "d64f5bd29149262e67ce65107ea44b3f10af22011e7af354f23ca01550210fde", 404, "windows-msvcabi-x64-le-raw1" },
 	{ 614, "0c27fa5c6ef48b1bfe44c7be82b8a696772af4625eeefeed25de27da9640dd3f", 404, "windows-msvcabi-x64-le-raw1" },
 	{ 556, "871e5811e1732be750b18374b3d537aa38a91a050fb94cef847e2e3d39769cc2", 218, "windows-msvcabi-x64-le-raw1" },
@@ -92,9 +92,28 @@ static const openQ4SaveGameV2Snapshot_t OPENQ4_SAVEGAME_V2_SNAPSHOTS[] = {
 	{ 544, "9b26849ccdc3652aad892fdeeb5f219b631119fe601de00eb691fb5b4c13e02f", 218, "windows-msvcabi-x64-le-raw1" }
 };
 
+// Version 3 was already public when the player liquid-state fields were added.
+// Keep the exact pre-field release snapshot readable without guessing between
+// layouts for arbitrary source revisions.
+static const openQ4SaveGameSnapshot_t OPENQ4_SAVEGAME_V3_PRE_PLAYER_LIQUID_FIELDS_SNAPSHOTS[] = {
+	{ 1, "19351be39d2d4077a74294c0442707ef9565fc7a2fa9af9b81e05fc9aca8b220", 404, "windows-msvcabi-x64-le-raw1" }
+};
+
 static bool SaveGame_IsSupportedV2Snapshot( int build, const idStr &sourceHash, int sourceFileCount ) {
 	for ( int i = 0; i < static_cast<int>( sizeof( OPENQ4_SAVEGAME_V2_SNAPSHOTS ) / sizeof( OPENQ4_SAVEGAME_V2_SNAPSHOTS[0] ) ); i++ ) {
-		const openQ4SaveGameV2Snapshot_t &snapshot = OPENQ4_SAVEGAME_V2_SNAPSHOTS[i];
+		const openQ4SaveGameSnapshot_t &snapshot = OPENQ4_SAVEGAME_V2_SNAPSHOTS[i];
+		if ( build == snapshot.build && sourceFileCount == snapshot.sourceFileCount &&
+			 sourceHash.Icmp( snapshot.sourceHash ) == 0 &&
+			 idStr::Icmp( OpenQ4SaveGameWireABI(), snapshot.wireABI ) == 0 ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool SaveGame_IsV3PrePlayerLiquidFieldsSnapshot( int build, const idStr &sourceHash, int sourceFileCount ) {
+	for ( int i = 0; i < static_cast<int>( sizeof( OPENQ4_SAVEGAME_V3_PRE_PLAYER_LIQUID_FIELDS_SNAPSHOTS ) / sizeof( OPENQ4_SAVEGAME_V3_PRE_PLAYER_LIQUID_FIELDS_SNAPSHOTS[0] ) ); i++ ) {
+		const openQ4SaveGameSnapshot_t &snapshot = OPENQ4_SAVEGAME_V3_PRE_PLAYER_LIQUID_FIELDS_SNAPSHOTS[i];
 		if ( build == snapshot.build && sourceFileCount == snapshot.sourceFileCount &&
 			 sourceHash.Icmp( snapshot.sourceHash ) == 0 &&
 			 idStr::Icmp( OpenQ4SaveGameWireABI(), snapshot.wireABI ) == 0 ) {
@@ -309,10 +328,10 @@ idSaveGame::CallSave_r
 void idSaveGame::CallSave_r( const idTypeInfo *cls, const idClass *obj ) {
 	if ( cls->super ) {
 		CallSave_r( cls->super, obj );
-		if ( cls->super->Save == cls->Save ) {
-			// don't call save on this inheritance level since the function was called in the super class
-			return;
-		}
+	}
+	if ( !cls->saveDeclaredHere ) {
+		// The class inherits its implementation, so its superclass frame already owns the payload.
+		return;
 	}
 
 	WriteSyncId();
@@ -1424,15 +1443,48 @@ idRestoreGame::CallRestore_r
 void idRestoreGame::CallRestore_r( const idTypeInfo *cls, idClass *obj ) {
 	if ( cls->super ) {
 		CallRestore_r( cls->super, obj );
-		if ( cls->super->Restore == cls->Restore ) {
-			// don't call save on this inheritance level since the function was called in the super class
-			return;
-		}
 	}
-	
+	if ( !cls->restoreDeclaredHere ) {
+		// The class inherits its implementation, so its superclass frame already consumed the payload.
+		return;
+	}
+	if ( openQ4SaveGameSyncMarkersEnabled && idStr::Icmp( cls->classname, "idPhysics" ) == 0 &&
+		 !HasNextSerializedEmptyClassFrame() ) {
+		// Older optimized MSVC links folded the empty idPhysics and idClass Restore
+		// functions together. Their writers consequently omitted this empty frame.
+		return;
+	}
 	ReadSyncId( "Callrestore_r start ", cls->classname );
 	( obj->*cls->Restore )( this );
 	ReadSyncId( "Callrestore_r end ", cls->classname );
+}
+
+/*
+================
+idRestoreGame::HasNextSerializedEmptyClassFrame
+================
+*/
+bool idRestoreGame::HasNextSerializedEmptyClassFrame( void ) {
+	const int offset = file->Tell();
+	int startMarker = 0;
+	int startSyncId = 0;
+	int endMarker = 0;
+	int endSyncId = 0;
+
+	const bool complete =
+		file->ReadInt( startMarker ) == static_cast<int>( sizeof( startMarker ) ) &&
+		file->ReadInt( startSyncId ) == static_cast<int>( sizeof( startSyncId ) ) &&
+		file->ReadInt( endMarker ) == static_cast<int>( sizeof( endMarker ) ) &&
+		file->ReadInt( endSyncId ) == static_cast<int>( sizeof( endSyncId ) );
+	if ( file->Seek( offset, FS_SEEK_SET ) == -1 ) {
+		Error( "idRestoreGame: failed to restore the save stream position after class-frame lookahead at offset %d", offset );
+	}
+
+	return complete &&
+		startMarker == OPENQ4_SAVEGAME_SYNC_MAGIC &&
+		startSyncId == openQ4SaveGameNextSyncId &&
+		endMarker == OPENQ4_SAVEGAME_SYNC_MAGIC &&
+		endSyncId == openQ4SaveGameNextSyncId + 1;
 }
 
 /*
@@ -2737,6 +2789,23 @@ idRestoreGame::GetOpenQ4SaveGameCompatibilityStamp
 */
 const char *idRestoreGame::GetOpenQ4SaveGameCompatibilityStamp( void ) const {
 	return openQ4SaveGameCompatibilityStamp.c_str();
+}
+
+/*
+=====================
+idRestoreGame::HasOpenQ4PlayerLiquidSaveFields
+=====================
+*/
+bool idRestoreGame::HasOpenQ4PlayerLiquidSaveFields( void ) const {
+	if ( !openQ4SaveGameHasCompatibilityStamp ||
+		 openQ4SaveGameCompatibilityVersion != OPENQ4_SAVEGAME_COMPATIBILITY_VERSION ) {
+		return false;
+	}
+
+	return !SaveGame_IsV3PrePlayerLiquidFieldsSnapshot(
+		buildNumber,
+		openQ4SaveGameCompatibilityStamp,
+		openQ4SaveGameCompatibilitySourceFileCount );
 }
 
 
