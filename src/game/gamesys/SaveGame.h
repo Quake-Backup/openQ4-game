@@ -213,6 +213,7 @@ public:
 	bool					IsOpenQ4SaveGameCompatible( void ) const;
 	const char *			GetOpenQ4SaveGameCompatibilityError( void ) const;
 	const char *			GetOpenQ4SaveGameCompatibilityStamp( void ) const;
+	bool					HasOpenQ4PlayerLiquidSaveFields( void ) const;
 
 private:
 	int						buildNumber;
@@ -231,6 +232,7 @@ private:
 
 	void					ReadChecked( void *buffer, int len, const char *detail );
 	void					CallRestore_r( const idTypeInfo *cls, idClass *obj );
+	bool					HasNextSerializedEmptyClassFrame( void );
 };
 
 #endif /* !__SAVEGAME_H__*/

@@ -76,6 +76,13 @@ EXPECTED_RAW_SAVE_WRITE_COUNTS = {
     "vehicle/VehiclePosition.cpp": 5,
 }
 
+V3_PRE_PLAYER_LIQUID_FIELDS_SNAPSHOT = (
+    1,
+    "19351be39d2d4077a74294c0442707ef9565fc7a2fa9af9b81e05fc9aca8b220",
+    404,
+    "windows-msvcabi-x64-le-raw1",
+)
+
 
 def read(relative_path: str) -> str:
     path = ROOT / relative_path
@@ -797,6 +804,172 @@ def validate_state_restore_guards(tree: str) -> None:
     )
 
 
+def validate_player_liquid_save_compatibility(tree: str) -> None:
+    savegame_header = read(f"src/{tree}/gamesys/SaveGame.h")
+    savegame_source = read(f"src/{tree}/gamesys/SaveGame.cpp")
+    physics_source = read(f"src/{tree}/physics/Physics_Player.cpp")
+    player_source = read(f"src/{tree}/Player.cpp")
+    build, source_hash, file_count, wire_abi = V3_PRE_PLAYER_LIQUID_FIELDS_SNAPSHOT
+
+    require(
+        savegame_source,
+        f'{{ {build}, "{source_hash}", {file_count}, "{wire_abi}" }}',
+        f"{tree} v3 pre-player-liquid-fields snapshot",
+    )
+    require(
+        savegame_header,
+        "HasOpenQ4PlayerLiquidSaveFields( void ) const",
+        f"{tree} pre-player-liquid-fields layout accessor declaration",
+    )
+
+    accessor = extract_function(
+        savegame_source,
+        "bool idRestoreGame::HasOpenQ4PlayerLiquidSaveFields( void ) const",
+        f"{tree} pre-player-liquid-fields layout accessor",
+    )
+    for token in (
+        "!openQ4SaveGameHasCompatibilityStamp",
+        "openQ4SaveGameCompatibilityVersion != OPENQ4_SAVEGAME_COMPATIBILITY_VERSION",
+        "!SaveGame_IsV3PrePlayerLiquidFieldsSnapshot(",
+        "openQ4SaveGameCompatibilitySourceFileCount",
+    ):
+        require(accessor, token, f"{tree} pre-player-liquid-fields layout accessor")
+
+    restore = extract_function(
+        physics_source,
+        "void idPhysics_Player::Restore( idRestoreGame *savefile )",
+        f"{tree} player physics restore",
+    )
+    require_regex(
+        restore,
+        r"ReadFloat\s*\(\s*playerSpeed\s*\)\s*;\s*"
+        r"swimSpeed\s*=\s*0\.0f\s*;\s*"
+        r"if\s*\(\s*savefile->HasOpenQ4PlayerLiquidSaveFields\s*\(\s*\)\s*\)\s*\{\s*"
+        r"savefile->ReadFloat\s*\(\s*swimSpeed\s*\)\s*;\s*\}\s*"
+        r"savefile->ReadVec3\s*\(\s*viewForward\s*\)",
+        f"{tree} conditional player swim-speed restore layout",
+    )
+
+    save = extract_function(
+        physics_source,
+        "void idPhysics_Player::Save( idSaveGame *savefile ) const",
+        f"{tree} player physics save",
+    )
+    require_regex(
+        save,
+        r"WriteFloat\s*\(\s*playerSpeed\s*\)\s*;\s*"
+        r"savefile->WriteFloat\s*\(\s*swimSpeed\s*\)\s*;\s*"
+        r"savefile->WriteVec3\s*\(\s*viewForward\s*\)",
+        f"{tree} current player swim-speed write layout",
+    )
+
+    player_restore = extract_function(
+        player_source,
+        "void idPlayer::Restore( idRestoreGame *savefile )",
+        f"{tree} player restore",
+    )
+    require_regex(
+        player_restore,
+        r"ReadInt\s*\(\s*previousWaterType\s*\)\s*;\s*"
+        r"nextLiquidSurfaceSoundTime\s*=\s*0\s*;\s*"
+        r"if\s*\(\s*savefile->HasOpenQ4PlayerLiquidSaveFields\s*\(\s*\)\s*\)\s*\{\s*"
+        r"savefile->ReadInt\s*\(\s*nextLiquidSurfaceSoundTime\s*\)\s*;\s*\}\s*"
+        r"savefile->ReadInt\s*\(\s*nextLiquidDamageTime\s*\)",
+        f"{tree} conditional liquid-surface sound restore layout",
+    )
+
+    player_save = extract_function(
+        player_source,
+        "void idPlayer::Save( idSaveGame *savefile ) const",
+        f"{tree} player save",
+    )
+    require_regex(
+        player_save,
+        r"WriteInt\s*\(\s*previousWaterType\s*\)\s*;\s*"
+        r"savefile->WriteInt\s*\(\s*nextLiquidSurfaceSoundTime\s*\)\s*;\s*"
+        r"savefile->WriteInt\s*\(\s*nextLiquidDamageTime\s*\)",
+        f"{tree} current liquid-surface sound write layout",
+    )
+
+
+def validate_declared_save_restore_frames(tree: str) -> None:
+    class_header = read(f"src/{tree}/gamesys/Class.h")
+    class_source = read(f"src/{tree}/gamesys/Class.cpp")
+    savegame_header = read(f"src/{tree}/gamesys/SaveGame.h")
+    savegame_source = read(f"src/{tree}/gamesys/SaveGame.cpp")
+    physics_source = read(f"src/{tree}/physics/Physics.cpp")
+
+    for token in (
+        "struct idMemberFunctionOwner",
+        "struct idMemberFunctionDeclaredHere",
+        "decltype( &nameofclass::Save )",
+        "decltype( &nameofclass::Restore )",
+        "bool\t\t\t\t\t\tsaveDeclaredHere",
+        "bool\t\t\t\t\t\trestoreDeclaredHere",
+    ):
+        require(class_header, token, f"{tree} declared save/restore metadata")
+    for token in (
+        "this->saveDeclaredHere\t= saveDeclaredHere",
+        "this->restoreDeclaredHere = restoreDeclaredHere",
+    ):
+        require(class_source, token, f"{tree} declared save/restore metadata initialization")
+
+    call_save = extract_function(
+        savegame_source,
+        "void idSaveGame::CallSave_r( const idTypeInfo *cls, const idClass *obj )",
+        f"{tree} recursive save dispatch",
+    )
+    require(call_save, "!cls->saveDeclaredHere", f"{tree} recursive save dispatch")
+    reject_regex(call_save, r"super->Save\s*==\s*cls->Save", f"{tree} recursive save dispatch")
+
+    call_restore = extract_function(
+        savegame_source,
+        "void idRestoreGame::CallRestore_r( const idTypeInfo *cls, idClass *obj )",
+        f"{tree} recursive restore dispatch",
+    )
+    for token in (
+        "!cls->restoreDeclaredHere",
+        'idStr::Icmp( cls->classname, "idPhysics" ) == 0',
+        "!HasNextSerializedEmptyClassFrame()",
+    ):
+        require(call_restore, token, f"{tree} recursive restore dispatch")
+    reject_regex(call_restore, r"super->Restore\s*==\s*cls->Restore", f"{tree} recursive restore dispatch")
+
+    require(
+        savegame_header,
+        "HasNextSerializedEmptyClassFrame( void )",
+        f"{tree} legacy folded-frame lookahead declaration",
+    )
+    lookahead = extract_function(
+        savegame_source,
+        "bool idRestoreGame::HasNextSerializedEmptyClassFrame( void )",
+        f"{tree} legacy folded-frame lookahead",
+    )
+    for token in (
+        "file->Tell()",
+        "file->ReadInt( startMarker )",
+        "file->ReadInt( endMarker )",
+        "file->Seek( offset, FS_SEEK_SET )",
+        "startSyncId == openQ4SaveGameNextSyncId",
+        "endSyncId == openQ4SaveGameNextSyncId + 1",
+    ):
+        require(lookahead, token, f"{tree} legacy folded-frame lookahead")
+
+    save_physics = extract_function(
+        physics_source,
+        "void idPhysics::Save( idSaveGame *savefile ) const",
+        f"{tree} empty idPhysics save frame",
+    )
+    restore_physics = extract_function(
+        physics_source,
+        "void idPhysics::Restore( idRestoreGame *savefile )",
+        f"{tree} empty idPhysics restore frame",
+    )
+    require_regex(save_physics, r"^\s*$", f"{tree} empty idPhysics save frame")
+    require_regex(restore_physics, r"^\s*$", f"{tree} empty idPhysics restore frame")
+    reject_regex(savegame_source, r"ISSUE123", f"{tree} savegame source diagnostics")
+
+
 def validate_representative_count_guards(tree: str) -> None:
     required_sources = {
         f"src/{tree}/Mover.cpp": (
@@ -1138,6 +1311,8 @@ def main() -> None:
         validate_brittle_fracture_guards(tree)
         validate_ai_manager_restore_guards(tree)
         validate_state_restore_guards(tree)
+        validate_player_liquid_save_compatibility(tree)
+        validate_declared_save_restore_frames(tree)
         validate_representative_count_guards(tree)
         reject_nested_count_regressions(tree)
         validate_portable_layout_migrations(tree)

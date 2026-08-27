@@ -25,6 +25,36 @@ struct idEventFunc {
 	eventCallback_t		function;
 };
 
+// The declaring type is stable even when a release linker folds identical
+// empty member functions to the same address.
+template< class Left, class Right >
+struct idTypesAreSame {
+	enum { value = false };
+};
+
+template< class Type >
+struct idTypesAreSame<Type, Type> {
+	enum { value = true };
+};
+
+template< class MemberPointer >
+struct idMemberFunctionOwner;
+
+template< class ReturnType, class Owner, class... Args >
+struct idMemberFunctionOwner<ReturnType ( Owner::* )( Args... )> {
+	typedef Owner type;
+};
+
+template< class ReturnType, class Owner, class... Args >
+struct idMemberFunctionOwner<ReturnType ( Owner::* )( Args... ) const> {
+	typedef Owner type;
+};
+
+template< class ExpectedOwner, class MemberPointer >
+struct idMemberFunctionDeclaredHere {
+	enum { value = idTypesAreSame<ExpectedOwner, typename idMemberFunctionOwner<MemberPointer>::type>::value };
+};
+
 // added & so gcc could compile this
 #define EVENT( event, function )	{ &( event ), ( void ( idClass::* )( void ) )( &function ) },
 #define END_CLASS					{ NULL, NULL } };
@@ -119,7 +149,9 @@ incorrect.  Use this on concrete classes only.
 	idTypeInfo nameofclass::Type( #nameofclass, #nameofsuperclass,											\
 			( idEventFunc<idClass> * )nameofclass::eventCallbacks,	nameofclass::CreateInstance, ( void ( idClass::* )( void ) )&nameofclass::Spawn,	\
 			( rvStateFunc<idClass> * )nameofclass::stateCallbacks,																						\
-			( void ( idClass::* )( idSaveGame * ) const )&nameofclass::Save, ( void ( idClass::* )( idRestoreGame * ) )&nameofclass::Restore );	\
+			( void ( idClass::* )( idSaveGame * ) const )&nameofclass::Save, ( void ( idClass::* )( idRestoreGame * ) )&nameofclass::Restore,	\
+			idMemberFunctionDeclaredHere<nameofclass, decltype( &nameofclass::Save )>::value,												\
+			idMemberFunctionDeclaredHere<nameofclass, decltype( &nameofclass::Restore )>::value );										\
 	void nameofclass::RegisterClass( void ) {														\
 	}																								\
 	void Register_##nameofclass( void ) {															\
@@ -157,7 +189,9 @@ idEventFunc<nameofclass> nameofclass::eventCallbacks[] = {
 		static idTypeInfo type( #nameofclass, #nameofsuperclass,											\
 			( idEventFunc<idClass> * )nameofclass::eventCallbacks,	nameofclass::CreateInstance, ( void ( idClass::* )( void ) )&nameofclass::Spawn,	\
 			( rvStateFunc<idClass> * )nameofclass::stateCallbacks,																						\
-			( void ( idClass::* )( idSaveGame * ) const )&nameofclass::Save, ( void ( idClass::* )( idRestoreGame * ) )&nameofclass::Restore );	\
+			( void ( idClass::* )( idSaveGame * ) const )&nameofclass::Save, ( void ( idClass::* )( idRestoreGame * ) )&nameofclass::Restore,	\
+			idMemberFunctionDeclaredHere<nameofclass, decltype( &nameofclass::Save )>::value,												\
+			idMemberFunctionDeclaredHere<nameofclass, decltype( &nameofclass::Restore )>::value );										\
 		nameofclass::Type = &type;																	\
 	}																								\
 	void Register_##nameofclass( void ) {															\
@@ -244,7 +278,9 @@ on abstract classes only.
 	idTypeInfo nameofclass::Type( #nameofclass, #nameofsuperclass,									\
 			( idEventFunc<idClass> * )nameofclass::eventCallbacks, nameofclass::CreateInstance, ( void ( idClass::* )( void ) )&nameofclass::Spawn,	\
 			( rvStateFunc<idClass> * )nameofclass::stateCallbacks,																					\
-			( void ( idClass::* )( idSaveGame * ) const )&nameofclass::Save, ( void ( idClass::* )( idRestoreGame * ) )&nameofclass::Restore );		\
+			( void ( idClass::* )( idSaveGame * ) const )&nameofclass::Save, ( void ( idClass::* )( idRestoreGame * ) )&nameofclass::Restore,	\
+			idMemberFunctionDeclaredHere<nameofclass, decltype( &nameofclass::Save )>::value,												\
+			idMemberFunctionDeclaredHere<nameofclass, decltype( &nameofclass::Restore )>::value );										\
 	void nameofclass::RegisterClass( void ) {														\
 	}																								\
 	void Register_##nameofclass( void ) {															\
@@ -273,7 +309,9 @@ on abstract classes only.
 		static idTypeInfo type( #nameofclass, #nameofsuperclass,									\
 			( idEventFunc<idClass> * )nameofclass::eventCallbacks, nameofclass::CreateInstance, ( void ( idClass::* )( void ) )&nameofclass::Spawn,	\
 			( rvStateFunc<idClass> * )nameofclass::stateCallbacks,																					\
-			( void ( idClass::* )( idSaveGame * ) const )&nameofclass::Save, ( void ( idClass::* )( idRestoreGame * ) )&nameofclass::Restore );		\
+			( void ( idClass::* )( idSaveGame * ) const )&nameofclass::Save, ( void ( idClass::* )( idRestoreGame * ) )&nameofclass::Restore,	\
+			idMemberFunctionDeclaredHere<nameofclass, decltype( &nameofclass::Save )>::value,												\
+			idMemberFunctionDeclaredHere<nameofclass, decltype( &nameofclass::Restore )>::value );										\
 		nameofclass::Type = &type;																	\
 	}																								\
 	void Register_##nameofclass( void ) {															\
@@ -457,6 +495,8 @@ public:
 	void						( idClass::*Spawn )( void );
 	void						( idClass::*Save )( idSaveGame *savefile ) const;
 	void						( idClass::*Restore )( idRestoreGame *savefile );
+	bool						saveDeclaredHere;
+	bool						restoreDeclaredHere;
 
 // RAVEN BEGIN
 // bdube: added
@@ -479,7 +519,8 @@ public:
 // bdube: added
 												rvStateFunc<idClass> *stateCallbacks,
 // RAVEN END												
-												void ( idClass::*Save )( idSaveGame *savefile ) const, void	( idClass::*Restore )( idRestoreGame *savefile ) );
+												void ( idClass::*Save )( idSaveGame *savefile ) const, void	( idClass::*Restore )( idRestoreGame *savefile ),
+												bool saveDeclaredHere, bool restoreDeclaredHere );
 								~idTypeInfo();
 
 	void						Init( void );

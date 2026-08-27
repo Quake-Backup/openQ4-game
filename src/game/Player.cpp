@@ -3366,7 +3366,10 @@ void idPlayer::Restore( idRestoreGame *savefile ) {
 // openQ4 BEGIN
 	savefile->ReadInt( (int &)previousWaterLevel );
 	savefile->ReadInt( previousWaterType );
-	savefile->ReadInt( nextLiquidSurfaceSoundTime );
+	nextLiquidSurfaceSoundTime = 0;
+	if ( savefile->HasOpenQ4PlayerLiquidSaveFields() ) {
+		savefile->ReadInt( nextLiquidSurfaceSoundTime );
+	}
 	savefile->ReadInt( nextLiquidDamageTime );
 	savefile->ReadInt( drownDamage );
 // openQ4 END
