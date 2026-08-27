@@ -4444,10 +4444,13 @@ idGameLocal::RunFrame
 		gameRenderWorld->DebugClear(0);
 	}
 
+	player = GetLocalPlayer();
+
 	const int baseCmdMSec = common->GetUserCmdMSec();
 	const int baseCmdHz = common->GetUserCmdHz();
 	if ( !isMultiplayer && cvarSystem != NULL ) {
-		const float slowTimeScale = idMath::ClampFloat( 0.1f, 1.0f, cvarSystem->GetCVarFloat( "timescale" ) );
+		const float slowTimeScale = idMath::ClampFloat( 0.1f, 1.0f,
+			cvarSystem->GetCVarFloat( "timescale" ) * common->GetGameTimeScale() );
 		if ( slowTimeScale < 0.999f ) {
 			msec = idMath::ClampInt( 1, baseCmdMSec, idMath::Ftoi( baseCmdMSec * slowTimeScale + 0.5f ) );
 			mHz = Max( 1, idMath::Ftoi( 1000.0f / static_cast<float>( msec ) + 0.5f ) );
@@ -4459,8 +4462,6 @@ idGameLocal::RunFrame
 		msec = baseCmdMSec;
 		mHz = baseCmdHz;
 	}
-
-	player = GetLocalPlayer();
 
 	if ( !isMultiplayer && g_stopTime.GetBool() ) {
 

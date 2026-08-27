@@ -1913,7 +1913,6 @@ idPlayer::idPlayer() {
 	weaponWheelLastMouseY	= 0;
 	weaponWheelLastUpdateTime = 0;
 	weaponWheelBlend		= 0.0f;
-	weaponWheelBaseTimescale = 1.0f;
 	weaponWheelCursor.Zero();
 	weaponWheelLastCmdAngles.Zero();
 
@@ -10123,6 +10122,7 @@ bool idPlayer::HandleESC( void ) {
 		return SkipCinematic();
 	}
 #endif
+	ResetWeaponWheel( true );
 	return false;
 }
  
@@ -10256,9 +10256,7 @@ void idPlayer::AdjustSpeed( void ) {
 	} else if ( noclip ) {
 		speed = pm_noclipspeed.GetFloat();
 		bobFrac = 0.0f;
-// jmarshall - force run, eval.
- 	} else if ( !physicsObj.OnLadder() /*&& ( usercmd.buttons & BUTTON_RUN )*/ && ( usercmd.forwardmove || usercmd.rightmove ) && ( usercmd.upmove >= 0 ) ) {
-// jmarshall end
+	} else if ( !physicsObj.OnLadder() && ( usercmd.buttons & BUTTON_RUN ) && ( usercmd.forwardmove || usercmd.rightmove ) && ( usercmd.upmove >= 0 ) ) {
 		bobFrac = 1.0f;
 		speed = pm_speed.GetFloat();
 	} else {
@@ -11272,13 +11270,12 @@ void idPlayer::ResetWeaponWheel( bool instantRestore ) {
 	weaponWheelLastCmdAngles[ YAW ] = SHORT2ANGLE( usercmd.angles[ YAW ] );
 	weaponWheelLastCmdAngles[ ROLL ] = SHORT2ANGLE( usercmd.angles[ ROLL ] );
 	weaponWheelLastUpdateTime = Sys_Milliseconds();
-	weaponWheelBaseTimescale = cvarSystem->GetCVarFloat( "timescale" );
 
 	if ( instantRestore ) {
 		weaponWheelBlend = 0.0f;
 		gameLocal.SetSpecialEffect( SPECIAL_EFFECT_BLUR, false );
 		if ( !gameLocal.isMultiplayer ) {
-			cvarSystem->SetCVarFloat( "timescale", weaponWheelBaseTimescale );
+			common->SetGameTimeScale( 1.0f );
 		}
 	}
 }
@@ -11423,13 +11420,13 @@ void idPlayer::UpdateWeaponWheelEffects( void ) {
 		return;
 	}
 
-	const float targetTimescale = weaponWheelBaseTimescale * WEAPON_WHEEL_TIMESCALE_SCALE;
-	cvarSystem->SetCVarFloat( "timescale", WeaponWheelLerp( weaponWheelBaseTimescale, targetTimescale, blend ) );
-
 	if ( blend <= 0.0f ) {
+		common->SetGameTimeScale( 1.0f );
 		gameLocal.SetSpecialEffect( SPECIAL_EFFECT_BLUR, false );
 		return;
 	}
+
+	common->SetGameTimeScale( WeaponWheelLerp( 1.0f, WEAPON_WHEEL_TIMESCALE_SCALE, blend ) );
 
 	gameLocal.SetSpecialEffect( SPECIAL_EFFECT_BLUR, true );
 	gameLocal.SetSpecialEffectParm( SPECIAL_EFFECT_BLUR, 0, WeaponWheelLerp( 0.694f, 0.820f, blend ) );
@@ -11445,6 +11442,7 @@ void idPlayer::UpdateWeaponWheelEffects( void ) {
 void idPlayer::UpdateWeaponWheel( void ) {
 	const bool canUseWheel = CanUseWeaponWheel();
 	const bool held = canUseWheel && ( usercmd.buttons & BUTTON_WEAPONWHEEL ) != 0;
+	const bool wasBlended = weaponWheelBlend > 0.0f;
 	const int now = Sys_Milliseconds();
 
 	if ( weaponWheelLastUpdateTime == 0 ) {
@@ -11457,8 +11455,10 @@ void idPlayer::UpdateWeaponWheel( void ) {
 	if ( !canUseWheel ) {
 		weaponWheelActive = false;
 		weaponWheelBlend = Max( 0.0f, weaponWheelBlend - dt * WEAPON_WHEEL_BLEND_OUT_SPEED );
-		UpdateWeaponWheelEffects();
-		if ( weaponWheelBlend <= 0.0f ) {
+		if ( weaponWheelBlend > 0.0f || wasBlended ) {
+			UpdateWeaponWheelEffects();
+		}
+		if ( weaponWheelBlend <= 0.0f && wasBlended ) {
 			ResetWeaponWheel( true );
 		}
 		return;
@@ -11466,9 +11466,6 @@ void idPlayer::UpdateWeaponWheel( void ) {
 
 	if ( held && !weaponWheelActive ) {
 		weaponWheelActive = true;
-		if ( weaponWheelBlend <= 0.0f || weaponWheelBaseTimescale <= 0.0f ) {
-			weaponWheelBaseTimescale = Max( cvarSystem->GetCVarFloat( "timescale" ), 0.001f );
-		}
 		weaponWheelCursor.Zero();
 		weaponWheelLastMouseX = usercmd.mx;
 		weaponWheelLastMouseY = usercmd.my;
@@ -11512,7 +11509,9 @@ void idPlayer::UpdateWeaponWheel( void ) {
 		weaponWheelBlend = Max( 0.0f, weaponWheelBlend - dt * WEAPON_WHEEL_BLEND_OUT_SPEED );
 	}
 
-	UpdateWeaponWheelEffects();
+	if ( weaponWheelBlend > 0.0f || wasBlended ) {
+		UpdateWeaponWheelEffects();
+	}
 }
 
 void idPlayer::DrawWeaponWheel( void ) {

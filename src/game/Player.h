@@ -976,7 +976,6 @@ private:
 	int						weaponWheelLastMouseY;
 	int						weaponWheelLastUpdateTime;
 	float					weaponWheelBlend;
-	float					weaponWheelBaseTimescale;
 	idVec2					weaponWheelCursor;
 	idAngles				weaponWheelLastCmdAngles;
 

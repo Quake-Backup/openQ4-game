@@ -688,7 +688,9 @@ extern rvGameLog *				gameLog;
 // 42: durable server MVD publication results for competitive match evidence
 // 43: two-phase game shutdown keeps module decl/animation/idLib state alive
 //     until the engine declaration manager has released module-owned decls
-const int GAME_API_VERSION		= 43;
+// 44: common exposes a transient game-owned time scale independently of the
+//     public timescale CVar
+const int GAME_API_VERSION		= 44;
 
 struct gameImport_t {
 
